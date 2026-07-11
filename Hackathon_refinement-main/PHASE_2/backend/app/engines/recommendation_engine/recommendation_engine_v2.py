@@ -47,7 +47,6 @@ from app.engines.recommendation_engine.signal_detectors import (
 )
 from app.engines.simulation_engine import EngineRunner, EngineRunnerV2, SimulationEngineV2
 
-
 class RecommendationEngineV2:
     """
     Orchestrates the full V2 pipeline.
@@ -273,9 +272,10 @@ class RecommendationEngineV2:
         selected_recommendations = deduped_final
 
         # Phase 2/3 of the recovery framework: diagnose WHY before the PM reads
-        # WHAT to do. Pure re-labeling of the signals already detected above —
-        # no new detection happens here.
-        self._cached_root_cause_analysis = RootCauseClassifier().classify(all_signals)
+        # WHAT to do. Pure re-labeling of the signals already detected above.
+        # If diagnose() was called first, reuse its cache; otherwise classify now.
+        if self._cached_root_cause_analysis is None:
+            self._cached_root_cause_analysis = RootCauseClassifier().classify(all_signals)
 
         # Validation pass using original upstream (stable baseline for scoring).
         signals_by_id = {s.signal_id: s for s in all_signals}
@@ -294,12 +294,59 @@ class RecommendationEngineV2:
         self._cached_recommendations = selected_recommendations
         return list(self._cached_recommendations)
 
+    # ------------------------------------------------------------------ #
+    # Diagnosis (PR 2) - decoupled from generate()                         #
+    # ------------------------------------------------------------------ #
+
+    def diagnose(self) -> Optional[RootCauseAnalysis]:
+        """
+        Run signal detection + RootCauseClassifier ONLY.
+
+        This is a first-class pipeline output that does NOT depend on
+        recommendation generation. The dependency graph is:
+            Workbook -> Signals -> Diagnosis
+        NOT:
+            Workbook -> Recommendations -> Diagnosis (old, coupled)
+
+        Caches result so subsequent calls (or generate()) reuse it.
+        """
+        if self._cached_root_cause_analysis is not None:
+            return self._cached_root_cause_analysis
+
+        upstream = self._compute_upstream()
+        state = self.project_state
+
+        # Signal detection (same detectors as iteration 0 of generate(), extracted)
+        signals: List[OpportunitySignal] = []
+        signals.extend(BlockerDetector(state, upstream.cp_result, upstream.dag, upstream.impact_scores).detect())
+        signals.extend(CapacityDetector(state, upstream.metrics, upstream.cp_result, upstream.impact_scores).detect())
+        signals.extend(SprintDetector(state, upstream.metrics, upstream.spillover, upstream.forecast).detect())
+        signals.extend(CriticalPathDetector(state, upstream.cp_result, upstream.dag, upstream.impact_scores).detect())
+        signals.extend(ScheduleDetector(state, upstream.forecast, upstream.monte_carlo, upstream.risk_result, upstream.metrics).detect())
+        signals.extend(EstimationReliabilityDetector(state).detect())
+        signals.extend(SpilloverRootCauseDetector(state, upstream.spillover).detect())
+        signals.extend(SPOFDetector(state, upstream.cp_result).detect())
+        signals.extend(RecurringBlockerDetector(state).detect())
+        signals.extend(ReworkLoopDetector(state).detect())
+        signals.extend(RampUpDetector(state).detect())
+        signals.extend(ResequencingDetector(state, upstream.dag, upstream.cp_result).detect())
+        signals.extend(SwarmTradeoffDetector(state, upstream.cp_result).detect())
+        signals.extend(SkillMismatchDetector(state).detect())
+        signals.extend(LowVelocityDetector(state).detect())
+
+        # Classify into the 9 root cause categories
+        self._cached_root_cause_analysis = RootCauseClassifier().classify(signals)
+        return self._cached_root_cause_analysis
+
     def get_root_cause_analysis(self) -> Optional[RootCauseAnalysis]:
         """
         Phase 3 diagnostic table: for each of the framework's nine root-cause
         categories, whether it was observed in this project, its label,
-        impact rating, and the signal evidence backing it. Call generate()
-        first — this reads the signals accumulated during that run.
+        impact rating, and the signal evidence backing it.
+
+        Prefer calling diagnose() directly for the decoupled path.
+        This getter remains for backward compatibility with code that
+        calls generate() first.
         """
         return self._cached_root_cause_analysis
 
@@ -521,100 +568,6 @@ class RecommendationEngineV2:
     def _fallback_signals(self, signals: List[OpportunitySignal]) -> List[OpportunitySignal]:
         """Backward-compat shim — delegates to the state-aware implementation."""
         return self._fallback_signals_for(self.project_state, signals)
-
-    def _fallback_signals_legacy(self, signals: List[OpportunitySignal]) -> List[OpportunitySignal]:
-        """Original implementation kept for reference; no longer called."""
-        emitted = {signal.category for signal in signals}
-        fallback: List[OpportunitySignal] = []
-        if SignalCategory.ESTIMATION_RELIABILITY not in emitted:
-            fallback.append(self._make_fallback_signal(
-                category=SignalCategory.ESTIMATION_RELIABILITY,
-                title="Estimation reliability check",
-                description="The project still shows planning uncertainty for the current work queue.",
-                affected_item_ids=[wi.item_id for wi in self.project_state.work_items if getattr(wi, "status", None) in {"NOT_STARTED", "IN_PROGRESS", "BLOCKED"}][:1],
-                affected_resource_ids=[resource.resource_id for resource in self.project_state.team][:1],
-                affected_sprint_ids=[sprint.sprint_id for sprint in self.project_state.sprints if getattr(sprint, "status", None) in {"IN_PROGRESS", "NOT_STARTED"}][:1],
-                blocker_ids=[blocker.blocker_id for blocker in self.project_state.blockers][:1],
-                evidence_value=1.0,
-            ))
-        if SignalCategory.SPILLOVER not in emitted:
-            fallback.append(self._make_fallback_signal(
-                category=SignalCategory.SPILLOVER,
-                title="Spillover risk check",
-                description="The current plan has carryover risk that should be addressed before the next sprint.",
-                affected_item_ids=[wi.item_id for wi in self.project_state.work_items if getattr(wi, "status", None) in {"NOT_STARTED", "IN_PROGRESS", "BLOCKED"}][:1],
-                affected_resource_ids=[resource.resource_id for resource in self.project_state.team][:1],
-                affected_sprint_ids=[sprint.sprint_id for sprint in self.project_state.sprints if getattr(sprint, "status", None) in {"IN_PROGRESS", "NOT_STARTED"}][:1],
-                blocker_ids=[blocker.blocker_id for blocker in self.project_state.blockers][:1],
-                evidence_value=1.0,
-            ))
-        if SignalCategory.SPOF not in emitted and len(self.project_state.team) >= 2:
-            fallback.append(self._make_fallback_signal(
-                category=SignalCategory.SPOF,
-                title="Single point of failure check",
-                description="A critical item is concentrated on one resource and would benefit from backup coverage.",
-                affected_item_ids=[wi.item_id for wi in self.project_state.work_items if getattr(wi, "status", None) in {"NOT_STARTED", "IN_PROGRESS", "BLOCKED"}][:1],
-                affected_resource_ids=[resource.resource_id for resource in self.project_state.team][:2],
-                affected_sprint_ids=[sprint.sprint_id for sprint in self.project_state.sprints if getattr(sprint, "status", None) in {"IN_PROGRESS", "NOT_STARTED"}][:1],
-                blocker_ids=[blocker.blocker_id for blocker in self.project_state.blockers][:1],
-                evidence_value=1.0,
-            ))
-        if SignalCategory.RECURRING_BLOCKER not in emitted and self.project_state.blockers:
-            fallback.append(self._make_fallback_signal(
-                category=SignalCategory.RECURRING_BLOCKER,
-                title="Recurring blocker check",
-                description="An active blocker is already creating repeat pressure in the plan.",
-                affected_item_ids=[wi.item_id for wi in self.project_state.work_items if getattr(wi, "status", None) in {"NOT_STARTED", "IN_PROGRESS", "BLOCKED"}][:1],
-                affected_resource_ids=[resource.resource_id for resource in self.project_state.team][:1],
-                affected_sprint_ids=[sprint.sprint_id for sprint in self.project_state.sprints if getattr(sprint, "status", None) in {"IN_PROGRESS", "NOT_STARTED"}][:1],
-                blocker_ids=[blocker.blocker_id for blocker in self.project_state.blockers][:1],
-                evidence_value=1.0,
-            ))
-        if SignalCategory.REWORK_LOOP not in emitted and self.project_state.work_items:
-            fallback.append(self._make_fallback_signal(
-                category=SignalCategory.REWORK_LOOP,
-                title="Rework loop check",
-                description="The work mix suggests a quality or handoff loop that should be interrupted.",
-                affected_item_ids=[wi.item_id for wi in self.project_state.work_items if getattr(wi, "status", None) in {"NOT_STARTED", "IN_PROGRESS", "BLOCKED"}][:1],
-                affected_resource_ids=[resource.resource_id for resource in self.project_state.team][:1],
-                affected_sprint_ids=[sprint.sprint_id for sprint in self.project_state.sprints if getattr(sprint, "status", None) in {"IN_PROGRESS", "NOT_STARTED"}][:1],
-                blocker_ids=[blocker.blocker_id for blocker in self.project_state.blockers][:1],
-                evidence_value=1.0,
-            ))
-        if SignalCategory.RAMP_UP not in emitted and self.project_state.team:
-            fallback.append(self._make_fallback_signal(
-                category=SignalCategory.RAMP_UP,
-                title="Ramp-up check",
-                description="A newer team member is taking on work that would benefit from a softer forecast assumption.",
-                affected_item_ids=[wi.item_id for wi in self.project_state.work_items if getattr(wi, "status", None) in {"NOT_STARTED", "IN_PROGRESS", "BLOCKED"}][:1],
-                affected_resource_ids=[resource.resource_id for resource in self.project_state.team][:1],
-                affected_sprint_ids=[sprint.sprint_id for sprint in self.project_state.sprints if getattr(sprint, "status", None) in {"IN_PROGRESS", "NOT_STARTED"}][:1],
-                blocker_ids=[blocker.blocker_id for blocker in self.project_state.blockers][:1],
-                evidence_value=1.0,
-            ))
-        if SignalCategory.RESEQUENCING not in emitted and len(self.project_state.work_items) >= 2:
-            fallback.append(self._make_fallback_signal(
-                category=SignalCategory.RESEQUENCING,
-                title="Resequencing check",
-                description="Some lower-priority work is competing for the same capacity as the critical path.",
-                affected_item_ids=[wi.item_id for wi in self.project_state.work_items if getattr(wi, "status", None) in {"NOT_STARTED", "IN_PROGRESS", "BLOCKED"}][:1],
-                affected_resource_ids=[resource.resource_id for resource in self.project_state.team][:1],
-                affected_sprint_ids=[sprint.sprint_id for sprint in self.project_state.sprints if getattr(sprint, "status", None) in {"IN_PROGRESS", "NOT_STARTED"}][:1],
-                blocker_ids=[blocker.blocker_id for blocker in self.project_state.blockers][:1],
-                evidence_value=1.0,
-            ))
-        if SignalCategory.SWARM_TRADEOFF not in emitted and self.project_state.team:
-            fallback.append(self._make_fallback_signal(
-                category=SignalCategory.SWARM_TRADEOFF,
-                title="Swarm tradeoff check",
-                description="A bottleneck item could be accelerated, but the change would shift some work to another resource.",
-                affected_item_ids=[wi.item_id for wi in self.project_state.work_items if getattr(wi, "status", None) in {"NOT_STARTED", "IN_PROGRESS", "BLOCKED"}][:1],
-                affected_resource_ids=[resource.resource_id for resource in self.project_state.team][:2],
-                affected_sprint_ids=[sprint.sprint_id for sprint in self.project_state.sprints if getattr(sprint, "status", None) in {"IN_PROGRESS", "NOT_STARTED"}][:1],
-                blocker_ids=[blocker.blocker_id for blocker in self.project_state.blockers][:1],
-                evidence_value=1.0,
-            ))
-        return fallback
 
     def _make_fallback_signal(
         self,
