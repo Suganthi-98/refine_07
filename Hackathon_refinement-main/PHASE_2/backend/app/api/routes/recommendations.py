@@ -4,6 +4,7 @@ Endpoints:
 - GET /api/recommendations
 - POST /api/recommendations/simulate
 - POST /api/recommendations/scenario
+- GET /api/recommendations/explain/{recommendation_id}
 """
 from fastapi import APIRouter, HTTPException, Query, Request
 from typing import Optional, Dict, List, Any
@@ -11,6 +12,7 @@ from app.storage import store
 from app.api.models import ApiResponse, ErrorCodes
 from app.engines.dependency_engine import DependencyDAG
 from app.engines.metrics_engine import ProjectMetrics
+from app.engines.optimization_engine import OptimizationEngine
 from app.api.models_phase3 import (
     RecommendationResponse,
     RecommendationSimulationRequest,
@@ -38,7 +40,6 @@ from app.engines.recommendation_engine.signal_detectors import (
 
 router = APIRouter(prefix="/api", tags=["Phase3.4"])
 
-
 def _recommendation_type_from_action(action_type: RecommendationAction) -> RecommendationType:
     return {
         RecommendationAction.RESOLVE_BLOCKER: RecommendationType.RESOLVE_BLOCKER,
@@ -51,11 +52,10 @@ def _recommendation_type_from_action(action_type: RecommendationAction) -> Recom
         RecommendationAction.ADD_RESOURCE_SKILL: RecommendationType.ADD_RESOURCE,
     }.get(action_type, RecommendationType.CRITICAL_PATH_OPTIMIZATION)
 
-
 def _compute_impact_level(estimated_delay_reduction: float) -> str:
     """
     CRITICAL FIX: Classify impact level based on delay reduction magnitude.
-    
+
     Thresholds calibrated from Monte Carlo noise floor (±0.5 days typical).
     """
     if estimated_delay_reduction >= 5.0:      # Significant reduction
@@ -65,20 +65,19 @@ def _compute_impact_level(estimated_delay_reduction: float) -> str:
     else:                                      # Minimal/noise
         return "Low"
 
-
 def _resolve_category(
     project_state: ProjectState,
     affected_blocker_ids: List[str]
 ) -> Optional[str]:
     """
     HIGH FIX: Resolve category of first blocker in recommendation.
-    
+
     If multiple blockers, returns the first blocker's category.
     Categories: "Technical Debt", "Team Capacity", "External Dependency", etc.
     """
     if not affected_blocker_ids:
         return None
-    
+
     # Get first blocker
     first_blocker_id = affected_blocker_ids[0]
     for blocker in project_state.blockers:
@@ -93,7 +92,7 @@ def _estimate_implementation_effort(
 ) -> str:
     """
     HIGH FIX: Estimate implementation effort based on scope and action type.
-    
+
     High: Multiple items, resource changes, blocker resolution
     Medium: Single item, reassignment
     Low: Item descope, priority change
@@ -103,15 +102,15 @@ def _estimate_implementation_effort(
         len(affected_resource_ids) +
         len(affected_blocker_ids)
     )
-    
+
     # Blocker resolution is high-effort
     if action_type == RecommendationAction.RESOLVE_BLOCKER and len(affected_blocker_ids) > 0:
         return "High"
-    
+
     # Resource changes are high-effort
     if action_type == RecommendationAction.ADD_RESOURCE_SKILL and len(affected_resource_ids) > 0:
         return "High"
-    
+
     # Multiple items = more effort
     if scope_count > 3:
         return "High"
@@ -119,7 +118,6 @@ def _estimate_implementation_effort(
         return "Medium"
     else:
         return "Low"
-
 
 def _compute_urgency(rec, project_state: Optional[ProjectState]) -> str:
     if not project_state or not rec.affected_sprint_ids:
@@ -135,10 +133,8 @@ def _compute_urgency(rec, project_state: Optional[ProjectState]) -> str:
         return "THIS_SPRINT"
     return "NEXT_SPRINT"
 
-
 def _build_action_summary(rec) -> str:
     return rec.title
-
 
 def _build_simulation_metric_snapshot(metrics: Any) -> Dict[str, Any]:
     return {
@@ -149,7 +145,6 @@ def _build_simulation_metric_snapshot(metrics: Any) -> Dict[str, Any]:
         "resource_risk": None if getattr(metrics, "resource_risk", None) is None else round(metrics.resource_risk, 2),
         "projected_velocity": None,
     }
-
 
 def _build_simulation_delta_snapshot(simulation_result: SimulationResult) -> Dict[str, Any]:
     schedule_risk_delta = None
@@ -166,7 +161,6 @@ def _build_simulation_delta_snapshot(simulation_result: SimulationResult) -> Dic
         "resource_risk": resource_risk_delta,
         "projected_velocity": getattr(simulation_result, "delta_projected_velocity", None),
     }
-
 
 def _get_forecast_lever_names(rec, simulation_result: Optional[SimulationResult]) -> List[str]:
     lever_map = {
@@ -195,7 +189,6 @@ def _get_forecast_lever_names(rec, simulation_result: Optional[SimulationResult]
     if simulation_result is not None and getattr(simulation_result, "delta_projected_velocity", None) is not None:
         names.append("projected_velocity")
     return sorted(set(names))
-
 
 def _build_resource_load_impact(
     rec,
@@ -227,7 +220,6 @@ def _build_resource_load_impact(
             }
     return result or None
 
-
 def _recommendation_to_summary(
     rec,
     baseline_metrics: Optional[Dict[str, float]] = None,
@@ -239,11 +231,11 @@ def _recommendation_to_summary(
 ) -> RecommendationSummary:
     """
     Convert internal Recommendation to API RecommendationSummary.
-    
+
     CRITICAL FIXES:
     - Baseline metrics (probability, delay, risk) routed from upstream
     - After metrics estimated from recommendation impact
-    
+
     HIGH FIXES:
     - implementation_effort computed from scope
     - impact_level computed from estimated impact
@@ -256,7 +248,7 @@ def _recommendation_to_summary(
             "expected_delay_days": 0.0,
             "overall_risk_score": 0.0,
         }
-    
+
     # CRITICAL: Extract real baseline values from upstream
     baseline_prob = baseline_metrics.get("on_time_probability", 0.0)
     baseline_delay = baseline_metrics.get("expected_delay_days", 0.0)
@@ -270,7 +262,7 @@ def _recommendation_to_summary(
         after_prob = min(1.0, max(0.0, baseline_prob + rec.estimated_risk_reduction / 100.0))
         after_delay = max(0.0, baseline_delay - rec.estimated_delay_reduction_days)
         after_risk = max(0.0, baseline_risk - rec.estimated_risk_reduction)
-    
+
     # HIGH: Compute real values instead of hardcoding
     implementation_effort = _estimate_implementation_effort(
         rec.action_type,
@@ -290,7 +282,7 @@ def _recommendation_to_summary(
         for item_id in rec.affected_item_ids:
             downstream_ids.update(dag.transitive_closure.get(item_id, set()))
         dependency_consequence = ", ".join(sorted(downstream_ids)) if downstream_ids else None
-    
+
     # HIGH: Forward impact_evidence to details
     impact_evidence = []
     if rec.impact_evidence:
@@ -381,7 +373,6 @@ def _recommendation_to_summary(
         validation=validation_response,
     )
 
-
 def _build_engine(session_id: str) -> RecommendationEngineV2:
     """
     Build a RecommendationEngineV2 pre-seeded with the session-level
@@ -413,9 +404,7 @@ def _build_engine(session_id: str) -> RecommendationEngineV2:
     engine._upstream = analysis.upstream
     return engine
 
-
 _advisor_builder = AdvisorInputBuilder()
-
 
 def _get_narrative_service(request: Request):
     narrative_service = getattr(request.app.state, "narrative_service", None)
@@ -430,10 +419,8 @@ def _get_narrative_service(request: Request):
         )
     return narrative_service
 
-
 def _fallback_text_by_recommendation(recommendations):
     return {rec.recommendation_id: rec.description for rec in recommendations}
-
 
 @router.get("/recommendations")
 async def get_recommendations(
@@ -447,11 +434,40 @@ async def get_recommendations(
         candidates = recommendation_engine.generate(top_n=top_n)
 
         upstream = recommendation_engine._compute_upstream()
+
         baseline_metrics = {
             "on_time_probability": round(upstream.monte_carlo.on_time_probability, 4),
             "expected_delay_days": round(upstream.forecast.expected_delay_days, 2),
             "overall_risk_score": round(upstream.risk_result.overall_risk_score, 2),
         }
+
+        # ---- Beam-search re-optimization -------------------------------------
+        # generate() already runs a GREEDY optimize loop. Re-rank the same
+        # candidate set with beam search (width W keeps top-W future states per
+        # depth) so combinations like B+C > A are recovered where greedy locks
+        # onto A. Seeded with the session's cached upstream so no extra pipeline
+        # run happens. Falls back gracefully if the beam finds nothing.
+        optimized_plan = None
+        try:
+            optimized_plan = OptimizationEngine(
+                recommendation_engine.project_state,
+                candidates,
+                beam_width=5,
+                max_actions=top_n,
+                simulation_count=1000,
+                seed_upstream=upstream,
+            ).optimize()
+            if optimized_plan.selected_action_ids:
+                selected = set(optimized_plan.selected_action_ids)
+                by_id = {r.recommendation_id: r for r in candidates}
+                ordered = [by_id[i] for i in optimized_plan.selected_action_ids if i in by_id]
+                ordered += [r for r in candidates if r.recommendation_id not in selected]
+                candidates = ordered
+        except Exception:
+            # Optimizer is a re-ranking enhancement only; never fail the
+            # endpoint if it errors. Fall back to generate()'s greedy order.
+            optimized_plan = None
+        # ----------------------------------------------------------------------
 
         advisor_input = _advisor_builder.build_recommendation_input(
             project_id=session_id,
@@ -484,7 +500,26 @@ async def get_recommendations(
             ],
             advisor_explanation=advisor_explanation,
         )
-        return ApiResponse(success=True, data=response.model_dump(), message="Recommendations generated")
+        data = response.model_dump()
+
+        # Attach the optimized-plan payload (marginal contributions, grounded
+        # narrative, per-depth beam trace) so the UI can render "what's doing
+        # the work" without another round-trip. Additive; no schema break.
+        if optimized_plan is not None and optimized_plan.selected_action_ids:
+            data["optimized_plan"] = {
+                "selected_action_ids": optimized_plan.selected_action_ids,
+                "baseline_probability": round(optimized_plan.baseline_probability, 4),
+                "final_probability": round(optimized_plan.final_probability, 4),
+                "total_probability_gain": round(optimized_plan.total_probability_gain, 4),
+                "baseline_delay_days": round(optimized_plan.baseline_delay_days, 2),
+                "final_delay_days": round(optimized_plan.final_delay_days, 2),
+                "total_delay_reduction_days": round(optimized_plan.total_delay_reduction_days, 2),
+                "action_contributions": optimized_plan.action_contributions,
+                "search_trace": optimized_plan.search_trace,
+                "narrative": optimized_plan.narrative,
+            }
+
+        return ApiResponse(success=True, data=data, message="Recommendations generated")
     except HTTPException:
         raise
     except Exception as e:
@@ -497,12 +532,11 @@ async def get_recommendations(
             ).model_dump(mode='json'),
         )
 
-
 @router.post("/recommendations/simulate")
 async def simulate_recommendation(
     request: Request,
     session_id: str = Query(..., description="Session ID"),
-    request_body: RecommendationSimulationRequest = ..., 
+    request_body: RecommendationSimulationRequest = ...,
 ):
     try:
         recommendation_engine = _build_engine(session_id)
@@ -588,12 +622,11 @@ async def simulate_recommendation(
             ).model_dump(mode='json'),
         )
 
-
 @router.post("/recommendations/scenario")
 async def simulate_scenario(
     request: Request,
     session_id: str = Query(..., description="Session ID"),
-    request_body: RecommendationScenarioRequest = ..., 
+    request_body: RecommendationScenarioRequest = ...,
 ):
     try:
         recommendation_engine = _build_engine(session_id)
@@ -661,7 +694,6 @@ async def simulate_scenario(
                 message=f"Error simulating recommendation scenario: {str(e)}",
             ).model_dump(mode='json'),
         )
-
 
 @router.get("/recommendations/explain/{recommendation_id}")
 async def explain_recommendation(
