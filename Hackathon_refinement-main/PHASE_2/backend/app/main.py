@@ -27,7 +27,7 @@ from app.ai.client import build_client
 from app.ai.cache import InMemoryNarrativeCache
 from app.ai.exceptions import AIClientError
 from app.engines.narrative_service import NarrativeService
-
+from app.api.routes.diagnosis import router as diagnosis_router
 
 def create_app() -> FastAPI:
     """Create and configure FastAPI application."""
@@ -91,7 +91,7 @@ def create_app() -> FastAPI:
     app.include_router(risk.router)
     app.include_router(scope_change.router)
     app.include_router(demo.router)
-    
+    app.include_router(diagnosis_router)
     return app
 
 
