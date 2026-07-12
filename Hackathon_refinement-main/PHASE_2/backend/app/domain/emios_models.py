@@ -3,17 +3,6 @@ EMIOS Domain Models — Cognition + Knowledge contexts.
 
 Pydantic v2 models for the EMIOS 18-stage cognitive pipeline built on top of
 Sprint Whisperer's 9 deterministic engines.
-
-Design rules (from the EMIOS blueprint):
-  - An Observation NEVER contains a cause (Stage 1 is neutral).
-  - Evidence is immutable once recorded; it supports OR contradicts hypotheses.
-  - Every claim carries a calibrated confidence (held accountable in Learning).
-  - Every recommendation/decision states its sacrifice (explicit tradeoffs).
-  - Provenance is recorded on cognition entities for auditability.
-
-All models allow arbitrary types so they can hold references to existing
-Sprint Whisperer engine outputs (ProjectMetrics, ForecastResult, etc.) without
-requiring those to be Pydantic-compatible.
 """
 from __future__ import annotations
 
@@ -31,7 +20,6 @@ def _utcnow() -> datetime:
 # ---------------------------------------------------------------------------
 # Enumerations
 # ---------------------------------------------------------------------------
-
 class ObservationDirection(str, Enum):
     """Direction of a metric change, with no causal interpretation."""
     UP = "up"
@@ -61,17 +49,7 @@ class ImpactDimension(str, Enum):
 
 
 class HealthState(str, Enum):
-    """Project health state machine, shared with the Recovery Engine.
-
-    SIX states, not five: the blueprint's Part 2 canonical state machine has
-    Healthy -> Watch -> Warning -> Critical -> Recovery -> Recovered, where
-    RECOVERY is the transient 'plan is actively running' state and RECOVERED
-    is the terminal 'exit KPIs met' state that then decays back to Healthy
-    after N sustained sprints (Recovered -> Healthy). They are distinct: a plan
-    can fail out of RECOVERY back to CRITICAL (rollback) without ever reaching
-    RECOVERED. Keep both — collapsing them loses the rollback vs. success
-    distinction the Recovery state machine (Phase 5) depends on.
-    """
+    """Project health state machine, shared with the Recovery Engine."""
     HEALTHY = "healthy"
     WATCH = "watch"
     WARNING = "warning"
@@ -98,13 +76,8 @@ class ExecutionPlanStatus(str, Enum):
 # ---------------------------------------------------------------------------
 # Stage 1 — Observation -> ObservationCluster
 # ---------------------------------------------------------------------------
-
 class Observation(BaseModel):
-    """A single neutral, non-causal statement about a metric change.
-
-    RULE: an Observation never contains a cause. It only reports that a signal
-    deviated from its expected band.
-    """
+    """A single neutral, non-causal statement about a metric change."""
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     observation_id: str
@@ -112,26 +85,20 @@ class Observation(BaseModel):
     magnitude: float = Field(..., description="Signed magnitude of the deviation")
     direction: ObservationDirection
     significance: Literal["HIGH", "MEDIUM", "LOW"] = Field(
-        "LOW", description="Coarse significance band, stored directly (no float translation)"
+        "LOW", description="Coarse significance band, stored directly"
     )
     baseline_ref: Optional[str] = Field(None, description="Baseline this was compared against")
     detected_at: datetime = Field(default_factory=_utcnow)
     source_engine: Optional[str] = Field(None, description="Engine/detector that emitted it")
-    # --- Phase 1 Observation Engine fields (raw signal, still no cause) -----
     current_value: Optional[float] = Field(None, description="Observed metric value")
     baseline_value: Optional[float] = Field(None, description="Expected/baseline metric value")
-    deviation_pct: Optional[float] = Field(None, description="(current - baseline) / baseline, as a fraction")
-    entity_id: Optional[str] = Field(None, description="sprint_id, resource_id, or None for project-level")
+    deviation_pct: Optional[float] = Field(None, description="(current - baseline) / baseline")
+    entity_id: Optional[str] = Field(None, description="sprint_id, resource_id, or None")
     cause: None = Field(None, description="ALWAYS None — an Observation never contains a cause")
 
 
 class ObservationCluster(BaseModel):
-    """Stage 1 output: a related group of observations detected in one pass.
-
-    cluster_severity and primary_signal are stored as explicit fields (not just
-    folded into summary) because ValidationEngine, the ReasoningTrace UI, the AI
-    advisor's ObservationSummaryFact, and Final.2 Invariant 1 all read them.
-    """
+    """Stage 1 output: a related group of observations detected in one pass."""
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     cluster_id: str
@@ -147,9 +114,8 @@ class ObservationCluster(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Stage 2 — Validation -> ValidatedObservation (per-item) + ValidationResult (batch)
+# Stage 2 — Validation
 # ---------------------------------------------------------------------------
-
 class DataQualityIssue(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
@@ -161,11 +127,7 @@ class DataQualityIssue(BaseModel):
 
 
 class ValidatedObservation(BaseModel):
-    """Per-observation wrapper: one observation confirmed real (not an artifact).
-
-    Distinct from ValidationResult below (the batch container). Kept for callers
-    that want a single observation plus its confidence/issues.
-    """
+    """Per-observation wrapper: one observation confirmed real (not an artifact)."""
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     observation: Observation
@@ -178,15 +140,15 @@ class ValidatedObservation(BaseModel):
 
 class ArtifactType(str, Enum):
     """Why an observation was suppressed during validation (Phase 1.2)."""
-    PLANNED_CAPACITY_REDUCTION = "planned_capacity_reduction"   # PTO / part-time sprint
-    ESTIMATE_OUTLIER = "estimate_outlier"                       # one giant item skews carryover
-    INSUFFICIENT_HISTORY = "insufficient_history"               # < 2 completed sprints
-    EARLY_BLOCKER = "early_blocker"                             # raised this sprint, too young
+    PLANNED_CAPACITY_REDUCTION = "planned_capacity_reduction"
+    ESTIMATE_OUTLIER = "estimate_outlier"
+    INSUFFICIENT_HISTORY = "insufficient_history"
+    EARLY_BLOCKER = "early_blocker"
 
 
 class SuppressedObservation(BaseModel):
     """An observation removed from the downstream stream, with the reason kept
-    for the audit trail (the ReasoningTrace UI shows these under Validate)."""
+    for the audit trail."""
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     observation: Observation
@@ -195,12 +157,7 @@ class SuppressedObservation(BaseModel):
 
 
 class ValidationResult(BaseModel):
-    """Stage 2 batch output. This is what downstream stages consume.
-
-    NOTE: distinct from the per-observation ValidatedObservation wrapper above.
-    This is the cluster-level result ValidationEngine.run() returns, and the
-    type of PipelineResult.validation_result.
-    """
+    """Stage 2 batch output. This is what downstream stages consume."""
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     validated: List[Observation] = Field(
@@ -210,8 +167,7 @@ class ValidationResult(BaseModel):
         default_factory=list, description="Observations removed as artifacts, with reasons"
     )
     data_confidence: float = Field(
-        1.0, ge=0.0, le=1.0,
-        description="1.0 = all validated; drops as observations are suppressed",
+        1.0, ge=0.0, le=1.0, description="1.0 = all validated; drops as observations are suppressed"
     )
     warnings: List[str] = Field(
         default_factory=list, description="Human-readable data-quality notes"
@@ -220,9 +176,8 @@ class ValidationResult(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Stage 3 — Evidence Collection -> EvidenceBundle
+# Stage 3 — Evidence Collection
 # ---------------------------------------------------------------------------
-
 class EvidenceItem(BaseModel):
     """A single timestamped, sourced, weighted fact. Immutable once recorded."""
     model_config = ConfigDict(arbitrary_types_allowed=True)
@@ -243,8 +198,6 @@ class EvidenceBundle(BaseModel):
     triggered_by_observation_ids: List[str] = Field(default_factory=list)
     items: List[EvidenceItem] = Field(default_factory=list)
     collected_at: datetime = Field(default_factory=_utcnow)
-    # Phase 2.1 hook: set True when validation_result.data_confidence < 0.5 so
-    # HypothesisGenerator caps all priors at 0.5 (garbage-in -> humble confidence).
     low_confidence_flag: bool = Field(
         False, description="True when upstream data_confidence < 0.5"
     )
@@ -254,15 +207,10 @@ class EvidenceBundle(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Stages 4 & 5 — Hypothesis Generation / Elimination -> [Hypothesis]
+# Stages 4 & 5 — Hypothesis Generation / Elimination
 # ---------------------------------------------------------------------------
-
 class Hypothesis(BaseModel):
-    """A candidate cause with a testable prediction.
-
-    Used by BOTH stage 4 (generation, status=OPEN) and stage 5 (elimination,
-    which flips survivors to SUPPORTED and killed ones to REJECTED with a reason).
-    """
+    """A candidate cause with a testable prediction."""
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     hypothesis_id: str
@@ -278,9 +226,8 @@ class Hypothesis(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Stage 6 — Root Cause Analysis -> Diagnosis
+# Stage 6 — Root Cause Analysis
 # ---------------------------------------------------------------------------
-
 class Diagnosis(BaseModel):
     """Stage 6 output: the deepest actionable cause with its causal chain."""
     model_config = ConfigDict(arbitrary_types_allowed=True)
@@ -301,9 +248,8 @@ class Diagnosis(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Stages 7-11 — Multi-dimensional Impact -> ImpactMatrix
+# Stages 7-11 — Multi-dimensional Impact
 # ---------------------------------------------------------------------------
-
 class ImpactEstimate(BaseModel):
     """One dimension's impact: magnitude + confidence."""
     model_config = ConfigDict(arbitrary_types_allowed=True)
@@ -323,13 +269,20 @@ class ImpactMatrix(BaseModel):
     estimates: Dict[str, ImpactEstimate] = Field(
         default_factory=dict, description="Keyed by ImpactDimension value"
     )
+    dominant_dimension: Optional[str] = Field(
+        None,
+        description=(
+            "ImpactDimension.value of the highest-magnitude estimate. Read by the "
+            "AI advisor's ImpactSummaryFact and the ReasoningTrace Stage-6 header. "
+            "None only when estimates is empty."
+        ),
+    )
     computed_at: datetime = Field(default_factory=_utcnow)
 
 
 # ---------------------------------------------------------------------------
-# Stage 12 — Risk Assessment -> [Risk]
+# Stage 12 — Risk Assessment
 # ---------------------------------------------------------------------------
-
 class Risk(BaseModel):
     """A prioritized risk: probability x severity over an exposure window."""
     model_config = ConfigDict(arbitrary_types_allowed=True)
@@ -348,12 +301,11 @@ class Risk(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Stage 13 — Tradeoff Analysis -> TradeoffMatrix
+# Stage 13 — Tradeoff Analysis
 # ---------------------------------------------------------------------------
-
 class TradeoffOption(BaseModel):
     """One candidate action projected across the five impact dimensions,
-    with its explicit sacrifice stated (iron triangle + people + debt)."""
+    with its explicit sacrifice stated."""
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     option_id: str
@@ -374,9 +326,8 @@ class TradeoffMatrix(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Stage 14 — Decision Making -> Decision
+# Stage 14 — Decision Making
 # ---------------------------------------------------------------------------
-
 class Decision(BaseModel):
     """Stage 14 output: the chosen alternative with rationale and rejected options."""
     model_config = ConfigDict(arbitrary_types_allowed=True)
@@ -396,9 +347,8 @@ class Decision(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Stage 15 — Execution Planning -> ExecutionPlan
+# Stage 15 — Execution Planning
 # ---------------------------------------------------------------------------
-
 class ExecutionStep(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
@@ -425,9 +375,8 @@ class ExecutionPlan(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Stage 16 — Monitoring -> TrajectoryConformance
+# Stage 16 — Monitoring
 # ---------------------------------------------------------------------------
-
 class KPIDeviation(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
@@ -451,9 +400,8 @@ class TrajectoryConformance(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Stage 17 — Learning -> LearningRecord
+# Stage 17 — Learning
 # ---------------------------------------------------------------------------
-
 class LearningRecord(BaseModel):
     """Stage 17 output: predicted vs actual, calibration + prior updates."""
     model_config = ConfigDict(arbitrary_types_allowed=True)
@@ -470,9 +418,8 @@ class LearningRecord(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Stage 18 — Knowledge Retention -> KnowledgeNode
+# Stage 18 — Knowledge Retention
 # ---------------------------------------------------------------------------
-
 class KnowledgeNode(BaseModel):
     """Stage 18 output: a reusable, cross-project pattern written to the KG."""
     model_config = ConfigDict(arbitrary_types_allowed=True)

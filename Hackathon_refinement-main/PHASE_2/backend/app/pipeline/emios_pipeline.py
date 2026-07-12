@@ -2,9 +2,9 @@
 EMIOS Pipeline — top-level contract bridging Sprint Whisperer's 9 deterministic
 engines to the EMIOS 18-stage cognitive pipeline.
 
-Stages 1-6 are LIVE (Observation, Validation, Evidence, Hypothesis Generation,
-Hypothesis Elimination, Root Cause Analysis). Stages 7-18 call stubs that return
-None until their engines land.
+Stages 1-11 are LIVE (Observation, Validation, Evidence, Hypothesis Generation,
+Hypothesis Elimination, Root Cause Analysis, Multi-dimensional Impact). Stages
+12-18 call stubs that return None until their engines land.
 """
 from __future__ import annotations
 
@@ -26,13 +26,14 @@ from app.engines.recommendation_engine.models import Recommendation, SimulationR
 
 from app.domain.models import ProjectState
 
-# --- EMIOS cognitive-stage engines (Stages 1-6 LIVE) -----------------------
+# --- EMIOS cognitive-stage engines (Stages 1-11 LIVE) ----------------------
 from app.engines.observation_engine import ObservationEngine
 from app.engines.validation_engine import ValidationEngine
 from app.engines.evidence_collector import EvidenceCollector
 from app.engines.hypothesis_generator import HypothesisGenerator
 from app.engines.hypothesis_eliminator import HypothesisEliminator
 from app.engines.root_cause_analyzer import RootCauseAnalyzer
+from app.engines.impact_assessor import ImpactAssessor
 
 # --- New EMIOS cognition/knowledge outputs (types) -------------------------
 from app.domain.emios_models import (
@@ -70,6 +71,8 @@ class PipelineResult:
     risk_result: Optional[RiskResult] = None
     recommendations: Optional[List[Recommendation]] = None
     simulation: Optional[SimulationResult] = None
+    # RiskScores from ImpactScoringEngine (retained for the QUALITY axis).
+    risk_scores: Optional[object] = None
 
     # ----- New EMIOS 18-stage cognitive outputs ----------------------------
     observation_cluster: Optional[ObservationCluster] = None      # Stage 1
@@ -92,8 +95,8 @@ class PipelineResult:
 # Helpers
 # ---------------------------------------------------------------------------
 def _velocity_artifact_suppressed(validation: Optional[ValidationResult]) -> bool:
-    """True if Stage 2 suppressed a velocity observation as a planned
-    capacity reduction (PTO). Lets Stage 5 kill the VELOCITY hypothesis."""
+    """True if Stage 2 suppressed a velocity observation as a planned capacity
+    reduction (PTO). Lets Stage 5 kill the VELOCITY hypothesis."""
     if validation is None:
         return False
     for s in getattr(validation, "suppressed", []) or []:
@@ -105,7 +108,7 @@ def _velocity_artifact_suppressed(validation: Optional[ValidationResult]) -> boo
 
 
 # ---------------------------------------------------------------------------
-# EMIOS stage functions (1-6 LIVE, 7-18 stubs)
+# EMIOS stage functions (1-11 LIVE, 12-18 stubs)
 # ---------------------------------------------------------------------------
 def _stage_01_observe(state: ProjectState, result: PipelineResult) -> Optional[ObservationCluster]:
     if result.metrics is None or result.forecast is None:
@@ -185,8 +188,27 @@ def _stage_06_root_cause(
     )
 
 
-# ---- Stages 7-18 remain stubs until their engines are implemented ----------
-def _stages_07_11_impact(state, diagnosis, result): return None
+def _stages_07_11_impact(
+    state: ProjectState, diagnosis: Optional[Diagnosis], result: PipelineResult
+) -> Optional[ImpactMatrix]:
+    """Stages 7-11: multi-dimensional impact. Runs even when diagnosis is None
+    (emits a full five-axis grid at low magnitude) so Phase 4 always has a
+    complete matrix; skips only when the base forecast is unavailable."""
+    if result.forecast is None:
+        return None
+    return ImpactAssessor().run(
+        diagnosis,
+        state,
+        forecast=result.forecast,
+        risk_result=result.risk_result,
+        monte_carlo=result.monte_carlo,
+        metrics=result.metrics,
+        critical_path=result.critical_path,
+        impact_scores=result.risk_scores,
+    )
+
+
+# ---- Stages 12-18 remain stubs until their engines are implemented ---------
 def _stage_12_assess_risk(impact, result): return None
 def _stage_13_tradeoffs(risks, result): return None
 def _stage_14_decide(matrix): return None
@@ -226,6 +248,7 @@ def run_emios_pipeline(
         seed=seed,
     ).calculate()
     impact_scores = ImpactScoringEngine(state, result.dependency_dag).score()
+    result.risk_scores = impact_scores  # retained for the QUALITY impact axis
     result.risk_result = RiskEngine(
         project_state=state,
         metrics=result.metrics,
@@ -250,7 +273,7 @@ def run_emios_pipeline(
             result.simulation = None
 
     # ===== EMIOS cognitive pipeline =========================================
-    # Stages 1-6: LIVE.
+    # Stages 1-11: LIVE.
     result.observation_cluster = _stage_01_observe(state, result)
     result.validation_result = _stage_02_validate(state, result.observation_cluster)
     result.evidence_bundle = _stage_03_collect_evidence(state, result.validation_result, result)
@@ -259,9 +282,9 @@ def run_emios_pipeline(
         result.hypotheses, result.evidence_bundle, state, result
     )
     result.diagnosis = _stage_06_root_cause(result.surviving_hypotheses, state, result)
-
-    # Stages 7-18: stubs (return None) until engines are implemented.
     result.impact_matrix = _stages_07_11_impact(state, result.diagnosis, result)
+
+    # Stages 12-18: stubs (return None) until engines are implemented.
     result.risks = _stage_12_assess_risk(result.impact_matrix, result)
     result.tradeoff_matrix = _stage_13_tradeoffs(result.risks, result)
     result.decision = _stage_14_decide(result.tradeoff_matrix)
