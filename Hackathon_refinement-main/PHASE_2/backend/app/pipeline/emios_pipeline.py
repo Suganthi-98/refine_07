@@ -33,6 +33,7 @@ from app.domain.models import ProjectState
 from app.domain.emios_models import (
     ObservationCluster,
     ValidatedObservation,
+    ValidationResult,
     EvidenceBundle,
     Hypothesis,
     Diagnosis,
@@ -76,8 +77,8 @@ class PipelineResult:
     # ----- New EMIOS 18-stage cognitive outputs (9 net-new types) ----------
     # Stage 1
     observation_cluster: Optional[ObservationCluster] = None
-    # Stage 2
-    validated_observations: Optional[List[ValidatedObservation]] = None
+    # Stage 2 (batch container: validated + suppressed + data_confidence + warnings)
+    validation_result: Optional[ValidationResult] = None
     # Stage 3
     evidence_bundle: Optional[EvidenceBundle] = None
     # Stage 4 (generation) + Stage 5 (elimination survivors)
@@ -114,13 +115,15 @@ def _stage_01_observe(state: ProjectState, result: PipelineResult) -> Optional[O
 
 def _stage_02_validate(
     state: ProjectState, cluster: Optional[ObservationCluster]
-) -> Optional[List[ValidatedObservation]]:
-    """Stage 2: confirm signals are real, assign data_confidence."""
+) -> Optional[ValidationResult]:
+    """Stage 2: confirm signals are real, suppress artifacts, assign data_confidence.
+    Returns the batch ValidationResult (validated + suppressed + data_confidence +
+    warnings). Phase 2.1's EvidenceCollector reads .validated and .data_confidence."""
     return None
 
 
 def _stage_03_collect_evidence(
-    state: ProjectState, validated: Optional[List[ValidatedObservation]], result: PipelineResult
+    state: ProjectState, validation: Optional[ValidationResult], result: PipelineResult
 ) -> Optional[EvidenceBundle]:
     """Stage 3: gather correlated signals across time/entities into a bundle."""
     return None
@@ -259,9 +262,9 @@ def run_emios_pipeline(
 
     # ===== EMIOS 18-stage cognitive pipeline (stubs, return None) ===========
     result.observation_cluster = _stage_01_observe(state, result)
-    result.validated_observations = _stage_02_validate(state, result.observation_cluster)
+    result.validation_result = _stage_02_validate(state, result.observation_cluster)
     result.evidence_bundle = _stage_03_collect_evidence(
-        state, result.validated_observations, result
+        state, result.validation_result, result
     )
     result.hypotheses = _stage_04_generate_hypotheses(result.evidence_bundle)
     result.surviving_hypotheses = _stage_05_eliminate_hypotheses(

@@ -1,8 +1,8 @@
 """
 EMIOS Domain Models — Cognition + Knowledge contexts.
 
-Pydantic v2 models for the 9 NEW output types the EMIOS 18-stage cognitive
-pipeline introduces on top of Sprint Whisperer's 9 deterministic engines.
+Pydantic v2 models for the EMIOS 18-stage cognitive pipeline built on top of
+Sprint Whisperer's 9 deterministic engines.
 
 Design rules (from the EMIOS blueprint):
   - An Observation NEVER contains a cause (Stage 1 is neutral).
@@ -64,10 +64,10 @@ class HealthState(str, Enum):
     """Project health state machine, shared with the Recovery Engine.
 
     SIX states, not five: the blueprint's Part 2 canonical state machine has
-    Healthy → Watch → Warning → Critical → Recovery → Recovered, where
+    Healthy -> Watch -> Warning -> Critical -> Recovery -> Recovered, where
     RECOVERY is the transient 'plan is actively running' state and RECOVERED
     is the terminal 'exit KPIs met' state that then decays back to Healthy
-    after N sustained sprints (Recovered → Healthy). They are distinct: a plan
+    after N sustained sprints (Recovered -> Healthy). They are distinct: a plan
     can fail out of RECOVERY back to CRITICAL (rollback) without ever reaching
     RECOVERED. Keep both — collapsing them loses the rollback vs. success
     distinction the Recovery state machine (Phase 5) depends on.
@@ -96,7 +96,7 @@ class ExecutionPlanStatus(str, Enum):
 
 
 # ---------------------------------------------------------------------------
-# Stage 1 — Observation → ObservationCluster
+# Stage 1 — Observation -> ObservationCluster
 # ---------------------------------------------------------------------------
 
 class Observation(BaseModel):
@@ -147,7 +147,7 @@ class ObservationCluster(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Stage 2 — Validation → ValidatedObservation
+# Stage 2 — Validation -> ValidatedObservation (per-item) + ValidationResult (batch)
 # ---------------------------------------------------------------------------
 
 class DataQualityIssue(BaseModel):
@@ -161,7 +161,11 @@ class DataQualityIssue(BaseModel):
 
 
 class ValidatedObservation(BaseModel):
-    """Stage 2 output: an observation confirmed real (not a data artifact)."""
+    """Per-observation wrapper: one observation confirmed real (not an artifact).
+
+    Distinct from ValidationResult below (the batch container). Kept for callers
+    that want a single observation plus its confidence/issues.
+    """
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     observation: Observation
@@ -172,8 +176,51 @@ class ValidatedObservation(BaseModel):
     validated_at: datetime = Field(default_factory=_utcnow)
 
 
+class ArtifactType(str, Enum):
+    """Why an observation was suppressed during validation (Phase 1.2)."""
+    PLANNED_CAPACITY_REDUCTION = "planned_capacity_reduction"   # PTO / part-time sprint
+    ESTIMATE_OUTLIER = "estimate_outlier"                       # one giant item skews carryover
+    INSUFFICIENT_HISTORY = "insufficient_history"               # < 2 completed sprints
+    EARLY_BLOCKER = "early_blocker"                             # raised this sprint, too young
+
+
+class SuppressedObservation(BaseModel):
+    """An observation removed from the downstream stream, with the reason kept
+    for the audit trail (the ReasoningTrace UI shows these under Validate)."""
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    observation: Observation
+    artifact_type: ArtifactType
+    reason: str = Field(..., description="Human-readable suppression reason")
+
+
+class ValidationResult(BaseModel):
+    """Stage 2 batch output. This is what downstream stages consume.
+
+    NOTE: distinct from the per-observation ValidatedObservation wrapper above.
+    This is the cluster-level result ValidationEngine.run() returns, and the
+    type of PipelineResult.validation_result.
+    """
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    validated: List[Observation] = Field(
+        default_factory=list, description="Observations that passed validation"
+    )
+    suppressed: List[SuppressedObservation] = Field(
+        default_factory=list, description="Observations removed as artifacts, with reasons"
+    )
+    data_confidence: float = Field(
+        1.0, ge=0.0, le=1.0,
+        description="1.0 = all validated; drops as observations are suppressed",
+    )
+    warnings: List[str] = Field(
+        default_factory=list, description="Human-readable data-quality notes"
+    )
+    validated_at: datetime = Field(default_factory=_utcnow)
+
+
 # ---------------------------------------------------------------------------
-# Stage 3 — Evidence Collection → EvidenceBundle
+# Stage 3 — Evidence Collection -> EvidenceBundle
 # ---------------------------------------------------------------------------
 
 class EvidenceItem(BaseModel):
@@ -196,10 +243,18 @@ class EvidenceBundle(BaseModel):
     triggered_by_observation_ids: List[str] = Field(default_factory=list)
     items: List[EvidenceItem] = Field(default_factory=list)
     collected_at: datetime = Field(default_factory=_utcnow)
+    # Phase 2.1 hook: set True when validation_result.data_confidence < 0.5 so
+    # HypothesisGenerator caps all priors at 0.5 (garbage-in -> humble confidence).
+    low_confidence_flag: bool = Field(
+        False, description="True when upstream data_confidence < 0.5"
+    )
+    data_confidence: float = Field(
+        1.0, ge=0.0, le=1.0, description="Inherited from ValidationResult.data_confidence"
+    )
 
 
 # ---------------------------------------------------------------------------
-# Stages 4 & 5 — Hypothesis Generation / Elimination → [Hypothesis]
+# Stages 4 & 5 — Hypothesis Generation / Elimination -> [Hypothesis]
 # ---------------------------------------------------------------------------
 
 class Hypothesis(BaseModel):
@@ -223,7 +278,7 @@ class Hypothesis(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Stage 6 — Root Cause Analysis → Diagnosis
+# Stage 6 — Root Cause Analysis -> Diagnosis
 # ---------------------------------------------------------------------------
 
 class Diagnosis(BaseModel):
@@ -246,7 +301,7 @@ class Diagnosis(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Stages 7–11 — Multi-dimensional Impact → ImpactMatrix
+# Stages 7-11 — Multi-dimensional Impact -> ImpactMatrix
 # ---------------------------------------------------------------------------
 
 class ImpactEstimate(BaseModel):
@@ -272,11 +327,11 @@ class ImpactMatrix(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Stage 12 — Risk Assessment → [Risk]
+# Stage 12 — Risk Assessment -> [Risk]
 # ---------------------------------------------------------------------------
 
 class Risk(BaseModel):
-    """A prioritized risk: probability × severity over an exposure window."""
+    """A prioritized risk: probability x severity over an exposure window."""
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     risk_id: str
@@ -293,7 +348,7 @@ class Risk(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Stage 13 — Tradeoff Analysis → TradeoffMatrix
+# Stage 13 — Tradeoff Analysis -> TradeoffMatrix
 # ---------------------------------------------------------------------------
 
 class TradeoffOption(BaseModel):
@@ -319,7 +374,7 @@ class TradeoffMatrix(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Stage 14 — Decision Making → Decision
+# Stage 14 — Decision Making -> Decision
 # ---------------------------------------------------------------------------
 
 class Decision(BaseModel):
@@ -341,7 +396,7 @@ class Decision(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Stage 15 — Execution Planning → ExecutionPlan
+# Stage 15 — Execution Planning -> ExecutionPlan
 # ---------------------------------------------------------------------------
 
 class ExecutionStep(BaseModel):
@@ -370,7 +425,7 @@ class ExecutionPlan(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Stage 16 — Monitoring → TrajectoryConformance
+# Stage 16 — Monitoring -> TrajectoryConformance
 # ---------------------------------------------------------------------------
 
 class KPIDeviation(BaseModel):
@@ -396,7 +451,7 @@ class TrajectoryConformance(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Stage 17 — Learning → LearningRecord
+# Stage 17 — Learning -> LearningRecord
 # ---------------------------------------------------------------------------
 
 class LearningRecord(BaseModel):
@@ -415,7 +470,7 @@ class LearningRecord(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Stage 18 — Knowledge Retention → KnowledgeNode
+# Stage 18 — Knowledge Retention -> KnowledgeNode
 # ---------------------------------------------------------------------------
 
 class KnowledgeNode(BaseModel):
