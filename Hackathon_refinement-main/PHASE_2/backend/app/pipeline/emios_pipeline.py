@@ -29,6 +29,10 @@ from app.engines.recommendation_engine.models import Recommendation, SimulationR
 
 from app.domain.models import ProjectState
 
+# --- EMIOS Stage 1 & 2 engines (LIVE) -------------------------------------
+from app.engines.observation_engine import ObservationEngine
+from app.engines.validation_engine import ValidationEngine
+
 # --- New EMIOS cognition/knowledge outputs (types) -------------------------
 from app.domain.emios_models import (
     ObservationCluster,
@@ -48,7 +52,6 @@ from app.domain.emios_models import (
 )
 
 MONTE_CARLO_SEED: int = 42
-
 
 # ---------------------------------------------------------------------------
 # PipelineResult — all 18 stage outputs, every field Optional
@@ -103,14 +106,21 @@ class PipelineResult:
     # Stage 18
     knowledge_node: Optional[KnowledgeNode] = None
 
-
 # ---------------------------------------------------------------------------
-# EMIOS stage stubs (1-18) — return None until each engine is implemented
+# EMIOS stage implementations (1-2 LIVE, 3-18 stubs)
 # ---------------------------------------------------------------------------
 
 def _stage_01_observe(state: ProjectState, result: PipelineResult) -> Optional[ObservationCluster]:
     """Stage 1: neutral anomaly/trend/threshold detection over metrics. No cause."""
-    return None
+    if result.metrics is None or result.forecast is None:
+        return None
+    engine = ObservationEngine()
+    return engine.run(
+        state=state,
+        metrics=result.metrics,
+        forecast=result.forecast,
+        monte_carlo=result.monte_carlo,
+    )
 
 
 def _stage_02_validate(
@@ -119,7 +129,10 @@ def _stage_02_validate(
     """Stage 2: confirm signals are real, suppress artifacts, assign data_confidence.
     Returns the batch ValidationResult (validated + suppressed + data_confidence +
     warnings). Phase 2.1's EvidenceCollector reads .validated and .data_confidence."""
-    return None
+    if cluster is None:
+        return None
+    engine = ValidationEngine()
+    return engine.run(cluster=cluster, state=state)
 
 
 def _stage_03_collect_evidence(
@@ -197,9 +210,8 @@ def _stage_18_retain(learning: Optional[LearningRecord]) -> Optional[KnowledgeNo
     """Stage 18: write the episode into the KG as a reusable pattern."""
     return None
 
-
 # ---------------------------------------------------------------------------
-# run_emios_pipeline — 9 real engines, then 18 cognitive-stage stubs
+# run_emios_pipeline — 9 real engines, then 18 cognitive-stage calls
 # ---------------------------------------------------------------------------
 
 def run_emios_pipeline(
@@ -211,8 +223,9 @@ def run_emios_pipeline(
     """Run the combined 9-engine + 18-stage EMIOS pipeline.
 
     Today: runs all 9 existing Sprint Whisperer engines in EngineRunner order
-    and populates their outputs. Stages 1-18 call stubs that return None, so
-    the cognitive fields stay unset until their engines are implemented.
+    and populates their outputs. Stages 1-2 are LIVE (ObservationEngine +
+    ValidationEngine). Stages 3-18 call stubs that return None until their
+    engines are implemented.
     """
     result = PipelineResult()
 
@@ -260,9 +273,12 @@ def run_emios_pipeline(
         except Exception:
             result.simulation = None
 
-    # ===== EMIOS 18-stage cognitive pipeline (stubs, return None) ===========
+    # ===== EMIOS 18-stage cognitive pipeline ================================
+    # Stages 1-2: LIVE — real engines producing real outputs.
     result.observation_cluster = _stage_01_observe(state, result)
     result.validation_result = _stage_02_validate(state, result.observation_cluster)
+
+    # Stages 3-18: stubs (return None) until engines are implemented.
     result.evidence_bundle = _stage_03_collect_evidence(
         state, result.validation_result, result
     )
