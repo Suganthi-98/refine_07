@@ -2,16 +2,13 @@
 EMIOS Pipeline — top-level contract bridging Sprint Whisperer's 9 deterministic
 engines to the EMIOS 18-stage cognitive pipeline.
 
-PipelineResult holds ALL 18 stage outputs as Optional fields: the 9 existing
-Sprint Whisperer outputs are populated by run_emios_pipeline() today; the 9 new
-cognition/knowledge outputs are stubbed (return None) until their engines land.
-
-The 9-engine run order mirrors EngineRunner.run() in simulation_engine.py exactly,
-so this uses the real constructors, not guessed ones.
+Stages 1-6 are LIVE (Observation, Validation, Evidence, Hypothesis Generation,
+Hypothesis Elimination, Root Cause Analysis). Stages 7-18 call stubs that return
+None until their engines land.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import List, Optional
 
 # --- Existing Sprint Whisperer engine outputs (types) ----------------------
@@ -29,15 +26,19 @@ from app.engines.recommendation_engine.models import Recommendation, SimulationR
 
 from app.domain.models import ProjectState
 
-# --- EMIOS Stage 1 & 2 engines (LIVE) -------------------------------------
+# --- EMIOS cognitive-stage engines (Stages 1-6 LIVE) -----------------------
 from app.engines.observation_engine import ObservationEngine
 from app.engines.validation_engine import ValidationEngine
+from app.engines.evidence_collector import EvidenceCollector
+from app.engines.hypothesis_generator import HypothesisGenerator
+from app.engines.hypothesis_eliminator import HypothesisEliminator
+from app.engines.root_cause_analyzer import RootCauseAnalyzer
 
 # --- New EMIOS cognition/knowledge outputs (types) -------------------------
 from app.domain.emios_models import (
     ObservationCluster,
-    ValidatedObservation,
     ValidationResult,
+    ArtifactType,
     EvidenceBundle,
     Hypothesis,
     Diagnosis,
@@ -53,19 +54,12 @@ from app.domain.emios_models import (
 
 MONTE_CARLO_SEED: int = 42
 
+
 # ---------------------------------------------------------------------------
 # PipelineResult — all 18 stage outputs, every field Optional
 # ---------------------------------------------------------------------------
-
 @dataclass
 class PipelineResult:
-    """Holds every output of the combined 9+9 pipeline.
-
-    Existing Sprint Whisperer engines populate the first block today.
-    EMIOS cognitive-stage engines fill the rest as they come online; until
-    then those fields stay None.
-    """
-
     # ----- Existing Sprint Whisperer engine outputs (9) --------------------
     metrics: Optional[ProjectMetrics] = None
     dependency_dag: Optional[DependencyDAG] = None
@@ -77,45 +71,46 @@ class PipelineResult:
     recommendations: Optional[List[Recommendation]] = None
     simulation: Optional[SimulationResult] = None
 
-    # ----- New EMIOS 18-stage cognitive outputs (9 net-new types) ----------
-    # Stage 1
-    observation_cluster: Optional[ObservationCluster] = None
-    # Stage 2 (batch container: validated + suppressed + data_confidence + warnings)
-    validation_result: Optional[ValidationResult] = None
-    # Stage 3
-    evidence_bundle: Optional[EvidenceBundle] = None
-    # Stage 4 (generation) + Stage 5 (elimination survivors)
-    hypotheses: Optional[List[Hypothesis]] = None
-    surviving_hypotheses: Optional[List[Hypothesis]] = None
-    # Stage 6
-    diagnosis: Optional[Diagnosis] = None
-    # Stages 7-11
-    impact_matrix: Optional[ImpactMatrix] = None
-    # Stage 12 (EMIOS Risk objects; distinct from the deterministic RiskResult above)
-    risks: Optional[List[Risk]] = None
-    # Stage 13
-    tradeoff_matrix: Optional[TradeoffMatrix] = None
-    # Stage 14
-    decision: Optional[Decision] = None
-    # Stage 15
-    execution_plan: Optional[ExecutionPlan] = None
-    # Stage 16
-    trajectory_conformance: Optional[TrajectoryConformance] = None
-    # Stage 17
-    learning_record: Optional[LearningRecord] = None
-    # Stage 18
-    knowledge_node: Optional[KnowledgeNode] = None
+    # ----- New EMIOS 18-stage cognitive outputs ----------------------------
+    observation_cluster: Optional[ObservationCluster] = None      # Stage 1
+    validation_result: Optional[ValidationResult] = None          # Stage 2
+    evidence_bundle: Optional[EvidenceBundle] = None              # Stage 3
+    hypotheses: Optional[List[Hypothesis]] = None                # Stage 4
+    surviving_hypotheses: Optional[List[Hypothesis]] = None      # Stage 5
+    diagnosis: Optional[Diagnosis] = None                        # Stage 6
+    impact_matrix: Optional[ImpactMatrix] = None                 # Stages 7-11
+    risks: Optional[List[Risk]] = None                           # Stage 12
+    tradeoff_matrix: Optional[TradeoffMatrix] = None             # Stage 13
+    decision: Optional[Decision] = None                          # Stage 14
+    execution_plan: Optional[ExecutionPlan] = None               # Stage 15
+    trajectory_conformance: Optional[TrajectoryConformance] = None  # Stage 16
+    learning_record: Optional[LearningRecord] = None             # Stage 17
+    knowledge_node: Optional[KnowledgeNode] = None               # Stage 18
+
 
 # ---------------------------------------------------------------------------
-# EMIOS stage implementations (1-2 LIVE, 3-18 stubs)
+# Helpers
 # ---------------------------------------------------------------------------
+def _velocity_artifact_suppressed(validation: Optional[ValidationResult]) -> bool:
+    """True if Stage 2 suppressed a velocity observation as a planned
+    capacity reduction (PTO). Lets Stage 5 kill the VELOCITY hypothesis."""
+    if validation is None:
+        return False
+    for s in getattr(validation, "suppressed", []) or []:
+        obs = getattr(s, "observation", None)
+        metric = getattr(obs, "metric_ref", None)
+        if metric == "velocity" and getattr(s, "artifact_type", None) == ArtifactType.PLANNED_CAPACITY_REDUCTION:
+            return True
+    return False
 
+
+# ---------------------------------------------------------------------------
+# EMIOS stage functions (1-6 LIVE, 7-18 stubs)
+# ---------------------------------------------------------------------------
 def _stage_01_observe(state: ProjectState, result: PipelineResult) -> Optional[ObservationCluster]:
-    """Stage 1: neutral anomaly/trend/threshold detection over metrics. No cause."""
     if result.metrics is None or result.forecast is None:
         return None
-    engine = ObservationEngine()
-    return engine.run(
+    return ObservationEngine().run(
         state=state,
         metrics=result.metrics,
         forecast=result.forecast,
@@ -123,114 +118,96 @@ def _stage_01_observe(state: ProjectState, result: PipelineResult) -> Optional[O
     )
 
 
-def _stage_02_validate(
-    state: ProjectState, cluster: Optional[ObservationCluster]
-) -> Optional[ValidationResult]:
-    """Stage 2: confirm signals are real, suppress artifacts, assign data_confidence.
-    Returns the batch ValidationResult (validated + suppressed + data_confidence +
-    warnings). Phase 2.1's EvidenceCollector reads .validated and .data_confidence."""
+def _stage_02_validate(state: ProjectState, cluster: Optional[ObservationCluster]) -> Optional[ValidationResult]:
     if cluster is None:
         return None
-    engine = ValidationEngine()
-    return engine.run(cluster=cluster, state=state)
+    return ValidationEngine().run(cluster=cluster, state=state)
 
 
 def _stage_03_collect_evidence(
     state: ProjectState, validation: Optional[ValidationResult], result: PipelineResult
 ) -> Optional[EvidenceBundle]:
-    """Stage 3: gather correlated signals across time/entities into a bundle."""
-    return None
+    if validation is None:
+        return None
+    return EvidenceCollector().run(
+        validation, state,
+        forecast=result.forecast,
+        risk_result=result.risk_result,
+        metrics=result.metrics,
+        monte_carlo=result.monte_carlo,
+        critical_path=result.critical_path,
+    )
 
 
 def _stage_04_generate_hypotheses(
-    bundle: Optional[EvidenceBundle],
+    bundle: Optional[EvidenceBundle], state: ProjectState, result: PipelineResult
 ) -> Optional[List[Hypothesis]]:
-    """Stage 4: enumerate ALL plausible causes (counters anchoring bias)."""
-    return None
+    if bundle is None:
+        return None
+    return HypothesisGenerator().run(
+        bundle, state,
+        forecast=result.forecast,
+        metrics=result.metrics,
+        monte_carlo=result.monte_carlo,
+        critical_path=result.critical_path,
+    )
 
 
 def _stage_05_eliminate_hypotheses(
-    hypotheses: Optional[List[Hypothesis]], bundle: Optional[EvidenceBundle]
+    hypotheses: Optional[List[Hypothesis]],
+    bundle: Optional[EvidenceBundle],
+    state: ProjectState,
+    result: PipelineResult,
 ) -> Optional[List[Hypothesis]]:
-    """Stage 5: falsify aggressively; return survivors with updated posteriors."""
-    return None
+    if not hypotheses or bundle is None:
+        return None
+    return HypothesisEliminator().run(
+        hypotheses, bundle, state,
+        forecast=result.forecast,
+        metrics=result.metrics,
+        monte_carlo=result.monte_carlo,
+        critical_path=result.critical_path,
+        velocity_artifact_suppressed=_velocity_artifact_suppressed(result.validation_result),
+    )
 
 
 def _stage_06_root_cause(
-    survivors: Optional[List[Hypothesis]], bundle: Optional[EvidenceBundle]
+    survivors: Optional[List[Hypothesis]], state: ProjectState, result: PipelineResult
 ) -> Optional[Diagnosis]:
-    """Stage 6: 5-Whys + Fishbone to the deepest actionable cause."""
-    return None
+    if not survivors:
+        return None
+    return RootCauseAnalyzer().run(
+        survivors, state,
+        forecast=result.forecast,
+        metrics=result.metrics,
+        monte_carlo=result.monte_carlo,
+        critical_path=result.critical_path,
+    )
 
 
-def _stages_07_11_impact(
-    state: ProjectState, diagnosis: Optional[Diagnosis], result: PipelineResult
-) -> Optional[ImpactMatrix]:
-    """Stages 7-11: schedule / quality / resource / business / org impact."""
-    return None
+# ---- Stages 7-18 remain stubs until their engines are implemented ----------
+def _stages_07_11_impact(state, diagnosis, result): return None
+def _stage_12_assess_risk(impact, result): return None
+def _stage_13_tradeoffs(risks, result): return None
+def _stage_14_decide(matrix): return None
+def _stage_15_plan(decision): return None
+def _stage_16_monitor(plan, state): return None
+def _stage_17_learn(conformance, decision): return None
+def _stage_18_retain(learning): return None
 
-
-def _stage_12_assess_risk(
-    impact: Optional[ImpactMatrix], result: PipelineResult
-) -> Optional[List[Risk]]:
-    """Stage 12: convert impacts into prioritized Risk objects (prob × severity)."""
-    return None
-
-
-def _stage_13_tradeoffs(
-    risks: Optional[List[Risk]], result: PipelineResult
-) -> Optional[TradeoffMatrix]:
-    """Stage 13: project each option across five axes; surface the sacrifice."""
-    return None
-
-
-def _stage_14_decide(matrix: Optional[TradeoffMatrix]) -> Optional[Decision]:
-    """Stage 14: MCDA over alternatives with feasibility gates."""
-    return None
-
-
-def _stage_15_plan(decision: Optional[Decision]) -> Optional[ExecutionPlan]:
-    """Stage 15: turn the decision into a runnable plan with owners + KPIs."""
-    return None
-
-
-def _stage_16_monitor(plan: Optional[ExecutionPlan], state: ProjectState) -> Optional[TrajectoryConformance]:
-    """Stage 16: track KPIs vs predicted trajectory; emit deviations."""
-    return None
-
-
-def _stage_17_learn(
-    conformance: Optional[TrajectoryConformance], decision: Optional[Decision]
-) -> Optional[LearningRecord]:
-    """Stage 17: compare predicted vs actual, update calibration + priors."""
-    return None
-
-
-def _stage_18_retain(learning: Optional[LearningRecord]) -> Optional[KnowledgeNode]:
-    """Stage 18: write the episode into the KG as a reusable pattern."""
-    return None
 
 # ---------------------------------------------------------------------------
-# run_emios_pipeline — 9 real engines, then 18 cognitive-stage calls
+# run_emios_pipeline
 # ---------------------------------------------------------------------------
-
 def run_emios_pipeline(
     state: ProjectState,
     *,
     simulation_count: int = 1000,
     seed: int = MONTE_CARLO_SEED,
 ) -> PipelineResult:
-    """Run the combined 9-engine + 18-stage EMIOS pipeline.
-
-    Today: runs all 9 existing Sprint Whisperer engines in EngineRunner order
-    and populates their outputs. Stages 1-2 are LIVE (ObservationEngine +
-    ValidationEngine). Stages 3-18 call stubs that return None until their
-    engines are implemented.
-    """
     result = PipelineResult()
 
     # ===== Existing Sprint Whisperer 9-engine pipeline (real calls) =========
-    # Order mirrors EngineRunner.run() in simulation_engine.py.
     result.metrics = MetricsEngine(state).calculate()
     result.dependency_dag = DependencyGraphEngine(state).build_dag()
     result.critical_path = CriticalPathEngine(state, result.dependency_dag).analyze()
@@ -260,7 +237,6 @@ def run_emios_pipeline(
         impact_scores=impact_scores,
     ).analyze()
 
-    # Recommendations (V2 greedy optimizer) + its best-scenario simulation.
     rec_engine = RecommendationEngineV2(
         project_state=state, simulation_count=simulation_count
     )
@@ -273,22 +249,18 @@ def run_emios_pipeline(
         except Exception:
             result.simulation = None
 
-    # ===== EMIOS 18-stage cognitive pipeline ================================
-    # Stages 1-2: LIVE — real engines producing real outputs.
+    # ===== EMIOS cognitive pipeline =========================================
+    # Stages 1-6: LIVE.
     result.observation_cluster = _stage_01_observe(state, result)
     result.validation_result = _stage_02_validate(state, result.observation_cluster)
-
-    # Stages 3-18: stubs (return None) until engines are implemented.
-    result.evidence_bundle = _stage_03_collect_evidence(
-        state, result.validation_result, result
-    )
-    result.hypotheses = _stage_04_generate_hypotheses(result.evidence_bundle)
+    result.evidence_bundle = _stage_03_collect_evidence(state, result.validation_result, result)
+    result.hypotheses = _stage_04_generate_hypotheses(result.evidence_bundle, state, result)
     result.surviving_hypotheses = _stage_05_eliminate_hypotheses(
-        result.hypotheses, result.evidence_bundle
+        result.hypotheses, result.evidence_bundle, state, result
     )
-    result.diagnosis = _stage_06_root_cause(
-        result.surviving_hypotheses, result.evidence_bundle
-    )
+    result.diagnosis = _stage_06_root_cause(result.surviving_hypotheses, state, result)
+
+    # Stages 7-18: stubs (return None) until engines are implemented.
     result.impact_matrix = _stages_07_11_impact(state, result.diagnosis, result)
     result.risks = _stage_12_assess_risk(result.impact_matrix, result)
     result.tradeoff_matrix = _stage_13_tradeoffs(result.risks, result)

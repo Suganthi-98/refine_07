@@ -5,10 +5,13 @@ Observation Signals (EMIOS Stage 1: Observation input stream).
 Each Signal is a NEUTRAL deviation report: metric, current, baseline, deviation,
 and a significance band. It contains no cause (Stage 1 rule).
 
-NOTE on on_time_probability: it lives on MonteCarloResult, NOT ForecastResult
-(verified against models_phase3.py). To keep your requested signature intact,
-monte_carlo is an OPTIONAL third arg; when omitted the on-time signal is skipped
-rather than fabricated. Pass result.monte_carlo to include it.
+NOTE on on_time_probability: it lives on MonteCarloResult, NOT ForecastResult.
+monte_carlo is an OPTIONAL third arg; when omitted the on-time signal is skipped.
+
+RESOURCE LOAD FIX: DeveloperMetrics has no capacity field, so the old
+remaining/capacity ratio fell back to alloc*avail (<=1.0) and never showed
+overload. Load now comes from ProjectMetrics.resource_sprint_loads (peak per
+resource), matching ObservationEngine and the Phase 2 cognition layer.
 """
 from __future__ import annotations
 
@@ -18,6 +21,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from app.engines.metrics_engine import ProjectMetrics
 from app.api.models_phase3 import ForecastResult, MonteCarloResult
+from app.engines import cognition_common as cc  # shared resource-load source
 
 
 class Signal(BaseModel):
@@ -32,10 +36,8 @@ class Signal(BaseModel):
     entity_id: Optional[str] = Field(None, description="resource_id / sprint_id, or None for project-level")
 
 
-# Significance thresholds on absolute deviation fraction. Tunable per project;
-# these are deliberately conservative so only real moves flag HIGH.
-_HIGH = 0.25   # >= 25% deviation
-_MED = 0.10    # >= 10% deviation
+_HIGH = 0.25
+_MED = 0.10
 
 
 def _significance(deviation_pct: float) -> str:
@@ -48,7 +50,6 @@ def _significance(deviation_pct: float) -> str:
 
 
 def _safe_pct(current: float, baseline: float) -> float:
-    """(current - baseline) / baseline, guarding divide-by-zero."""
     if baseline == 0:
         return 0.0 if current == 0 else 1.0
     return (current - baseline) / abs(baseline)
@@ -79,14 +80,12 @@ class SignalMapper:
 
         return signals
 
-    # --- velocity_trend_pct: trend vs a flat (0%) baseline -----------------
+    # --- velocity_trend_pct -----------------------------------------------
     def _velocity_trend_signal(self, metrics: ProjectMetrics) -> List[Signal]:
         vm = getattr(metrics, "velocity_metrics", None)
         if vm is None:
             return []
         trend = float(getattr(vm, "velocity_trend_pct", 0.0) or 0.0)
-        # velocity_trend_pct is already a percentage-change figure; baseline is
-        # 0% (no trend). Express deviation directly as the trend fraction.
         trend_frac = trend / 100.0 if abs(trend) > 1.0 else trend
         return [Signal(
             metric_name="velocity_trend_pct",
@@ -96,16 +95,12 @@ class SignalMapper:
             significance=_significance(trend_frac),
         )]
 
-    # --- on_time_probability: current MC prob vs a 0.85 target baseline ----
+    # --- on_time_probability ----------------------------------------------
     def _on_time_probability_signal(self, monte_carlo: Optional[MonteCarloResult]) -> Optional[Signal]:
         if monte_carlo is None:
-            return None  # source lives on MC, not forecast — skip if not provided
+            return None
         otp = float(getattr(monte_carlo, "on_time_probability", 0.0) or 0.0)
-        # TODO Phase 6: replace with CalibrationStore.get_team_baseline(team_id),
-        # or derive from historical MonteCarloResult mean across completed
-        # projects. A team that historically delivers at 70% is not in distress
-        # at 70%; a fixed 0.85 target flags them falsely until calibrated.
-        baseline = 0.85  # a healthy delivery target; deviation below this is the signal
+        baseline = 0.85
         dev = _safe_pct(otp, baseline)
         return Signal(
             metric_name="on_time_probability",
@@ -115,32 +110,38 @@ class SignalMapper:
             significance=_significance(dev),
         )
 
-    # --- load_ratio per resource: assigned vs available capacity -----------
+    # --- load_ratio per resource  (FIXED: reads resource_sprint_loads) ----
     def _resource_load_signals(self, metrics: ProjectMetrics) -> List[Signal]:
+        """Peak load per resource from resource_sprint_loads (baseline 1.0 =
+        fully loaded). Falls back to alloc*avail (baseline 0.8) only when the
+        loads dict is empty — that fallback still can't show true overload,
+        but preserves prior behaviour for inputs lacking sprint loads."""
+        peaks = cc.peak_resource_loads(metrics)  # {resource_name: peak_ratio}
+        if peaks:
+            signals: List[Signal] = []
+            for name, load in peaks.items():
+                baseline = 1.0
+                dev = _safe_pct(load, baseline)
+                signals.append(Signal(
+                    metric_name="load_ratio",
+                    current_value=round(load, 4),
+                    baseline_value=baseline,
+                    deviation_pct=round(dev, 4),
+                    significance=_significance(dev),
+                    entity_id=name,
+                ))
+            return signals
+        # Fallback: no resource_sprint_loads present.
         rm = getattr(metrics, "resource_metrics", None)
         if rm is None:
             return []
         devs = getattr(rm, "developer_metrics", None) or []
-        signals: List[Signal] = []
+        signals = []
         for d in devs:
-            # DeveloperMetrics has no load_ratio field (see NOTE 3); derive it as
-            # OVER-COMMITMENT relative to capacity, NOT a completion fraction.
-            # Prefer remaining work / remaining capacity when capacity is known.
             alloc = float(getattr(d, "allocation_pct", 0.0) or 0.0)
             avail = float(getattr(d, "availability_pct", 1.0) or 1.0)
-            remaining = float(getattr(d, "remaining_effort_hours", 0.0) or 0.0)
-            remaining_capacity = float(getattr(d, "available_capacity_hours", 0.0) or 0.0)
-
-            if remaining_capacity > 0:
-                # >1.0 means more work assigned than capacity to do it: overloaded.
-                load_ratio = remaining / remaining_capacity
-                baseline = 1.0
-            else:
-                # No capacity field: use allocation as the load proxy. 0.8 = fully
-                # loaded; >0.8 = overloaded. More honest than a completion fraction.
-                load_ratio = alloc * avail
-                baseline = 0.8
-
+            load_ratio = alloc * avail
+            baseline = 0.8
             dev = _safe_pct(load_ratio, baseline)
             signals.append(Signal(
                 metric_name="load_ratio",
@@ -152,14 +153,11 @@ class SignalMapper:
             ))
         return signals
 
-    # --- total_remaining_hours vs planned throughput -----------------------
+    # --- total_remaining_hours vs planned throughput ----------------------
     def _remaining_vs_planned_signal(
         self, metrics: ProjectMetrics, forecast: ForecastResult
     ) -> Optional[Signal]:
         current = float(getattr(metrics, "remaining_effort_hours", 0.0) or 0.0)
-        # Baseline = planned throughput still available across remaining sprints,
-        # approximated as actual_avg_velocity * remaining_sprints. Fall back to
-        # total_effort_hours if forecast_input_metrics isn't populated.
         fim = getattr(metrics, "forecast_input_metrics", None)
         remaining_sprints = float(getattr(fim, "remaining_sprints", 0.0) or 0.0) if fim else 0.0
         avg_velocity = float(getattr(metrics, "actual_avg_velocity", 0.0) or 0.0)
@@ -178,15 +176,12 @@ class SignalMapper:
             significance=_significance(dev),
         )
 
-    # --- carryover_rate vs a 0 (no-carryover) baseline ---------------------
+    # --- carryover_rate ---------------------------------------------------
     def _carryover_signal(self, metrics: ProjectMetrics) -> Optional[Signal]:
         rate = getattr(metrics, "historical_carryover_rate", None)
         if rate is None:
             return None
         rate = float(rate)
-        # Baseline of 0 items/sprint = ideal. Any positive rate is the deviation;
-        # normalize against a 1.0 items/sprint reference so the fraction is bounded
-        # and comparable to the other signals' significance bands.
         reference = 1.0
         dev = _safe_pct(rate, 0.0) if rate == 0 else min(rate / reference, 5.0)
         return Signal(
