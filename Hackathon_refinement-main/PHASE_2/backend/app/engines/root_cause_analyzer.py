@@ -1,12 +1,7 @@
 """
-EMIOS RootCauseAnalyzer (Stage 6).
-
-Turns surviving hypotheses (posteriors set) into a Diagnosis: highest-posterior
-hypothesis becomes the root cause, with a 5-Whys causal chain built from ACTUAL
-ProjectState data. Confidence == root posterior, so confidence + sum(alternative
-posteriors) == 1.0.
-
-5-Whys live in causal_chain; fishbone category is contributing_factors[0].
+EMIOS RootCauseAnalyzer (Stage 6). Highest-posterior hypothesis becomes the root
+cause with a 5-Whys chain from actual ProjectState data. confidence == root
+posterior, so confidence + sum(alternatives) == 1.0.
 """
 from __future__ import annotations
 
@@ -18,7 +13,7 @@ from app.domain.emios_models import Hypothesis, Diagnosis
 from app.engines import cognition_common as cc
 from app.engines.hypothesis_generator import (
     hypothesis_category,
-    BLOCKER, VELOCITY, SCOPE, CAPACITY, DEPENDENCY, NULL,
+    BLOCKER, VELOCITY, SCOPE, CAPACITY, DEPENDENCY, QUALITY, NULL,
 )
 
 _FISHBONE = {
@@ -27,14 +22,12 @@ _FISHBONE = {
     SCOPE: "PROCESS",
     CAPACITY: "PEOPLE",
     DEPENDENCY: "ENVIRONMENT",
+    QUALITY: "PROCESS",
     NULL: "MEASUREMENT",
 }
 
 
 def _scope_changed_items(state: ProjectState) -> List[str]:
-    """Items flagged scope-changed, else items that moved sprints after baseline.
-    WorkItem HAS is_scope_changed; original_sprint/assigned_sprint are name
-    strings, so the fallback compares those (there is no sprint_number field)."""
     changed = [
         wi.item_id for wi in getattr(state, "work_items", []) or []
         if getattr(wi, "is_scope_changed", False)
@@ -89,7 +82,6 @@ class RootCauseAnalyzer:
             supporting_hypothesis_id=root.hypothesis_id,
         )
 
-    # ------------------------------------------------------------------ #
     def _causal_chain(self, cat, state, cp_ids, sprint_days, forecast, metrics, monte_carlo) -> List[str]:
         if cat == BLOCKER:
             on_cp = [b for b in cc.open_blockers(state) if cc.blocker_hits_critical_path(b, cp_ids)]
@@ -153,7 +145,16 @@ class RootCauseAnalyzer:
                 "Why not parallelized? The dependency is finish-to-start on the critical path.",
                 "Root: shorten/parallelize the dependency or start the predecessor earlier.",
             ]
-        # NULL
+        if cat == QUALITY:
+            rework = cc.rework_rate(metrics)
+            reopened = cc.reopened_count(metrics)
+            return [
+                "Why is the project delayed? Completed work is being reopened.",
+                f"Why reopened? Rework rate is {rework:.0%} ({reopened} items).",
+                "Why rework? Quality shortcuts under schedule pressure or unclear acceptance criteria.",
+                "Why not caught earlier? Review gates insufficient or rushed under velocity pressure.",
+                "Root: add review checkpoints; address root acceptance-criteria gaps before sprint end.",
+            ]
         otp = cc.on_time_probability(monte_carlo)
         otp_txt = ("%.0f%%" % (otp * 100)) if otp is not None else "healthy"
         return [
@@ -186,5 +187,10 @@ class RootCauseAnalyzer:
         if cat == DEPENDENCY:
             return ("A long-lead dependency on the critical path is the root cause. "
                     "Shorten, parallelize, or start the predecessor earlier.")
+        if cat == QUALITY:
+            rework = cc.rework_rate(metrics)
+            reopened = cc.reopened_count(metrics)
+            return (f"Rework is consuming capacity ({rework:.0%} rate, {reopened} reopened items). "
+                    "Add review gates and clarify acceptance criteria to stop the leak.")
         return ("No systemic root cause found; the project is on track. "
                 "Continue monitoring the deviating signals.")

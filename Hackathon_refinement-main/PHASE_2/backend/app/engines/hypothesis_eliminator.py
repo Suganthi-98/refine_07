@@ -1,27 +1,17 @@
 """
-EMIOS HypothesisEliminator (Stage 5).
-
-Popperian falsification: try to KILL each hypothesis with the evidence/state.
-Survivors get Bayesian-style posterior updates, then are normalized to sum 1.0
-so Diagnosis.confidence + sum(alternative posteriors) == 1.0.
-
-    posterior = prior * (1 + sum supporting weights) * (1 - sum contradicting weights)
-    clamp to [0.01, 0.99], then normalize survivors to sum 1.0.
+EMIOS HypothesisEliminator (Stage 5). Popperian falsification; survivors get
+Bayesian posteriors normalized to sum 1.0 (the gate).
 """
 from __future__ import annotations
 
 from typing import List, Optional
 
 from app.domain.models import ProjectState
-from app.domain.emios_models import (
-    EvidenceBundle,
-    Hypothesis,
-    HypothesisStatus,
-)
+from app.domain.emios_models import EvidenceBundle, Hypothesis, HypothesisStatus
 from app.engines import cognition_common as cc
 from app.engines.hypothesis_generator import (
     hypothesis_category,
-    BLOCKER, VELOCITY, SCOPE, CAPACITY, DEPENDENCY, NULL,
+    BLOCKER, VELOCITY, SCOPE, CAPACITY, DEPENDENCY, QUALITY, NULL,
 )
 
 
@@ -62,7 +52,6 @@ class HypothesisEliminator:
             h.status = HypothesisStatus.SUPPORTED
         return survivors
 
-    # ------------------------------------------------------------------ #
     def _elimination_reason(
         self, h, state, cp_ids, sprint_days, *, forecast, metrics, monte_carlo,
         velocity_artifact_suppressed,
@@ -93,7 +82,6 @@ class HypothesisEliminator:
             return None
 
         if cat == CAPACITY:
-            # SAME threshold as the generator — no divergence.
             if not cc.overloaded_resource_ids(metrics, threshold=cc.OVERLOAD_THRESHOLD):
                 return f"Eliminated: no resource exceeds load ratio {cc.OVERLOAD_THRESHOLD}."
             return None
@@ -101,6 +89,14 @@ class HypothesisEliminator:
         if cat == DEPENDENCY:
             if not cc.critical_path_blocked_dependencies(state, cp_ids, sprint_days):
                 return "Eliminated: no critical-path items have blocked/long-lead dependencies."
+            return None
+
+        if cat == QUALITY:
+            rework = cc.rework_rate(metrics)
+            reopened = cc.reopened_count(metrics)
+            if rework < 0.05 and reopened < 2:
+                return (f"Eliminated: rework rate {rework:.0%} and {reopened} reopened items "
+                        "are below meaningful thresholds.")
             return None
 
         if cat == NULL:
@@ -131,7 +127,6 @@ class HypothesisEliminator:
             for h in survivors:
                 h.posterior = round(h.posterior / total, 4)
 
-        # Correct rounding drift so posteriors sum to EXACTLY 1.0 (the gate).
         drift = round(1.0 - sum(h.posterior for h in survivors), 4)
         if abs(drift) >= 0.0001:
             top = max(survivors, key=lambda x: x.posterior)

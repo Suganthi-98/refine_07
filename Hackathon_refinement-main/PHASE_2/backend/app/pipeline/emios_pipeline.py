@@ -1,17 +1,12 @@
 """
-EMIOS Pipeline — top-level contract bridging Sprint Whisperer's 9 deterministic
-engines to the EMIOS 18-stage cognitive pipeline.
-
-Stages 1-11 are LIVE (Observation, Validation, Evidence, Hypothesis Generation,
-Hypothesis Elimination, Root Cause Analysis, Multi-dimensional Impact). Stages
-12-18 call stubs that return None until their engines land.
+EMIOS Pipeline — bridges Sprint Whisperer's 9 deterministic engines to the EMIOS
+18-stage cognitive pipeline. Stages 1-11 are LIVE; 12-18 are stubs.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import List, Optional
 
-# --- Existing Sprint Whisperer engine outputs (types) ----------------------
 from app.engines.metrics_engine import MetricsEngine, ProjectMetrics
 from app.engines.dependency_engine import DependencyGraphEngine, DependencyDAG
 from app.engines.critical_path_engine import CriticalPathEngine, CriticalPathResult
@@ -26,7 +21,6 @@ from app.engines.recommendation_engine.models import Recommendation, SimulationR
 
 from app.domain.models import ProjectState
 
-# --- EMIOS cognitive-stage engines (Stages 1-11 LIVE) ----------------------
 from app.engines.observation_engine import ObservationEngine
 from app.engines.validation_engine import ValidationEngine
 from app.engines.evidence_collector import EvidenceCollector
@@ -35,7 +29,6 @@ from app.engines.hypothesis_eliminator import HypothesisEliminator
 from app.engines.root_cause_analyzer import RootCauseAnalyzer
 from app.engines.impact_assessor import ImpactAssessor
 
-# --- New EMIOS cognition/knowledge outputs (types) -------------------------
 from app.domain.emios_models import (
     ObservationCluster,
     ValidationResult,
@@ -56,12 +49,8 @@ from app.domain.emios_models import (
 MONTE_CARLO_SEED: int = 42
 
 
-# ---------------------------------------------------------------------------
-# PipelineResult — all 18 stage outputs, every field Optional
-# ---------------------------------------------------------------------------
 @dataclass
 class PipelineResult:
-    # ----- Existing Sprint Whisperer engine outputs (9) --------------------
     metrics: Optional[ProjectMetrics] = None
     dependency_dag: Optional[DependencyDAG] = None
     critical_path: Optional[CriticalPathResult] = None
@@ -71,10 +60,8 @@ class PipelineResult:
     risk_result: Optional[RiskResult] = None
     recommendations: Optional[List[Recommendation]] = None
     simulation: Optional[SimulationResult] = None
-    # RiskScores from ImpactScoringEngine (retained for the QUALITY axis).
-    risk_scores: Optional[object] = None
+    risk_scores: Optional[object] = None  # RiskScores from ImpactScoringEngine
 
-    # ----- New EMIOS 18-stage cognitive outputs ----------------------------
     observation_cluster: Optional[ObservationCluster] = None      # Stage 1
     validation_result: Optional[ValidationResult] = None          # Stage 2
     evidence_bundle: Optional[EvidenceBundle] = None              # Stage 3
@@ -91,12 +78,7 @@ class PipelineResult:
     knowledge_node: Optional[KnowledgeNode] = None               # Stage 18
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 def _velocity_artifact_suppressed(validation: Optional[ValidationResult]) -> bool:
-    """True if Stage 2 suppressed a velocity observation as a planned capacity
-    reduction (PTO). Lets Stage 5 kill the VELOCITY hypothesis."""
     if validation is None:
         return False
     for s in getattr(validation, "suppressed", []) or []:
@@ -107,10 +89,7 @@ def _velocity_artifact_suppressed(validation: Optional[ValidationResult]) -> boo
     return False
 
 
-# ---------------------------------------------------------------------------
-# EMIOS stage functions (1-11 LIVE, 12-18 stubs)
-# ---------------------------------------------------------------------------
-def _stage_01_observe(state: ProjectState, result: PipelineResult) -> Optional[ObservationCluster]:
+def _stage_01_observe(state, result):
     if result.metrics is None or result.forecast is None:
         return None
     return ObservationEngine().run(
@@ -118,18 +97,17 @@ def _stage_01_observe(state: ProjectState, result: PipelineResult) -> Optional[O
         metrics=result.metrics,
         forecast=result.forecast,
         monte_carlo=result.monte_carlo,
+        critical_path=result.critical_path,
     )
 
 
-def _stage_02_validate(state: ProjectState, cluster: Optional[ObservationCluster]) -> Optional[ValidationResult]:
+def _stage_02_validate(state, cluster):
     if cluster is None:
         return None
     return ValidationEngine().run(cluster=cluster, state=state)
 
 
-def _stage_03_collect_evidence(
-    state: ProjectState, validation: Optional[ValidationResult], result: PipelineResult
-) -> Optional[EvidenceBundle]:
+def _stage_03_collect_evidence(state, validation, result):
     if validation is None:
         return None
     return EvidenceCollector().run(
@@ -142,9 +120,7 @@ def _stage_03_collect_evidence(
     )
 
 
-def _stage_04_generate_hypotheses(
-    bundle: Optional[EvidenceBundle], state: ProjectState, result: PipelineResult
-) -> Optional[List[Hypothesis]]:
+def _stage_04_generate_hypotheses(bundle, state, result):
     if bundle is None:
         return None
     return HypothesisGenerator().run(
@@ -156,12 +132,7 @@ def _stage_04_generate_hypotheses(
     )
 
 
-def _stage_05_eliminate_hypotheses(
-    hypotheses: Optional[List[Hypothesis]],
-    bundle: Optional[EvidenceBundle],
-    state: ProjectState,
-    result: PipelineResult,
-) -> Optional[List[Hypothesis]]:
+def _stage_05_eliminate_hypotheses(hypotheses, bundle, state, result):
     if not hypotheses or bundle is None:
         return None
     return HypothesisEliminator().run(
@@ -174,9 +145,7 @@ def _stage_05_eliminate_hypotheses(
     )
 
 
-def _stage_06_root_cause(
-    survivors: Optional[List[Hypothesis]], state: ProjectState, result: PipelineResult
-) -> Optional[Diagnosis]:
+def _stage_06_root_cause(survivors, state, result):
     if not survivors:
         return None
     return RootCauseAnalyzer().run(
@@ -188,17 +157,11 @@ def _stage_06_root_cause(
     )
 
 
-def _stages_07_11_impact(
-    state: ProjectState, diagnosis: Optional[Diagnosis], result: PipelineResult
-) -> Optional[ImpactMatrix]:
-    """Stages 7-11: multi-dimensional impact. Runs even when diagnosis is None
-    (emits a full five-axis grid at low magnitude) so Phase 4 always has a
-    complete matrix; skips only when the base forecast is unavailable."""
+def _stages_07_11_impact(state, diagnosis, result):
     if result.forecast is None:
         return None
     return ImpactAssessor().run(
-        diagnosis,
-        state,
+        diagnosis, state,
         forecast=result.forecast,
         risk_result=result.risk_result,
         monte_carlo=result.monte_carlo,
@@ -208,7 +171,6 @@ def _stages_07_11_impact(
     )
 
 
-# ---- Stages 12-18 remain stubs until their engines are implemented ---------
 def _stage_12_assess_risk(impact, result): return None
 def _stage_13_tradeoffs(risks, result): return None
 def _stage_14_decide(matrix): return None
@@ -218,9 +180,6 @@ def _stage_17_learn(conformance, decision): return None
 def _stage_18_retain(learning): return None
 
 
-# ---------------------------------------------------------------------------
-# run_emios_pipeline
-# ---------------------------------------------------------------------------
 def run_emios_pipeline(
     state: ProjectState,
     *,
@@ -229,7 +188,6 @@ def run_emios_pipeline(
 ) -> PipelineResult:
     result = PipelineResult()
 
-    # ===== Existing Sprint Whisperer 9-engine pipeline (real calls) =========
     result.metrics = MetricsEngine(state).calculate()
     result.dependency_dag = DependencyGraphEngine(state).build_dag()
     result.critical_path = CriticalPathEngine(state, result.dependency_dag).analyze()
@@ -248,7 +206,7 @@ def run_emios_pipeline(
         seed=seed,
     ).calculate()
     impact_scores = ImpactScoringEngine(state, result.dependency_dag).score()
-    result.risk_scores = impact_scores  # retained for the QUALITY impact axis
+    result.risk_scores = impact_scores
     result.risk_result = RiskEngine(
         project_state=state,
         metrics=result.metrics,
@@ -272,8 +230,7 @@ def run_emios_pipeline(
         except Exception:
             result.simulation = None
 
-    # ===== EMIOS cognitive pipeline =========================================
-    # Stages 1-11: LIVE.
+    # ===== EMIOS cognitive pipeline (Stages 1-11 LIVE) ======================
     result.observation_cluster = _stage_01_observe(state, result)
     result.validation_result = _stage_02_validate(state, result.observation_cluster)
     result.evidence_bundle = _stage_03_collect_evidence(state, result.validation_result, result)
@@ -284,7 +241,6 @@ def run_emios_pipeline(
     result.diagnosis = _stage_06_root_cause(result.surviving_hypotheses, state, result)
     result.impact_matrix = _stages_07_11_impact(state, result.diagnosis, result)
 
-    # Stages 12-18: stubs (return None) until engines are implemented.
     result.risks = _stage_12_assess_risk(result.impact_matrix, result)
     result.tradeoff_matrix = _stage_13_tradeoffs(result.risks, result)
     result.decision = _stage_14_decide(result.tradeoff_matrix)

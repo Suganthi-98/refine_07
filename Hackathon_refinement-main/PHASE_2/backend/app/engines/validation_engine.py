@@ -1,49 +1,32 @@
 """
 EMIOS Validation Engine (Stage 2).
 
-Confirms each Observation in an ObservationCluster is REAL data, not an artifact
-of a data-quality issue (PTO sprint, estimate outlier, thin history, brand-new
-blocker). Suppressed observations are removed from the downstream stream but
-kept in a suppression log for the audit trail.
-
-Computes nothing new about the project — it only classifies existing
-observations as real vs artifact using ProjectState context.
+Confirms each Observation is REAL data, not a data-quality artifact. Handles the
+17-detector metric vocabulary; adds DELIBERATE_RESCOPE and SECONDARY_SKILL_COVERS.
 """
 from __future__ import annotations
 
 from typing import List, Optional
 
-from app.domain.models import (
-    ProjectState,
-    SprintStatus,
-    WorkItemStatus,
-)
+from app.domain.models import ProjectState, SprintStatus, WorkItemStatus, WorkItemType
 from app.domain.emios_models import (
-    Observation,
-    ObservationCluster,
-    ArtifactType,
-    SuppressedObservation,
-    ValidationResult,
+    Observation, ObservationCluster, ArtifactType, SuppressedObservation, ValidationResult,
 )
+
+_SPIKE_TYPES = {WorkItemType.SPIKE}
 
 
 class ValidationEngine:
     """Stage 2: validate an ObservationCluster into a ValidationResult."""
 
-    # A sprint whose available capacity is below this fraction of the team's
-    # baseline capacity is treated as a planned capacity reduction (PTO etc.).
     PTO_CAPACITY_FLOOR: float = 0.60
-    # A single item accounting for more than this share of carryover effort is
-    # an estimate outlier, not a systemic carryover problem.
     OUTLIER_SHARE: float = 0.50
-    # Fewer than this many completed sprints = insufficient velocity history.
     MIN_COMPLETED_SPRINTS: int = 2
 
     def run(self, cluster: ObservationCluster, state: ProjectState) -> ValidationResult:
         validated: List[Observation] = []
         suppressed: List[SuppressedObservation] = []
         warnings: List[str] = []
-
         completed_sprints = self._completed_sprint_count(state)
 
         for obs in cluster.observations:
@@ -69,12 +52,7 @@ class ValidationEngine:
             warnings=warnings,
         )
 
-    # ------------------------------------------------------------------ #
-    # Dispatch: return a SuppressedObservation if this obs is an artifact  #
-    # ------------------------------------------------------------------ #
-    def _classify(
-        self, obs: Observation, state: ProjectState, completed_sprints: int
-    ) -> Optional[SuppressedObservation]:
+    def _classify(self, obs, state, completed_sprints) -> Optional[SuppressedObservation]:
         metric = obs.metric_ref
         if metric == "velocity":
             return self._check_pto_artifact(obs, state)
@@ -84,15 +62,15 @@ class ValidationEngine:
             return self._check_insufficient_history(obs, completed_sprints)
         if metric == "blocker_delay_days":
             return self._check_early_blocker(obs, state)
-        # velocity/probability/etc. that don't match an artifact pass through.
+        if metric == "estimation_drift":
+            return self._check_estimation_drift_artifact(obs, state)
+        if metric == "blocker_age_sprints":
+            return self._check_early_blocker(obs, state)
+        if metric == "skill_mismatch":
+            return self._check_skill_mismatch_artifact(obs, state)
         return None
 
-    # --- Artifact 1: velocity drop on a reduced-capacity (PTO) sprint ------
-    def _check_pto_artifact(
-        self, obs: Observation, state: ProjectState
-    ) -> Optional[SuppressedObservation]:
-        # Only a DEGRADING velocity observation can be a PTO artifact; an
-        # improving velocity needs no excuse.
+    def _check_pto_artifact(self, obs, state) -> Optional[SuppressedObservation]:
         if (obs.deviation_pct or 0.0) >= 0:
             return None
         current_sprint = self._current_sprint(state)
@@ -115,10 +93,7 @@ class ValidationEngine:
             )
         return None
 
-    # --- Artifact 2: carryover spike driven by one outlier item -----------
-    def _check_estimate_outlier(
-        self, obs: Observation, state: ProjectState
-    ) -> Optional[SuppressedObservation]:
+    def _check_estimate_outlier(self, obs, state) -> Optional[SuppressedObservation]:
         carried = self._carryover_items(state)
         if not carried:
             return None
@@ -142,10 +117,7 @@ class ValidationEngine:
             )
         return None
 
-    # --- Artifact 3: on-time probability with too little history ----------
-    def _check_insufficient_history(
-        self, obs: Observation, completed_sprints: int
-    ) -> Optional[SuppressedObservation]:
+    def _check_insufficient_history(self, obs, completed_sprints) -> Optional[SuppressedObservation]:
         if completed_sprints < self.MIN_COMPLETED_SPRINTS:
             return SuppressedObservation(
                 observation=obs,
@@ -157,10 +129,7 @@ class ValidationEngine:
             )
         return None
 
-    # --- Artifact 4: blocker raised only in the current sprint ------------
-    def _check_early_blocker(
-        self, obs: Observation, state: ProjectState
-    ) -> Optional[SuppressedObservation]:
+    def _check_early_blocker(self, obs, state) -> Optional[SuppressedObservation]:
         blocker = self._find_blocker(state, obs.entity_id)
         if blocker is None:
             return None
@@ -171,7 +140,6 @@ class ValidationEngine:
         sprint_start = getattr(current_sprint, "start_date", None)
         if sprint_start is None:
             return None
-        # Normalize tz so naive/aware datetimes don't raise on comparison.
         raised_cmp = raised.replace(tzinfo=None) if getattr(raised, "tzinfo", None) else raised
         start_cmp = sprint_start.replace(tzinfo=None) if getattr(sprint_start, "tzinfo", None) else sprint_start
         if raised_cmp >= start_cmp:
@@ -185,30 +153,62 @@ class ValidationEngine:
             )
         return None
 
-    # ------------------------------------------------------------------ #
-    # ProjectState helpers                                                 #
-    # ------------------------------------------------------------------ #
-    def _completed_sprint_count(self, state: ProjectState) -> int:
-        return sum(
-            1 for s in getattr(state, "sprints", []) or []
-            if getattr(s, "status", None) == SprintStatus.COMPLETED
-        )
+    def _check_estimation_drift_artifact(self, obs, state) -> Optional[SuppressedObservation]:
+        wi = self._find_work_item(state, obs.entity_id)
+        if wi is None:
+            return None
+        rescoped = bool(getattr(wi, "rescoped", False)) or bool(getattr(wi, "is_scope_changed", False))
+        is_spike = getattr(wi, "work_type", None) in _SPIKE_TYPES
+        if rescoped or is_spike:
+            reason_kind = "deliberately rescoped" if rescoped else "a spike/research item"
+            return SuppressedObservation(
+                observation=obs,
+                artifact_type=ArtifactType.DELIBERATE_RESCOPE,
+                reason=(
+                    f"Estimation change suppressed: item {getattr(wi, 'item_id', '?')} is "
+                    f"{reason_kind}, not unplanned drift."
+                ),
+            )
+        return None
 
-    def _current_sprint(self, state: ProjectState):
+    def _check_skill_mismatch_artifact(self, obs, state) -> Optional[SuppressedObservation]:
+        wi = self._find_work_item(state, obs.entity_id)
+        if wi is None:
+            return None
+        req = getattr(wi, "required_skill", None)
+        rid = getattr(wi, "assigned_resource", None)
+        resource = self._find_resource(state, rid)
+        if resource is None or not req:
+            return None
+        secondary = getattr(resource, "secondary_skill", None)
+        coverage = [getattr(sc, "skill", None) for sc in getattr(resource, "skill_coverage", []) or []]
+        if secondary == req or req in coverage:
+            return SuppressedObservation(
+                observation=obs,
+                artifact_type=ArtifactType.SECONDARY_SKILL_COVERS,
+                reason=(
+                    f"Skill mismatch suppressed: {getattr(resource, 'name', rid)} covers "
+                    f"'{req}' as a secondary/backup skill."
+                ),
+            )
+        return None
+
+    # --- helpers ----------------------------------------------------------
+    def _completed_sprint_count(self, state) -> int:
+        return sum(1 for s in getattr(state, "sprints", []) or []
+                   if getattr(s, "status", None) == SprintStatus.COMPLETED)
+
+    def _current_sprint(self, state):
         sprints = getattr(state, "sprints", []) or []
         for s in sprints:
             if getattr(s, "status", None) == SprintStatus.IN_PROGRESS:
                 return s
-        # fall back to first not-started sprint
         for s in sorted(sprints, key=lambda x: getattr(x, "sprint_number", 0)):
             if getattr(s, "status", None) == SprintStatus.NOT_STARTED:
                 return s
         return None
 
-    def _sprint_available_hours(self, sprint, state: ProjectState) -> float:
-        """Available team-hours for a sprint. Prefer the capacity_breakdown the
-        workbook/simulation writes; fall back to planned_velocity_hrs; final
-        fallback derives from team daily capacity × working days."""
+    def _sprint_available_hours(self, sprint, state) -> float:
         breakdown = getattr(sprint, "capacity_breakdown", None) or []
         if breakdown:
             return float(sum(getattr(e, "hours", 0.0) or 0.0 for e in breakdown))
@@ -218,23 +218,18 @@ class ValidationEngine:
         working_days = float(getattr(sprint, "working_days", 0) or 0)
         return self._team_daily_capacity(state) * working_days
 
-    def _team_baseline_capacity(self, state: ProjectState) -> float:
-        """Baseline = mean available_hours across completed sprints, else the
-        team's nominal capacity over a standard sprint window."""
-        completed = [
-            s for s in getattr(state, "sprints", []) or []
-            if getattr(s, "status", None) == SprintStatus.COMPLETED
-        ]
+    def _team_baseline_capacity(self, state) -> float:
+        completed = [s for s in getattr(state, "sprints", []) or []
+                     if getattr(s, "status", None) == SprintStatus.COMPLETED]
         if completed:
             vals = [self._sprint_available_hours(s, state) for s in completed]
             vals = [v for v in vals if v > 0]
             if vals:
                 return sum(vals) / len(vals)
         sprint_days = float(getattr(state.project_info, "sprint_duration_days", 14) or 14)
-        # working days ≈ sprint_days × 5/7
         return self._team_daily_capacity(state) * (sprint_days * 5.0 / 7.0)
 
-    def _team_daily_capacity(self, state: ProjectState) -> float:
+    def _team_daily_capacity(self, state) -> float:
         total = 0.0
         for r in getattr(state, "team", []) or []:
             daily = float(getattr(r, "daily_capacity_hrs", 8.0) or 8.0)
@@ -243,8 +238,7 @@ class ValidationEngine:
             total += daily * avail * alloc
         return total
 
-    def _carryover_items(self, state: ProjectState):
-        """Items that moved out of their original sprint (spillover/carryover)."""
+    def _carryover_items(self, state):
         out = []
         for wi in getattr(state, "work_items", []) or []:
             status = getattr(wi, "status", None)
@@ -255,10 +249,26 @@ class ValidationEngine:
                 out.append(wi)
         return out
 
-    def _find_blocker(self, state: ProjectState, blocker_id: Optional[str]):
+    def _find_blocker(self, state, blocker_id):
         if not blocker_id:
             return None
         for b in getattr(state, "blockers", []) or []:
             if getattr(b, "blocker_id", None) == blocker_id:
                 return b
+        return None
+
+    def _find_work_item(self, state, item_id):
+        if not item_id:
+            return None
+        for wi in getattr(state, "work_items", []) or []:
+            if getattr(wi, "item_id", None) == item_id:
+                return wi
+        return None
+
+    def _find_resource(self, state, rid):
+        if not rid:
+            return None
+        for r in getattr(state, "team", []) or []:
+            if getattr(r, "resource_id", None) == rid or getattr(r, "name", None) == rid:
+                return r
         return None

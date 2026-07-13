@@ -1,45 +1,42 @@
 """
-EMIOS EvidenceCollector (Stage 3).
-
-Projects validated observations + Sprint Whisperer outputs + ProjectState into
-an immutable EvidenceBundle. Collects only — states facts, never causes, never
-links hypotheses (Stage 4 wires the edges).
-
-Each EvidenceItem.source is tagged '<source>::<CATEGORY>' for routing.
+EMIOS EvidenceCollector (Stage 3). Projects validated observations + Sprint
+Whisperer outputs + ProjectState into an immutable EvidenceBundle. Facts only;
+each source is tagged '<source>::<CATEGORY>' for routing.
 """
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import List, Optional
 from uuid import uuid4
 
 from app.domain.models import ProjectState
-from app.domain.emios_models import (
-    ValidationResult,
-    EvidenceBundle,
-    EvidenceItem,
-)
+from app.domain.emios_models import ValidationResult, EvidenceBundle, EvidenceItem
 from app.engines import cognition_common as cc
 
-CAT_BLOCKER = "BLOCKER"
-CAT_VELOCITY = "VELOCITY"
-CAT_SCOPE = "SCOPE"
-CAT_CAPACITY = "CAPACITY"
-CAT_DEPENDENCY = "DEPENDENCY"
-CAT_NEUTRAL = "NEUTRAL"
+CAT_BLOCKER = cc.CAT_BLOCKER
+CAT_VELOCITY = cc.CAT_VELOCITY
+CAT_SCOPE = cc.CAT_SCOPE
+CAT_CAPACITY = cc.CAT_CAPACITY
+CAT_DEPENDENCY = cc.CAT_DEPENDENCY
+CAT_QUALITY = cc.CAT_QUALITY
+CAT_NEUTRAL = cc.CAT_NEUTRAL
 
-# Evidence is broader than hypothesis firing: record a resource fact from 0.9,
-# even though the CAPACITY hypothesis only fires at cc.OVERLOAD_THRESHOLD (1.2).
 RESOURCE_EVIDENCE_FLOOR = 0.9
+AGED_BLOCKER_SPRINTS = 2.0
 
 
 def _tag(source: str, category: str) -> str:
     return f"{source}::{category}"
 
 
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
 class EvidenceCollector:
     """Stage 3: gather everything relevant before theorizing."""
 
-    RISK_EVIDENCE_MIN_SCORE = 41.0  # HIGH/CRITICAL band on the 0-100 risk scale
+    RISK_EVIDENCE_MIN_SCORE = 41.0
 
     def run(
         self,
@@ -55,11 +52,15 @@ class EvidenceCollector:
         items: List[EvidenceItem] = []
         items.extend(self._delay_breakdown_evidence(forecast))
         items.extend(self._scope_evidence(forecast))
+        items.extend(self._estimation_drift_evidence(state))
         items.extend(self._risk_driver_evidence(risk_result))
-        items.extend(self._open_blocker_evidence(state))
+        items.extend(self._blocker_evidence(state))
+        items.extend(self._critical_path_pressure_evidence(state, critical_path))
         items.extend(self._velocity_evidence(metrics))
         items.extend(self._resource_load_evidence(metrics))
-        items.extend(self._critical_path_blocked_evidence(state, critical_path))
+        items.extend(self._load_concentration_evidence(metrics))
+        items.extend(self._skill_mismatch_evidence(state))
+        items.extend(self._rework_evidence(metrics))
 
         data_confidence = 1.0
         triggered_ids: List[str] = []
@@ -78,7 +79,6 @@ class EvidenceCollector:
             data_confidence=round(data_confidence, 4),
         )
 
-    # --- delay breakdown --------------------------------------------------
     def _delay_breakdown_evidence(self, forecast) -> List[EvidenceItem]:
         if forecast is None:
             return []
@@ -106,7 +106,6 @@ class EvidenceCollector:
             ))
         return items
 
-    # --- scope growth -----------------------------------------------------
     def _scope_evidence(self, forecast) -> List[EvidenceItem]:
         if forecast is None:
             return []
@@ -126,17 +125,41 @@ class EvidenceCollector:
             weight=weight,
         )]
 
-    # --- top risk drivers -------------------------------------------------
+    def _estimation_drift_evidence(self, state) -> List[EvidenceItem]:
+        from app.domain.models import WorkItemStatus
+        done = {WorkItemStatus.DONE, WorkItemStatus.COMPLETED}
+        items = []
+        drifted = 0
+        for wi in getattr(state, "work_items", []) or []:
+            if getattr(wi, "status", None) in done:
+                continue
+            baseline = getattr(wi, "estimated_effort_hrs", None)
+            current = getattr(wi, "current_estimate_hrs", None)
+            if baseline is None or current is None or baseline <= 0:
+                continue
+            if float(current) <= float(baseline) * 1.2:
+                continue
+            drifted += 1
+            pct = (float(current) - float(baseline)) / float(baseline) * 100.0
+            items.append(EvidenceItem(
+                fact=(f"Item {getattr(wi, 'item_id', '?')} re-estimated from "
+                      f"{float(baseline):.0f}h to {float(current):.0f}h (+{pct:.0f}% drift)."),
+                source=_tag("WorkItems.estimation_drift", CAT_SCOPE),
+                weight=round(min(1.0, (float(current) - float(baseline)) / float(baseline)), 4),
+            ))
+        if drifted > 2:
+            items.append(EvidenceItem(
+                fact=f"{drifted} in-flight items have drifted >20% over their baseline estimate.",
+                source=_tag("WorkItems.estimation_drift", CAT_SCOPE),
+                weight=0.7,
+            ))
+        return items
+
     def _risk_driver_evidence(self, risk_result) -> List[EvidenceItem]:
         if risk_result is None:
             return []
-        cat_map = {
-            "BLOCKER": CAT_BLOCKER,
-            "DEPENDENCY": CAT_DEPENDENCY,
-            "RESOURCE": CAT_CAPACITY,
-            "SCOPE": CAT_SCOPE,
-            "SCHEDULE": CAT_NEUTRAL,
-        }
+        cat_map = {"BLOCKER": CAT_BLOCKER, "DEPENDENCY": CAT_DEPENDENCY,
+                   "RESOURCE": CAT_CAPACITY, "SCOPE": CAT_SCOPE, "SCHEDULE": CAT_NEUTRAL}
         items = []
         for d in getattr(risk_result, "top_risk_drivers", None) or []:
             score = float(getattr(d, "score", 0.0) or 0.0)
@@ -152,23 +175,51 @@ class EvidenceCollector:
             ))
         return items
 
-    # --- open blockers ----------------------------------------------------
-    def _open_blocker_evidence(self, state) -> List[EvidenceItem]:
+    def _blocker_evidence(self, state) -> List[EvidenceItem]:
+        sprint_days = float(getattr(state.project_info, "sprint_duration_days", 14) or 14)
+        now = _utcnow()
         items = []
         for b in cc.open_blockers(state):
             severity = getattr(b, "severity", None)
-            weight = cc.SEVERITY_WEIGHT.get(severity, 0.6)
-            delay = cc.blocker_delay_days(b)
-            sev_label = getattr(severity, "value", str(severity))
-            desc = getattr(b, "description", None) or getattr(b, "blocker_id", "blocker")
-            items.append(EvidenceItem(
-                fact=f"Open {sev_label} blocker {getattr(b, 'blocker_id', '?')}: {desc} (~{delay:.0f} delay-days).",
-                source=_tag("ProjectState.blockers", CAT_BLOCKER),
-                weight=round(weight, 4),
-            ))
+            base_weight = cc.SEVERITY_WEIGHT.get(severity, 0.6)
+            raised = getattr(b, "raised_date", None)
+            age_sprints = 0.0
+            if raised is not None:
+                r = raised.replace(tzinfo=None) if getattr(raised, "tzinfo", None) else raised
+                age_sprints = ((now.replace(tzinfo=None) - r).days) / sprint_days if sprint_days else 0.0
+            bid = getattr(b, "blocker_id", "?")
+            if age_sprints > AGED_BLOCKER_SPRINTS:
+                weight = min(1.0, base_weight * (age_sprints / 4.0))
+                items.append(EvidenceItem(
+                    fact=f"Blocker {bid} unresolved for {age_sprints:.1f} sprints (aging risk).",
+                    source=_tag("ProjectState.blockers", CAT_BLOCKER),
+                    weight=round(weight, 4),
+                ))
+            else:
+                delay = cc.blocker_delay_days(b)
+                sev_label = getattr(severity, "value", str(severity))
+                desc = getattr(b, "description", None) or bid
+                items.append(EvidenceItem(
+                    fact=f"Open {sev_label} blocker {bid}: {desc} (~{delay:.0f} delay-days).",
+                    source=_tag("ProjectState.blockers", CAT_BLOCKER),
+                    weight=round(base_weight, 4),
+                ))
         return items
 
-    # --- velocity trend (< -10%) ------------------------------------------
+    def _critical_path_pressure_evidence(self, state, critical_path) -> List[EvidenceItem]:
+        cp_ids = cc.critical_path_ids(critical_path)
+        if not cp_ids:
+            return []
+        blocked = cc.blocked_item_ids(state)
+        ratio = len(blocked & cp_ids) / max(len(cp_ids), 1)
+        if ratio <= 0.25:
+            return []
+        return [EvidenceItem(
+            fact=f"{ratio:.0%} of critical-path items are blocked or at risk.",
+            source=_tag("CriticalPathEngine.pressure", CAT_DEPENDENCY),
+            weight=round(min(1.0, ratio * 1.5), 4),
+        )]
+
     def _velocity_evidence(self, metrics) -> List[EvidenceItem]:
         if metrics is None:
             return []
@@ -181,7 +232,6 @@ class EvidenceCollector:
             weight=round(max(0.0, min(1.0, abs(trend) / 50.0)), 4),
         )]
 
-    # --- resource load (peak sprint load > floor) -------------------------
     def _resource_load_evidence(self, metrics) -> List[EvidenceItem]:
         if metrics is None:
             return []
@@ -196,17 +246,65 @@ class EvidenceCollector:
             ))
         return items
 
-    # --- critical-path items blocked --------------------------------------
-    def _critical_path_blocked_evidence(self, state, critical_path) -> List[EvidenceItem]:
-        cp_ids = cc.critical_path_ids(critical_path)
-        if not cp_ids:
+    def _load_concentration_evidence(self, metrics) -> List[EvidenceItem]:
+        if metrics is None:
+            return []
+        devs = cc.developer_metrics(metrics)
+        total = sum(float(getattr(d, "remaining_effort_hours", 0.0) or 0.0) for d in devs)
+        if total <= 0:
             return []
         items = []
-        for b in cc.open_blockers(state):
-            if cc.blocker_hits_critical_path(b, cp_ids):
-                items.append(EvidenceItem(
-                    fact=f"Critical-path item(s) blocked by {getattr(b, 'blocker_id', '?')}.",
-                    source=_tag("CriticalPathEngine.blocked", CAT_DEPENDENCY),
-                    weight=0.9,
-                ))
+        for d in devs:
+            share = float(getattr(d, "remaining_effort_hours", 0.0) or 0.0) / total
+            if share <= 0.40:
+                continue
+            name = getattr(d, "resource_id", None) or getattr(d, "name", "resource")
+            items.append(EvidenceItem(
+                fact=f"Resource {name} carries {share:.0%} of remaining team effort (concentration risk).",
+                source=_tag("MetricsEngine.load_concentration", CAT_CAPACITY),
+                weight=round(min(1.0, share * 1.5), 4),
+            ))
         return items
+
+    def _skill_mismatch_evidence(self, state) -> List[EvidenceItem]:
+        from app.domain.models import WorkItemStatus
+        done = {WorkItemStatus.DONE, WorkItemStatus.COMPLETED}
+        team = {getattr(r, "resource_id", None): r for r in getattr(state, "team", []) or []}
+        by_name = {getattr(r, "name", None): r for r in getattr(state, "team", []) or []}
+        count = 0
+        for wi in getattr(state, "work_items", []) or []:
+            if getattr(wi, "status", None) in done:
+                continue
+            req = getattr(wi, "required_skill", None)
+            rid = getattr(wi, "assigned_resource", None)
+            if not req or not rid:
+                continue
+            resource = team.get(rid) or by_name.get(rid)
+            if resource is None:
+                continue
+            covers = resource.covers_skill(req) if hasattr(resource, "covers_skill") else (
+                getattr(resource, "primary_skill", None) == req
+                or getattr(resource, "secondary_skill", None) == req
+            )
+            if not covers:
+                count += 1
+        if count <= 0:
+            return []
+        return [EvidenceItem(
+            fact=f"{count} work item(s) assigned to resources without the required skill.",
+            source=_tag("WorkItems.skill_mismatch", CAT_CAPACITY),
+            weight=round(min(1.0, count / 5.0), 4),
+        )]
+
+    def _rework_evidence(self, metrics) -> List[EvidenceItem]:
+        if metrics is None:
+            return []
+        rate = cc.rework_rate(metrics)
+        if rate <= 0.05:
+            return []
+        reopened = cc.reopened_count(metrics)
+        return [EvidenceItem(
+            fact=f"Rework rate {rate:.0%}: {reopened} item(s) reopened after completion.",
+            source=_tag("MetricsEngine.quality_metrics", CAT_QUALITY),
+            weight=round(min(1.0, rate * 4.0), 4),
+        )]

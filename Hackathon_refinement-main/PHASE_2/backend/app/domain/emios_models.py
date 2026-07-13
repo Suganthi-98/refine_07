@@ -21,14 +21,12 @@ def _utcnow() -> datetime:
 # Enumerations
 # ---------------------------------------------------------------------------
 class ObservationDirection(str, Enum):
-    """Direction of a metric change, with no causal interpretation."""
     UP = "up"
     DOWN = "down"
     FLAT = "flat"
 
 
 class DataConfidence(str, Enum):
-    """How much we trust the underlying data (set in Validation)."""
     HIGH = "high"
     MEDIUM = "medium"
     LOW = "low"
@@ -49,7 +47,6 @@ class ImpactDimension(str, Enum):
 
 
 class HealthState(str, Enum):
-    """Project health state machine, shared with the Recovery Engine."""
     HEALTHY = "healthy"
     WATCH = "watch"
     WARNING = "warning"
@@ -74,10 +71,9 @@ class ExecutionPlanStatus(str, Enum):
 
 
 # ---------------------------------------------------------------------------
-# Stage 1 — Observation -> ObservationCluster
+# Stage 1 — Observation
 # ---------------------------------------------------------------------------
 class Observation(BaseModel):
-    """A single neutral, non-causal statement about a metric change."""
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     observation_id: str
@@ -98,7 +94,6 @@ class Observation(BaseModel):
 
 
 class ObservationCluster(BaseModel):
-    """Stage 1 output: a related group of observations detected in one pass."""
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     cluster_id: str
@@ -127,7 +122,6 @@ class DataQualityIssue(BaseModel):
 
 
 class ValidatedObservation(BaseModel):
-    """Per-observation wrapper: one observation confirmed real (not an artifact)."""
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     observation: Observation
@@ -139,16 +133,16 @@ class ValidatedObservation(BaseModel):
 
 
 class ArtifactType(str, Enum):
-    """Why an observation was suppressed during validation (Phase 1.2)."""
-    PLANNED_CAPACITY_REDUCTION = "planned_capacity_reduction"
-    ESTIMATE_OUTLIER = "estimate_outlier"
-    INSUFFICIENT_HISTORY = "insufficient_history"
-    EARLY_BLOCKER = "early_blocker"
+    """Why an observation was suppressed during validation."""
+    PLANNED_CAPACITY_REDUCTION = "planned_capacity_reduction"  # PTO / part-time sprint
+    ESTIMATE_OUTLIER = "estimate_outlier"                      # one giant item skews carryover
+    INSUFFICIENT_HISTORY = "insufficient_history"              # < 2 completed sprints
+    EARLY_BLOCKER = "early_blocker"                            # raised this sprint, too young
+    DELIBERATE_RESCOPE = "deliberate_rescope"                  # NEW: planned re-estimate / spike
+    SECONDARY_SKILL_COVERS = "secondary_skill_covers"          # NEW: resource covers req skill
 
 
 class SuppressedObservation(BaseModel):
-    """An observation removed from the downstream stream, with the reason kept
-    for the audit trail."""
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     observation: Observation
@@ -157,7 +151,6 @@ class SuppressedObservation(BaseModel):
 
 
 class ValidationResult(BaseModel):
-    """Stage 2 batch output. This is what downstream stages consume."""
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     validated: List[Observation] = Field(
@@ -179,7 +172,6 @@ class ValidationResult(BaseModel):
 # Stage 3 — Evidence Collection
 # ---------------------------------------------------------------------------
 class EvidenceItem(BaseModel):
-    """A single timestamped, sourced, weighted fact. Immutable once recorded."""
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     fact: str
@@ -191,7 +183,6 @@ class EvidenceItem(BaseModel):
 
 
 class EvidenceBundle(BaseModel):
-    """Stage 3 output: everything relevant gathered before theorizing."""
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     bundle_id: str
@@ -207,10 +198,9 @@ class EvidenceBundle(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Stages 4 & 5 — Hypothesis Generation / Elimination
+# Stages 4 & 5 — Hypothesis
 # ---------------------------------------------------------------------------
 class Hypothesis(BaseModel):
-    """A candidate cause with a testable prediction."""
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     hypothesis_id: str
@@ -229,7 +219,6 @@ class Hypothesis(BaseModel):
 # Stage 6 — Root Cause Analysis
 # ---------------------------------------------------------------------------
 class Diagnosis(BaseModel):
-    """Stage 6 output: the deepest actionable cause with its causal chain."""
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     diagnosis_id: str
@@ -251,11 +240,10 @@ class Diagnosis(BaseModel):
 # Stages 7-11 — Multi-dimensional Impact
 # ---------------------------------------------------------------------------
 class ImpactEstimate(BaseModel):
-    """One dimension's impact: magnitude + confidence."""
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     dimension: ImpactDimension
-    magnitude: float = Field(..., description="Dimension-specific magnitude (e.g. days, $, score)")
+    magnitude: float = Field(..., description="Dimension-specific magnitude")
     unit: str = Field("", description="Unit of magnitude, e.g. 'days', 'USD', 'score'")
     confidence: float = Field(0.0, ge=0.0, le=1.0)
     explanation: str = ""
@@ -284,16 +272,13 @@ class ImpactMatrix(BaseModel):
 # Stage 12 — Risk Assessment
 # ---------------------------------------------------------------------------
 class Risk(BaseModel):
-    """A prioritized risk: probability x severity over an exposure window."""
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     risk_id: str
     title: str
     probability: float = Field(0.0, ge=0.0, le=1.0)
     severity: float = Field(0.0, description="Impact severity if it materializes")
-    exposure_window_days: Optional[float] = Field(
-        None, description="How long the exposure persists"
-    )
+    exposure_window_days: Optional[float] = Field(None, description="How long the exposure persists")
     time_to_materialize_days: Optional[float] = None
     trend: Optional[str] = Field(None, description="'growing' | 'decaying' | 'stable'")
     owner: Optional[str] = None
@@ -304,8 +289,6 @@ class Risk(BaseModel):
 # Stage 13 — Tradeoff Analysis
 # ---------------------------------------------------------------------------
 class TradeoffOption(BaseModel):
-    """One candidate action projected across the five impact dimensions,
-    with its explicit sacrifice stated."""
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     option_id: str
@@ -318,7 +301,6 @@ class TradeoffOption(BaseModel):
 
 
 class TradeoffMatrix(BaseModel):
-    """Stage 13 output: all options with their sacrifices side by side."""
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     options: List[TradeoffOption] = Field(default_factory=list)
@@ -329,7 +311,6 @@ class TradeoffMatrix(BaseModel):
 # Stage 14 — Decision Making
 # ---------------------------------------------------------------------------
 class Decision(BaseModel):
-    """Stage 14 output: the chosen alternative with rationale and rejected options."""
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     decision_id: str
@@ -360,7 +341,6 @@ class ExecutionStep(BaseModel):
 
 
 class ExecutionPlan(BaseModel):
-    """Stage 15 output: a runnable plan bound to a Recovery state machine."""
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     plan_id: str
@@ -388,7 +368,6 @@ class KPIDeviation(BaseModel):
 
 
 class TrajectoryConformance(BaseModel):
-    """Stage 16 output: is the plan working? Feeds deviations back to Observation."""
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     plan_id: Optional[str] = None
@@ -403,7 +382,6 @@ class TrajectoryConformance(BaseModel):
 # Stage 17 — Learning
 # ---------------------------------------------------------------------------
 class LearningRecord(BaseModel):
-    """Stage 17 output: predicted vs actual, calibration + prior updates."""
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     record_id: str
@@ -421,7 +399,6 @@ class LearningRecord(BaseModel):
 # Stage 18 — Knowledge Retention
 # ---------------------------------------------------------------------------
 class KnowledgeNode(BaseModel):
-    """Stage 18 output: a reusable, cross-project pattern written to the KG."""
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     node_id: str

@@ -1,15 +1,12 @@
 """
-EMIOS Phase 2 — shared deterministic derivations for the cognition stages.
+EMIOS — shared deterministic derivations for Stage 1 detection and the cognition
+stages. Nothing here computes new analytics; helpers re-read parsed ProjectState
++ Sprint Whisperer outputs so every engine agrees on the same definitions.
 
-Nothing here computes new project analytics. These helpers only re-read
-already-parsed ProjectState + Sprint Whisperer outputs so the four Phase 2
-engines agree on the same definitions.
-
-RESOURCE LOAD NOTE: DeveloperMetrics has NO capacity field (only allocation_pct,
-availability_pct, assigned/remaining_effort_hours). The authoritative per-sprint
-load lives on ProjectMetrics.resource_sprint_loads as
-{resource_name: {sprint_name: load_ratio}}. We take each resource's peak load
-across sprints; alloc*avail is a last-resort fallback only.
+RESOURCE LOAD: DeveloperMetrics has NO capacity field. The authoritative
+per-sprint load lives on ProjectMetrics.resource_sprint_loads as
+{resource_name: {sprint_name: load_ratio}}. We take each resource's peak load;
+alloc*avail is a last-resort fallback only.
 """
 from __future__ import annotations
 
@@ -22,9 +19,15 @@ from app.domain.models import (
     BlockerSeverity,
 )
 
-# Resource is 'overloaded' above this load ratio. Defined ONCE and imported by
-# both HypothesisGenerator and HypothesisEliminator so the two never diverge.
 OVERLOAD_THRESHOLD: float = 1.2
+
+CAT_BLOCKER = "BLOCKER"
+CAT_VELOCITY = "VELOCITY"
+CAT_SCOPE = "SCOPE"
+CAT_CAPACITY = "CAPACITY"
+CAT_DEPENDENCY = "DEPENDENCY"
+CAT_QUALITY = "QUALITY"
+CAT_NEUTRAL = "NEUTRAL"
 
 _SEVERITY_DELAY_DAYS = {
     BlockerSeverity.CRITICAL: 21.0,
@@ -60,6 +63,16 @@ def blocker_delay_days(blocker: Blocker) -> float:
     if raised is not None and target is not None:
         return max(0.0, (target - raised).days)
     return _SEVERITY_DELAY_DAYS.get(getattr(blocker, "severity", BlockerSeverity.MEDIUM), 7.0)
+
+
+def blocked_item_ids(state: ProjectState) -> Set[str]:
+    ids: Set[str] = set()
+    for b in open_blockers(state):
+        ids |= set(getattr(b, "impacted_item_ids", []) or [])
+        r = getattr(b, "related_item_id", None)
+        if r:
+            ids.add(r)
+    return ids
 
 
 # --- critical path ---------------------------------------------------------
@@ -102,22 +115,17 @@ def critical_path_blocked_dependencies(
     state: ProjectState, cp_ids: Set[str], sprint_days: float
 ) -> list:
     blocked = list(critical_path_dependencies_over_lag(state, cp_ids, sprint_days))
-    blocked_items: Set[str] = set()
-    for b in open_blockers(state):
-        blocked_items |= set(getattr(b, "impacted_item_ids", []) or [])
-        r = getattr(b, "related_item_id", None)
-        if r:
-            blocked_items.add(r)
+    b_items = blocked_item_ids(state)
     for dep in getattr(state, "dependencies", []) or []:
         pred = getattr(dep, "predecessor_item_id", None)
         succ = getattr(dep, "successor_item_id", None)
         touches_cp = (pred in cp_ids) or (succ in cp_ids)
-        if touches_cp and ((pred in blocked_items) or (succ in blocked_items)) and dep not in blocked:
+        if touches_cp and ((pred in b_items) or (succ in b_items)) and dep not in blocked:
             blocked.append(dep)
     return blocked
 
 
-# --- resources (reads resource_sprint_loads; NO capacity field on dev) -----
+# --- resources -------------------------------------------------------------
 def developer_metrics(metrics) -> list:
     rm = getattr(metrics, "resource_metrics", None)
     if rm is None:
@@ -126,13 +134,10 @@ def developer_metrics(metrics) -> list:
 
 
 def resource_sprint_loads(metrics) -> Dict[str, Dict[str, float]]:
-    """{resource_name: {sprint_name: load_ratio}} computed by MetricsEngine.
-    Authoritative overload source — DeveloperMetrics carries no capacity."""
     return getattr(metrics, "resource_sprint_loads", None) or {}
 
 
 def peak_resource_loads(metrics) -> Dict[str, float]:
-    """Max load ratio across sprints per resource (resource_name -> ratio)."""
     peaks: Dict[str, float] = {}
     for name, by_sprint in resource_sprint_loads(metrics).items():
         vals = [float(v) for v in (by_sprint or {}).values() if v is not None]
@@ -142,16 +147,12 @@ def peak_resource_loads(metrics) -> Dict[str, float]:
 
 
 def _dev_load_fallback(dev) -> float:
-    """Fallback only: no capacity field exists, so alloc*avail (≤1.0).
-    Real overload (>1.0) can only come from resource_sprint_loads."""
     alloc = float(getattr(dev, "allocation_pct", 0.0) or 0.0)
     avail = float(getattr(dev, "availability_pct", 1.0) or 1.0)
     return alloc * avail
 
 
 def overloaded_resource_ids(metrics, threshold: float = OVERLOAD_THRESHOLD) -> List[str]:
-    """Resource identifiers whose load exceeds threshold. Prefers the
-    authoritative resource_sprint_loads; falls back to developer_metrics."""
     peaks = peak_resource_loads(metrics)
     if peaks:
         return [name for name, load in peaks.items() if load > threshold]
@@ -191,3 +192,20 @@ def on_time_probability(monte_carlo) -> Optional[float]:
     if monte_carlo is None:
         return None
     return float(getattr(monte_carlo, "on_time_probability", 0.0) or 0.0)
+
+
+# --- quality ---------------------------------------------------------------
+def reopened_count(metrics) -> int:
+    qm = getattr(metrics, "quality_metrics", None)
+    if qm is None:
+        return 0
+    return int(getattr(qm, "reopened_work_count", 0) or 0)
+
+
+def rework_rate(metrics) -> float:
+    qm = getattr(metrics, "quality_metrics", None)
+    if qm is None:
+        return 0.0
+    reopened = float(getattr(qm, "reopened_work_count", 0) or 0)
+    completed = float(getattr(metrics, "completed_items", 0) or 0)
+    return reopened / max(completed, 1.0)
