@@ -1,9 +1,14 @@
 """
 SignalMapper — projects ProjectMetrics + ForecastResult into a flat list of
-Observation Signals. Each Signal is a NEUTRAL deviation report (no cause).
+Observation Signals (EMIOS Stage 1: Observation input stream).
 
-RESOURCE LOAD FIX: reads ProjectMetrics.resource_sprint_loads (peak per
-resource) instead of the dead available_capacity_hours.
+Each Signal is a NEUTRAL deviation report: metric, current, baseline, deviation,
+and a significance band. It contains no cause (Stage 1 rule).
+
+RESOURCE LOAD FIX: DeveloperMetrics has no capacity field, so the old
+remaining/capacity ratio fell back to alloc*avail (<=1.0) and never showed
+overload. Load now comes from ProjectMetrics.resource_sprint_loads (peak per
+resource), matching ObservationEngine and the cognition layer.
 """
 from __future__ import annotations
 
@@ -13,10 +18,11 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from app.engines.metrics_engine import ProjectMetrics
 from app.api.models_phase3 import ForecastResult, MonteCarloResult
-from app.engines import cognition_common as cc
+from app.engines import cognition_common as cc  # shared resource-load source
 
 
 class Signal(BaseModel):
+    """A neutral, non-causal deviation report for the Observation Engine."""
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     metric_name: str
@@ -24,7 +30,7 @@ class Signal(BaseModel):
     baseline_value: float
     deviation_pct: float = Field(..., description="(current - baseline) / baseline, as a fraction")
     significance: str = Field(..., description='"HIGH" | "MEDIUM" | "LOW"')
-    entity_id: Optional[str] = Field(None, description="resource_id / sprint_id, or None")
+    entity_id: Optional[str] = Field(None, description="resource_id / sprint_id, or None for project-level")
 
 
 _HIGH = 0.25
@@ -56,6 +62,7 @@ class SignalMapper:
         monte_carlo: Optional[MonteCarloResult] = None,
     ) -> List[Signal]:
         signals: List[Signal] = []
+
         signals.extend(self._velocity_trend_signal(metrics))
         on_time = self._on_time_probability_signal(monte_carlo)
         if on_time is not None:
@@ -67,9 +74,11 @@ class SignalMapper:
         carry = self._carryover_signal(metrics)
         if carry is not None:
             signals.append(carry)
+
         return signals
 
-    def _velocity_trend_signal(self, metrics) -> List[Signal]:
+    # --- velocity_trend_pct -----------------------------------------------
+    def _velocity_trend_signal(self, metrics: ProjectMetrics) -> List[Signal]:
         vm = getattr(metrics, "velocity_metrics", None)
         if vm is None:
             return []
@@ -83,7 +92,8 @@ class SignalMapper:
             significance=_significance(trend_frac),
         )]
 
-    def _on_time_probability_signal(self, monte_carlo) -> Optional[Signal]:
+    # --- on_time_probability ----------------------------------------------
+    def _on_time_probability_signal(self, monte_carlo: Optional[MonteCarloResult]) -> Optional[Signal]:
         if monte_carlo is None:
             return None
         otp = float(getattr(monte_carlo, "on_time_probability", 0.0) or 0.0)
@@ -97,8 +107,12 @@ class SignalMapper:
             significance=_significance(dev),
         )
 
-    def _resource_load_signals(self, metrics) -> List[Signal]:
-        peaks = cc.peak_resource_loads(metrics)
+    # --- load_ratio per resource (FIXED: reads resource_sprint_loads) -----
+    def _resource_load_signals(self, metrics: ProjectMetrics) -> List[Signal]:
+        """Peak load per resource from resource_sprint_loads (baseline 1.0 =
+        fully loaded). Falls back to alloc*avail (baseline 0.8) only when the
+        loads dict is empty."""
+        peaks = cc.peak_resource_loads(metrics)  # {resource_name: peak_ratio}
         if peaks:
             signals: List[Signal] = []
             for name, load in peaks.items():
@@ -113,6 +127,7 @@ class SignalMapper:
                     entity_id=name,
                 ))
             return signals
+        # Fallback: no resource_sprint_loads present.
         rm = getattr(metrics, "resource_metrics", None)
         if rm is None:
             return []
@@ -134,7 +149,10 @@ class SignalMapper:
             ))
         return signals
 
-    def _remaining_vs_planned_signal(self, metrics, forecast) -> Optional[Signal]:
+    # --- total_remaining_hours vs planned throughput ----------------------
+    def _remaining_vs_planned_signal(
+        self, metrics: ProjectMetrics, forecast: ForecastResult
+    ) -> Optional[Signal]:
         current = float(getattr(metrics, "remaining_effort_hours", 0.0) or 0.0)
         fim = getattr(metrics, "forecast_input_metrics", None)
         remaining_sprints = float(getattr(fim, "remaining_sprints", 0.0) or 0.0) if fim else 0.0
@@ -154,7 +172,8 @@ class SignalMapper:
             significance=_significance(dev),
         )
 
-    def _carryover_signal(self, metrics) -> Optional[Signal]:
+    # --- carryover_rate ---------------------------------------------------
+    def _carryover_signal(self, metrics: ProjectMetrics) -> Optional[Signal]:
         rate = getattr(metrics, "historical_carryover_rate", None)
         if rate is None:
             return None
