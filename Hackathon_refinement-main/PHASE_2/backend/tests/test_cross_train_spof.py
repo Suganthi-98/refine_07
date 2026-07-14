@@ -53,6 +53,7 @@ def make_spof_project_state() -> ProjectState:
             primary_skill="General",
             secondary_skill=None,
             skill_level=SkillLevel.MID,
+            daily_capacity_hrs=8.0,
             allocation_pct=0.2,
             availability_pct=1.0,
         ),

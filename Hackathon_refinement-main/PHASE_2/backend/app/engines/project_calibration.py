@@ -52,6 +52,9 @@ class PlanScoreWeights:
     def validate(self) -> "PlanScoreWeights":
         total = self.probability + self.delay + self.risk + abs(self.complexity)
         assert abs(total - 1.0) < 0.02, f"Weights don't sum to 1.0: {total}"
+        # Hard floor: REBASELINE applicator uses scale = 1 + work_std_dev_pct.
+        # If this is 0.0, the applicator is a no-op and the mutation guard fires.
+        self.work_std_dev_pct = max(0.05, self.work_std_dev_pct)
         return self
 
 
@@ -233,6 +236,8 @@ class ProjectCalibration:
             if errors:
                 raw_work_std = statistics.mean(errors)
                 self.work_std_dev_pct = round(max(0.05, min(0.40, raw_work_std)), 3)
+                # Floor is enforced in max(0.05,...) above — but apply again
+                # defensively to guard against any future override that sets it to 0.
                 self.derivation_notes.append(
                     f"work_std_dev_pct={self.work_std_dev_pct:.3f}  "
                     f"(mean abs estimation error across {len(errors)} completed items)"

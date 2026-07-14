@@ -62,7 +62,7 @@ def make_pattern_state() -> ProjectState:
             name="Bob",
             role="Engineer",
             primary_skill="Testing",
-            secondary_skill="Python",
+            secondary_skill="SQL",  # Fix: was "Python" — caused SPOF to be masked since R2 covered it
             skill_level=SkillLevel.MID,
             allocation_pct=0.8,
             availability_pct=0.8,

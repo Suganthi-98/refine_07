@@ -76,17 +76,19 @@ class RecommendationValidator:
 
         # Fix 2: prefer simulation results for delay and OTP summaries; fall back
         # to heuristic estimates only when simulation wasn't run for this rec.
-        if sim is not None:
+        # Guard: some test mocks return a SimpleNamespace without baseline_metrics.
+        if sim is not None and hasattr(sim, "baseline_metrics") and sim.baseline_metrics is not None:
             delay_before = round(sim.baseline_metrics.expected_delay_days, 1)
             delay_after  = round(sim.simulated_metrics.expected_delay_days, 1)
-            prob_before  = round(sim.baseline_metrics.on_time_probability * 100, 1)
-            prob_after   = round(sim.simulated_metrics.on_time_probability * 100, 1)
+            prob_before  = round(sim.baseline_metrics.on_time_probability * 100)
+            prob_after   = round(sim.simulated_metrics.on_time_probability * 100)
         else:
+            sim = None  # fall through to heuristic path
             delay_before = round(getattr(self.upstream.forecast, "expected_delay_days", 0.0), 1)
             delay_after  = round(max(0.0, delay_before - rec.estimated_delay_reduction_days), 1)
-            prob_before  = round(getattr(self.upstream.monte_carlo, "on_time_probability", 0.0) * 100, 1)
-            prob_gain    = round(rec.estimated_risk_reduction * 100, 1)
-            prob_after   = round(min(100.0, prob_before + prob_gain), 1)
+            prob_before  = round(getattr(self.upstream.monte_carlo, "on_time_probability", 0.0) * 100)
+            prob_gain    = round(rec.estimated_risk_reduction * 100)
+            prob_after   = round(min(100.0, prob_before + prob_gain))
 
         delay_summary = f"{delay_before}d → {delay_after}d"
         prob_summary  = f"{prob_before}% → {prob_after}%"
