@@ -172,7 +172,27 @@ def _stages_07_11_impact(state, diagnosis, result):
 
 
 def _stage_12_assess_risk(impact, result): return None
-def _stage_13_tradeoffs(risks, result): return None
+
+
+def _stage_13_tradeoffs(
+    state: ProjectState, result: PipelineResult
+) -> Optional[TradeoffMatrix]:
+    """Stage 13: project each option across five axes; surface the sacrifice."""
+    from app.engines.tradeoff_analyzer import TradeoffAnalyzer
+
+    recommendations = result.recommendations or []
+    if not recommendations and not result.impact_matrix:
+        return None
+
+    return TradeoffAnalyzer().run(
+        recommendations=recommendations,
+        impact_matrix=result.impact_matrix,
+        state=state,
+        forecast=result.forecast,
+        monte_carlo=result.monte_carlo,
+    )
+
+
 def _stage_14_decide(matrix): return None
 def _stage_15_plan(decision): return None
 def _stage_16_monitor(plan, state): return None
@@ -242,7 +262,7 @@ def run_emios_pipeline(
     result.impact_matrix = _stages_07_11_impact(state, result.diagnosis, result)
 
     result.risks = _stage_12_assess_risk(result.impact_matrix, result)
-    result.tradeoff_matrix = _stage_13_tradeoffs(result.risks, result)
+    result.tradeoff_matrix = _stage_13_tradeoffs(state, result)
     result.decision = _stage_14_decide(result.tradeoff_matrix)
     result.execution_plan = _stage_15_plan(result.decision)
     result.trajectory_conformance = _stage_16_monitor(result.execution_plan, state)

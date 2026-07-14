@@ -286,24 +286,57 @@ class Risk(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Stage 13 — Tradeoff Analysis
+# Stage 13 — Tradeoff Analysis -> TradeoffMatrix
 # ---------------------------------------------------------------------------
 class TradeoffOption(BaseModel):
+    """One candidate action projected across impact dimensions,
+    with its explicit sacrifice stated (iron triangle + people + debt).
+    There is NEVER a free option — every gain has a cost."""
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     option_id: str
-    label: str
-    projected_impacts: Dict[str, float] = Field(
-        default_factory=dict, description="Keyed by ImpactDimension value"
+    recommendation_id: Optional[str] = Field(
+        None, description="None for the null (do-nothing) option"
     )
-    sacrifice: str = Field(..., description="The explicit cost/opportunity cost of choosing this")
-    expected_value: Optional[float] = None
+    label: str
+    gains: Dict[str, float] = Field(
+        default_factory=dict,
+        description="dimension -> improvement magnitude (positive = better)",
+    )
+    sacrifices: Dict[str, float] = Field(
+        default_factory=dict,
+        description="dimension -> cost magnitude (positive = cost)",
+    )
+    net_expected_value: float = Field(
+        0.0, description="sum(gains) - sum(sacrifices)"
+    )
+    disruption_level: Literal["HIGH", "MEDIUM", "LOW"] = "LOW"
+    reversible: bool = True
+    sacrifice_statement: str = Field(
+        "", description="Plain English, uses actual data values"
+    )
+    # Keep backward compat aliases
+    projected_impacts: Dict[str, float] = Field(
+        default_factory=dict, description="Legacy alias for gains"
+    )
+    sacrifice: str = Field("", description="Legacy alias for sacrifice_statement")
+    expected_value: Optional[float] = Field(
+        None, description="Legacy alias for net_expected_value"
+    )
 
 
 class TradeoffMatrix(BaseModel):
+    """Stage 13 output: all options with their sacrifices side by side."""
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     options: List[TradeoffOption] = Field(default_factory=list)
+    null_option: Optional[TradeoffOption] = Field(
+        None, description="Reference to the do-nothing option"
+    )
+    dominated_options: List[str] = Field(
+        default_factory=list,
+        description="recommendation_ids of dominated options",
+    )
     computed_at: datetime = Field(default_factory=_utcnow)
 
 
