@@ -167,5 +167,11 @@ export const api = {
     if (sessionId) url += `?session_id=${encodeURIComponent(sessionId)}`
     const resp = await fetch(url)
     return unwrapResponse(resp)
+  },
+  reasoningTrace: async (sessionId = '') => {
+    let url = `${API_ROOT}/reasoning-trace`
+    if (sessionId) url += `?session_id=${encodeURIComponent(sessionId)}`
+    const resp = await fetch(url)
+    return unwrapResponse(resp)
   }
 }

@@ -2,6 +2,7 @@ import React, {useState, useEffect} from 'react'
 import { api } from '../api/client'
 import MetricsRow from './components/MetricsRow'
 import RecoveryPlansPage from './components/RecoveryPlans'
+import { ReasoningTrace } from './components/ReasoningTrace'
 
 const tabs = [
   { key: 'overview', label: 'Overview' },
@@ -11,6 +12,7 @@ const tabs = [
   { key: 'recovery-plans', label: 'Recovery Plans' },
   { key: 'actions', label: 'Actions' },
   { key: 'compare', label: '📊 Compare' },
+  { key: 'reasoning-trace', label: '🧠 Reasoning Trace' },
 ]
 
 function MetricCard({label, value}){
@@ -1618,6 +1620,7 @@ export function Dashboard({session, onReset}){
       {active === 'recovery-plans' && <RecoveryPlansPage session={session} />}
       {active === 'actions' && <ActionsPage session={session} onSimulated={() => setActive('compare')} />}
       {active === 'compare' && <ReforecastPage session={session} />}
+      {active === 'reasoning-trace' && <ReasoningTrace session={session} />}
     </div>
   )
 }
