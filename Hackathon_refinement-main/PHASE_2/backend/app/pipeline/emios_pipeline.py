@@ -43,6 +43,7 @@ from app.domain.emios_models import (
     ExecutionPlan,
     TrajectoryConformance,
     LearningRecord,
+    HistoricalAnalysis,
     KnowledgeNode,
 )
 
@@ -72,9 +73,12 @@ class PipelineResult:
     risks: Optional[List[Risk]] = None                           # Stage 12
     tradeoff_matrix: Optional[TradeoffMatrix] = None             # Stage 13
     decision: Optional[Decision] = None                          # Stage 14
-    execution_plan: Optional[ExecutionPlan] = None               # Stage 15
-    trajectory_conformance: Optional[TrajectoryConformance] = None  # Stage 16
+    execution_plan: Optional[ExecutionPlan] = None               # legacy, unused by Stage 15
+    recovery_plans: Optional[list] = None                        # Stage 15 — List[RecoveryPlan] (dataclass, see recovery_plan_engine.models)
+    trajectory_conformance: Optional[TrajectoryConformance] = None  # legacy, superseded by recovery_state_machine
+    recovery_state_machine: Optional[object] = None               # Stage 16 — RecoveryStateMachineResult
     learning_record: Optional[LearningRecord] = None             # Stage 17
+    historical_analysis: Optional[HistoricalAnalysis] = None     # Stage 17b (Phase 6b)
     knowledge_node: Optional[KnowledgeNode] = None               # Stage 18
 
 
@@ -193,10 +197,101 @@ def _stage_13_tradeoffs(
     )
 
 
-def _stage_14_decide(matrix): return None
-def _stage_15_plan(decision): return None
+def _stage_14_decide(
+    tradeoff_matrix, diagnosis, state: ProjectState, monte_carlo
+):
+    """Stage 14: MCDA-scored winner with an explicit, numeric rationale."""
+    from app.engines.decision_engine import DecisionEngine
+
+    if tradeoff_matrix is None:
+        return None
+
+    return DecisionEngine().run(
+        tradeoff_matrix=tradeoff_matrix,
+        diagnosis=diagnosis,
+        state=state,
+        monte_carlo=monte_carlo,
+    )
+def _stage_15_plan(state: ProjectState, result: PipelineResult):
+    """Stage 15 — RecoveryPlanBuilder.
+
+    NOTE: this is an adapter, not a new engine. The repo already has a
+    mature RecoveryPlanEngine (app/engines/recovery_plan_engine/) that
+    generates 3 ranked, simulated, scored plans (SAFE / AGGRESSIVE /
+    MINIMAL_DISRUPTION) with composite scores and narrative explanations.
+    Stage 15's job is just to feed it this pipeline's already-computed
+    upstream state instead of recomputing it, using the same construction
+    pattern as app/api/routes/recovery_plans.py::_build_recovery_plan_engine.
+    """
+    from app.engines.recovery_plan_engine import RecoveryPlanEngine
+    from app.engines.simulation_engine import SimulationEngine
+
+    recommendations = result.recommendations or []
+    if not recommendations or result.metrics is None or result.forecast is None:
+        return None
+
+    simulation_engine = SimulationEngine(
+        project_state=state,
+        metrics=result.metrics,
+        dag=result.dependency_dag,
+        cp_result=result.critical_path,
+        spillover=result.spillover,
+        forecast=result.forecast,
+        monte_carlo=result.monte_carlo,
+        risk_result=result.risk_result,
+        simulation_count=1000,
+    )
+    recovery_plan_engine = RecoveryPlanEngine(simulation_engine=simulation_engine)
+
+    return recovery_plan_engine.generate_recovery_plans(recommendations=recommendations)
+
+
 def _stage_16_monitor(plan, state): return None
+
+
+def _stage_16_recovery_state(state: ProjectState, result: PipelineResult):
+    """Stage 16 — RecoveryStateMachine (Phase 5).
+
+    NOTE: constructs a fresh machine per pipeline run, matching the spec's
+    literal wiring. Multi-run history/consecutive-healthy tracking across
+    separate pipeline executions would need a session-scoped instance at
+    the API layer -- out of scope for this stage.
+    """
+    from app.engines.recovery_engine import RecoveryStateMachine
+
+    if result.monte_carlo is None:
+        return None
+
+    return RecoveryStateMachine().evaluate(
+        monte_carlo=result.monte_carlo,
+        risk_result=result.risk_result,
+        recovery_plan_result=result.recovery_plans,
+        previous_probability=None,
+        state=state,
+        metrics=result.metrics,
+    )
 def _stage_17_learn(conformance, decision): return None
+
+
+def _stage_17a_learning(result: PipelineResult):
+    """Stage 17a — LearningEngine (Phase 6a). actual_outcome is None until
+    real sprint outcomes are known; the engine is designed to degrade
+    gracefully in that case (see learning_engine.py docstring)."""
+    from app.engines.learning_engine import LearningEngine
+
+    return LearningEngine().run(
+        pipeline_result=result,
+        actual_outcome=None,
+        team_id="default",
+    )
+
+
+def _stage_17b_historical(state: ProjectState):
+    """Stage 17b — HistoricalAnalyzer (Phase 6b). Runs on every pipeline
+    execution; does not depend on any other stage's output."""
+    from app.engines.historical_analyzer import HistoricalAnalyzer
+
+    return HistoricalAnalyzer().run(state=state)
 def _stage_18_retain(learning): return None
 
 
@@ -263,10 +358,14 @@ def run_emios_pipeline(
 
     result.risks = _stage_12_assess_risk(result.impact_matrix, result)
     result.tradeoff_matrix = _stage_13_tradeoffs(state, result)
-    result.decision = _stage_14_decide(result.tradeoff_matrix)
-    result.execution_plan = _stage_15_plan(result.decision)
+    result.decision = _stage_14_decide(
+        result.tradeoff_matrix, result.diagnosis, state, result.monte_carlo
+    )
+    result.recovery_plans = _stage_15_plan(state, result)
     result.trajectory_conformance = _stage_16_monitor(result.execution_plan, state)
-    result.learning_record = _stage_17_learn(result.trajectory_conformance, result.decision)
+    result.recovery_state_machine = _stage_16_recovery_state(state, result)
+    result.historical_analysis = _stage_17b_historical(state)
+    result.learning_record = _stage_17a_learning(result)
     result.knowledge_node = _stage_18_retain(result.learning_record)
 
     return result

@@ -343,14 +343,56 @@ class TradeoffMatrix(BaseModel):
 # ---------------------------------------------------------------------------
 # Stage 14 — Decision Making
 # ---------------------------------------------------------------------------
+class FeasibilityCheck(BaseModel):
+    """Stage 14 support model: can the chosen option actually be executed."""
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    engineering_feasible: bool = Field(
+        True, description="EMIOS cannot assess code complexity; defaults True"
+    )
+    organizational_feasible: bool = True
+    blockers: List[str] = Field(default_factory=list)
+
+
+class BrooksLawCheck(BaseModel):
+    """Stage 14 support model: Brooks's Law guardrail for capacity-add options."""
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    triggered: bool = False
+    ramp_window_sprints: int = 0
+    verdict: Literal["SAFE", "RISKY", "REJECT"] = "SAFE"
+    reasoning: str = ""
+
+
+class RejectedAlternative(BaseModel):
+    """Stage 14 support model: a non-chosen option with its explicit reason."""
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    option: TradeoffOption
+    score: float = 0.0
+    rejection_reason: str = ""
+
+
 class Decision(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
-    decision_id: str
-    chosen_option_id: str
-    rationale: str
+    # --- canonical Stage 14 fields ---
+    id: Optional[str] = None
+    chosen_option: Optional[TradeoffOption] = None
+    weighted_score: float = 0.0
+    rationale: str = ""
+    rejected_alternatives: List[RejectedAlternative] = Field(default_factory=list)
     expected_value: Optional[float] = None
     confidence: float = Field(0.0, ge=0.0, le=1.0)
+    feasibility_check: Optional[FeasibilityCheck] = None
+    brooks_law_check: Optional[BrooksLawCheck] = None
+    warning: Optional[str] = Field(
+        None, description="Set when all options scored <= 0 and null was chosen"
+    )
+
+    # --- legacy aliases (kept so nothing downstream breaks) ---
+    decision_id: Optional[str] = None
+    chosen_option_id: Optional[str] = None
     rejected_option_ids: List[str] = Field(default_factory=list)
     rejected_reasons: Dict[str, str] = Field(
         default_factory=dict, description="option_id -> why it was rejected"
@@ -414,18 +456,56 @@ class TrajectoryConformance(BaseModel):
 # ---------------------------------------------------------------------------
 # Stage 17 — Learning
 # ---------------------------------------------------------------------------
+class ActualSprintOutcome(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    sprint_id: str
+    actual_velocity_hrs: float
+    actual_delay_days: Optional[float] = Field(None, description="None if sprint in progress")
+    blocker_ids_resolved: List[str] = Field(default_factory=list)
+    item_ids_completed: List[str] = Field(default_factory=list)
+    diagnosis_confirmed: Optional[bool] = Field(None, description="PM manually flags correctness")
+
+
 class LearningRecord(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
-    record_id: str
+    # --- canonical Stage 17a fields ---
+    id: Optional[str] = None
+    episode_date: datetime = Field(default_factory=_utcnow)
+    forecast_probability: float = 0.5
+    actual_outcome: Optional[float] = Field(
+        None, description="1.0=on time, 0.0=late, None=unknown"
+    )
+    brier_score: Optional[float] = Field(None, description="(forecast - actual)^2, None if no outcome")
+    diagnosis_accuracy: Optional[float] = Field(
+        None, description="1.0=confirmed, 0.0=denied, None=unknown"
+    )
+    velocity_estimate_bias: float = 0.0
+    calibration_note: str = ""
+    retained_pattern: Optional[str] = None
+    recommended_prior_adjustment: float = 0.0
+
+    # --- legacy aliases (kept so nothing downstream breaks) ---
+    record_id: Optional[str] = None
     episode_ref: Optional[str] = Field(None, description="Which decision/plan episode this evaluates")
     diagnosis_was_correct: Optional[bool] = None
     decision_was_good: Optional[bool] = None
-    brier_score: Optional[float] = Field(None, description="Confidence calibration score")
     what_worked: List[str] = Field(default_factory=list)
     what_didnt: List[str] = Field(default_factory=list)
     updated_priors: Dict[str, float] = Field(default_factory=dict)
     learned_at: datetime = Field(default_factory=_utcnow)
+
+
+class CalibrationProfile(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    team_id: str
+    velocity_bias: float = 0.0
+    probability_overestimate: float = 0.0
+    brier_scores: List[float] = Field(default_factory=list)
+    episode_count: int = 0
+    last_updated: datetime = Field(default_factory=_utcnow)
 
 
 # ---------------------------------------------------------------------------
@@ -443,3 +523,125 @@ class KnowledgeNode(BaseModel):
     confidence: float = Field(0.0, ge=0.0, le=1.0)
     provenance: Optional[str] = Field(None, description="Which engine + model version produced it")
     retained_at: datetime = Field(default_factory=_utcnow)
+
+# ---------------------------------------------------------------------------
+# Stage 17b — HistoricalAnalyzer (Phase 6b)
+# ---------------------------------------------------------------------------
+class OverbillingInstance(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    item_id: str
+    item_title: str
+    sprint_id: str
+    estimated_hrs: float
+    actual_hrs: float
+    overrun_hrs: float
+    overrun_pct: float
+    assigned_to: str
+    required_skill: str
+    was_flagged: bool = Field(False, description="True if a blocker existed for this item")
+    first_flagged_sprint: Optional[str] = None
+
+
+class SpilloverInstance(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    item_id: str
+    item_title: str
+    original_sprint: str
+    landed_sprint: str
+    sprints_delayed: int
+    reason_category: Literal["BLOCKER", "DEPENDENCY", "CAPACITY", "UNKNOWN"]
+    recurred: bool = Field(False, description="True if delayed more than once (sprints_delayed > 1)")
+    root_blocker_id: Optional[str] = None
+
+
+class RecurringBlockerPattern(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    category: str
+    occurrences: int
+    sprint_ids: List[str] = Field(default_factory=list)
+    total_delay_days: float = 0.0
+    was_resolved_permanently: bool = False
+    recurrence_verdict: Literal["SYSTEMIC", "COINCIDENTAL", "UNRESOLVED"] = "COINCIDENTAL"
+
+
+class CascadePattern(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    trigger_item_id: str
+    cascade_item_ids: List[str] = Field(default_factory=list)
+    total_cascade_delay_sprints: int = 0
+
+
+class PreventionRecommendation(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    trigger: str
+    action: str
+    sprint_to_apply: Literal["NEXT", "PLANNING", "IMMEDIATELY"]
+    confidence: Literal["HIGH", "MEDIUM", "LOW"]
+    evidence: List[str] = Field(default_factory=list)
+
+
+class HistoricalAnalysis(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    analysis_id: str
+    sprints_analysed: int
+    overbilling: List[OverbillingInstance] = Field(default_factory=list)
+    spillover: List[SpilloverInstance] = Field(default_factory=list)
+    recurring_blockers: List[RecurringBlockerPattern] = Field(default_factory=list)
+    cascade_patterns: List[CascadePattern] = Field(default_factory=list)
+    prevention_recommendations: List[PreventionRecommendation] = Field(default_factory=list)
+    summary: str = ""
+    generated_at: datetime = Field(default_factory=_utcnow)
+
+
+# ---------------------------------------------------------------------------
+# Stage 16 — RecoveryStateMachine (Phase 5)
+# ---------------------------------------------------------------------------
+class StateTransition(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    from_state: str
+    to_state: str
+    trigger: str = Field(..., description="Plain English reason")
+    probability_at_transition: float
+    timestamp: datetime = Field(default_factory=_utcnow)
+
+
+class ExitKPI(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    metric: str
+    current_value: float
+    target_value: float
+    target_by: str = Field(..., description='Sprint name or "Next sprint"')
+    status: Literal["ON_TRACK", "AT_RISK", "BREACHED"]
+
+
+class ActiveRecoveryPlan(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    actions: List[str] = Field(
+        default_factory=list, description="Action labels, not full Recommendation objects"
+    )
+    state_label: str
+    urgency: Literal["LOW", "MEDIUM", "HIGH", "CRITICAL"]
+    owner: str = Field(..., description='First action owner or "Project Manager"')
+    narrative: str
+
+
+class RecoveryStateMachineResult(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    current_state: str
+    previous_state: Optional[str] = None
+    transition_occurred: bool = False
+    transition_reason: Optional[str] = None
+    active_plan: ActiveRecoveryPlan
+    exit_kpis: List[ExitKPI] = Field(default_factory=list)
+    rollback_trigger: str
+    monitoring_intensity: Literal["STANDARD", "ELEVATED", "INTENSIVE"]
