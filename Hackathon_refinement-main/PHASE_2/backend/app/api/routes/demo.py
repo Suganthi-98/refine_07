@@ -20,7 +20,12 @@ from app.engines.metrics_engine import MetricsEngine
 from app.engines.dependency_engine import DependencyGraphEngine
 from app.engines.critical_path_engine import CriticalPathEngine
 from app.engines.spillover_engine import SpilloverAnalysisEngine
-from app.engines.forecast_engine import ForecastEngine
+# NOTE: ForecastEngine is imported lazily inside the function that uses it
+# (see below) to break a circular import: forecast_engine.py imports
+# app.api.models_phase3, which triggers app/api/__init__.py's package init,
+# which imports this module -- so a top-level import here creates a cycle
+# whenever forecast_engine (or anything importing it, e.g. emios_pipeline)
+# is the first thing loaded in a fresh process.
 from app.engines.monte_carlo_engine import MonteCarloEngine
 from app.engines.impact_scoring_engine import ImpactScoringEngine
 from app.engines.risk_engine import RiskEngine
@@ -38,6 +43,8 @@ def _prewarm_session(session_id: str) -> None:
         dag = DependencyGraphEngine(project_state).build_dag()
         cp_result = CriticalPathEngine(project_state, dag).analyze()
         spillover = SpilloverAnalysisEngine(project_state, metrics.average_item_effort).analyze()
+        from app.engines.forecast_engine import ForecastEngine
+
         forecast = ForecastEngine(project_state, metrics, cp_result, spillover).calculate()
         mc = MonteCarloEngine(project_state, metrics, cp_result, spillover, seed=42).simulate()
         impact = ImpactScoringEngine(project_state, dag).calculate()

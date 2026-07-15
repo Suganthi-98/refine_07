@@ -45,6 +45,7 @@ from app.domain.emios_models import (
     LearningRecord,
     HistoricalAnalysis,
     KnowledgeNode,
+    ActualSprintOutcome,
 )
 
 MONTE_CARLO_SEED: int = 42
@@ -80,6 +81,7 @@ class PipelineResult:
     learning_record: Optional[LearningRecord] = None             # Stage 17
     historical_analysis: Optional[HistoricalAnalysis] = None     # Stage 17b (Phase 6b)
     knowledge_node: Optional[KnowledgeNode] = None               # Stage 18
+    advisor_output: Optional[object] = None                       # Phase 7 — EMIOSAdvisorOutput
 
 
 def _velocity_artifact_suppressed(validation: Optional[ValidationResult]) -> bool:
@@ -273,16 +275,22 @@ def _stage_16_recovery_state(state: ProjectState, result: PipelineResult):
 def _stage_17_learn(conformance, decision): return None
 
 
-def _stage_17a_learning(result: PipelineResult):
-    """Stage 17a — LearningEngine (Phase 6a). actual_outcome is None until
-    real sprint outcomes are known; the engine is designed to degrade
-    gracefully in that case (see learning_engine.py docstring)."""
+def _stage_17a_learning(
+    result: PipelineResult,
+    actual_outcome: "Optional[ActualSprintOutcome]" = None,
+    team_id: str = "default",
+):
+    """Stage 17a — LearningEngine (Phase 6a). actual_outcome is None on a
+    fresh/in-progress sprint (the engine degrades gracefully in that case
+    — see learning_engine.py docstring). Once a sprint closes, callers
+    should pass the real ActualSprintOutcome (see
+    SessionStore.get_actual_outcome / POST /api/learning/outcome)."""
     from app.engines.learning_engine import LearningEngine
 
     return LearningEngine().run(
         pipeline_result=result,
-        actual_outcome=None,
-        team_id="default",
+        actual_outcome=actual_outcome,
+        team_id=team_id,
     )
 
 
@@ -295,11 +303,26 @@ def _stage_17b_historical(state: ProjectState):
 def _stage_18_retain(learning): return None
 
 
+def _stage_advisor(result: PipelineResult):
+    """Phase 7 — EMIOSAdvisor. Runs the deterministic fallback path by
+    default (see app/engines/emios_advisor.py for why the LLM path isn't
+    wired to the shared client yet); always returns a fully-populated
+    EMIOSAdvisorOutput, never None, so INVARIANT 7 (Final.2) always has
+    something to check."""
+    from app.engines.emios_advisor import EMIOSAdvisor
+    from app.engines.emios_advisor_input_builder import build_emios_advisor_input
+
+    advisor_input = build_emios_advisor_input(result)
+    return EMIOSAdvisor().run(advisor_input)
+
+
 def run_emios_pipeline(
     state: ProjectState,
     *,
     simulation_count: int = 1000,
     seed: int = MONTE_CARLO_SEED,
+    actual_outcome: Optional[ActualSprintOutcome] = None,
+    team_id: str = "default",
 ) -> PipelineResult:
     result = PipelineResult()
 
@@ -365,7 +388,8 @@ def run_emios_pipeline(
     result.trajectory_conformance = _stage_16_monitor(result.execution_plan, state)
     result.recovery_state_machine = _stage_16_recovery_state(state, result)
     result.historical_analysis = _stage_17b_historical(state)
-    result.learning_record = _stage_17a_learning(result)
+    result.learning_record = _stage_17a_learning(result, actual_outcome=actual_outcome, team_id=team_id)
     result.knowledge_node = _stage_18_retain(result.learning_record)
+    result.advisor_output = _stage_advisor(result)
 
     return result

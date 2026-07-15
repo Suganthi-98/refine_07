@@ -11,6 +11,7 @@ from datetime import datetime
 from threading import Lock
 
 from app.domain.models import ProjectState
+from app.domain.emios_models import ActualSprintOutcome
 
 
 def _snapshot_from_analysis(analysis) -> dict:
@@ -60,6 +61,11 @@ class Session:
         self.applied_plan_id = None
         # last_simulation_result: stored by POST /recommendations/simulate
         self.last_simulation_result = None
+        # actual_outcomes: sprint_id -> ActualSprintOutcome, populated by
+        # POST /api/learning/outcome once a sprint closes. Stage 17a
+        # (LearningEngine) reads the most recent entry here instead of the
+        # previous hardcoded actual_outcome=None.
+        self.actual_outcomes: Dict[str, ActualSprintOutcome] = {}
     
     def touch(self) -> None:
         """Update last accessed timestamp."""
@@ -207,6 +213,39 @@ class SessionStore:
         if session is not None:
             session.invalidate_analysis()
     
+    def record_actual_outcome(self, session_id: str, outcome: ActualSprintOutcome) -> bool:
+        """
+        Store a real sprint outcome once it's known (sprint closed).
+        Called by POST /api/learning/outcome. Overwrites any prior outcome
+        recorded for the same sprint_id (PMs may correct/update a report).
+
+        Returns True if stored, False if the session doesn't exist.
+        """
+        session = self.get_session(session_id)
+        if session is None:
+            return False
+        session.actual_outcomes[outcome.sprint_id] = outcome
+        return True
+
+    def get_actual_outcome(self, session_id: str, sprint_id: str) -> Optional[ActualSprintOutcome]:
+        """Retrieve a specific sprint's recorded outcome, if any."""
+        session = self.get_session(session_id)
+        if session is None:
+            return None
+        return session.actual_outcomes.get(sprint_id)
+
+    def get_latest_actual_outcome(self, session_id: str) -> Optional[ActualSprintOutcome]:
+        """
+        Retrieve the most recently recorded outcome for this session
+        (insertion order = report order, since dicts preserve insertion
+        order). Used by the pipeline to feed Stage 17a (LearningEngine)
+        the freshest ground truth available for this session.
+        """
+        session = self.get_session(session_id)
+        if session is None or not session.actual_outcomes:
+            return None
+        return next(reversed(session.actual_outcomes.values()))
+
     def delete_session(self, session_id: str) -> bool:
         """
         Delete a session.

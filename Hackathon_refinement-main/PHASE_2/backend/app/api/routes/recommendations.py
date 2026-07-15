@@ -25,7 +25,11 @@ from app.api.models_phase3 import (
     TradeOffResponse,
 )
 from app.domain.models import ProjectState
-from app.engines.advisor_input_builder import AdvisorInputBuilder
+# NOTE: AdvisorInputBuilder is imported lazily (see _get_advisor_builder below)
+# to break a circular import: advisor_input_builder.py imports
+# app.api.models_phase3, which triggers app/api/__init__.py's package init,
+# which imports this module, which used to import AdvisorInputBuilder at
+# module scope -> ImportError on partially-initialized module.
 from app.engines.recommendation_engine.candidate_generator import CandidateGenerator
 from app.engines.recommendation_engine.impact_estimator import ImpactEstimator
 from app.engines.recommendation_engine.models import RecommendationAction, RecommendationValidation, ScoringWeights, SimulationResult
@@ -404,7 +408,16 @@ def _build_engine(session_id: str) -> RecommendationEngineV2:
     engine._upstream = analysis.upstream
     return engine
 
-_advisor_builder = AdvisorInputBuilder()
+_advisor_builder = None
+
+def _get_advisor_builder():
+    """Lazily import + construct AdvisorInputBuilder to avoid the circular
+    import described above. Safe to call repeatedly; builds once."""
+    global _advisor_builder
+    if _advisor_builder is None:
+        from app.engines.advisor_input_builder import AdvisorInputBuilder
+        _advisor_builder = AdvisorInputBuilder()
+    return _advisor_builder
 
 def _get_narrative_service(request: Request):
     narrative_service = getattr(request.app.state, "narrative_service", None)
@@ -469,7 +482,7 @@ async def get_recommendations(
             optimized_plan = None
         # ----------------------------------------------------------------------
 
-        advisor_input = _advisor_builder.build_recommendation_input(
+        advisor_input = _get_advisor_builder().build_recommendation_input(
             project_id=session_id,
             project_state=recommendation_engine.project_state,
             forecast=upstream.forecast,
@@ -549,7 +562,7 @@ async def simulate_recommendation(
         if recommendation is None:
             raise KeyError(f"Recommendation {request_body.recommendation_id} not found")
 
-        advisor_input = _advisor_builder.build_simulation_input(
+        advisor_input = _get_advisor_builder().build_simulation_input(
             project_id=session_id,
             recommendation=recommendation,
             simulation_result=simulation_result,
@@ -638,7 +651,7 @@ async def simulate_scenario(
         ]
 
         _up = recommendation_engine._compute_upstream()
-        advisor_input = _advisor_builder.build_scenario_input(
+        advisor_input = _get_advisor_builder().build_scenario_input(
             project_id=session_id,
             project_state=recommendation_engine.project_state,
             forecast=_up.forecast,
