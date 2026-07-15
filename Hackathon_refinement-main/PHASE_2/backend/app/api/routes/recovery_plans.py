@@ -33,9 +33,14 @@ router = APIRouter(prefix="/api", tags=["Recovery Plans"])
 
 
 def _build_engine(session_id: str) -> RecommendationEngineV2:
-    """Build a RecommendationEngineV2 for a session."""
-    project_state = store.get_project_state(session_id)
-    if not project_state:
+    """Build a RecommendationEngineV2 pre-seeded from the cached session analysis.
+
+    Reads from store.get_analysis() so recovery plans, forecast, risk, and
+    recommendations all share the same single computed truth for the session —
+    no engines are re-run independently.
+    """
+    analysis = store.get_analysis(session_id)
+    if not analysis:
         raise HTTPException(
             status_code=404,
             detail=ApiResponse(
@@ -44,17 +49,26 @@ def _build_engine(session_id: str) -> RecommendationEngineV2:
                 message=f"Session {session_id} not found",
             ).model_dump(mode="json"),
         )
-    return RecommendationEngineV2(project_state=project_state, simulation_count=1000, scoring_weights=ScoringWeights())
+    engine = RecommendationEngineV2(
+        project_state=analysis.project_state,
+        simulation_count=1000,
+        scoring_weights=ScoringWeights(),
+    )
+    # Pre-seed the upstream cache so the engine never re-runs engines
+    # independently — it reads from the shared session analysis instead.
+    engine._upstream = analysis.upstream
+    return engine
 
 
 def _build_recovery_plan_engine(session_id: str) -> tuple[RecoveryPlanEngine, RecommendationEngineV2]:
-    """Build a RecoveryPlanEngine with all upstream components."""
+    """Build a RecoveryPlanEngine with all upstream components from cached analysis."""
     recommendation_engine = _build_engine(session_id)
-    
-    # Get upstream engine outputs (metrics, dag, critical path, etc.)
+
+    # _compute_upstream() returns immediately from the pre-seeded cache —
+    # no extra pipeline run happens here.
     upstream = recommendation_engine._compute_upstream()
-    
-    # Build SimulationEngine with upstream outputs
+
+    # Build SimulationEngine with cached upstream outputs
     simulation_engine = SimulationEngine(
         project_state=recommendation_engine.project_state,
         metrics=upstream.metrics,
@@ -66,10 +80,8 @@ def _build_recovery_plan_engine(session_id: str) -> tuple[RecoveryPlanEngine, Re
         risk_result=upstream.risk_result,
         simulation_count=1000,
     )
-    
-    # Build RecoveryPlanEngine
+
     recovery_plan_engine = RecoveryPlanEngine(simulation_engine=simulation_engine)
-    
     return recovery_plan_engine, recommendation_engine
 
 

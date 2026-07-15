@@ -82,6 +82,7 @@ class PipelineResult:
     historical_analysis: Optional[HistoricalAnalysis] = None     # Stage 17b (Phase 6b)
     knowledge_node: Optional[KnowledgeNode] = None               # Stage 18
     advisor_output: Optional[object] = None                       # Phase 7 — EMIOSAdvisorOutput
+    signal_map: Optional[list] = None                              # Phase 3 — SignalMapper output (pre-Observation)
 
 
 def _velocity_artifact_suppressed(validation: Optional[ValidationResult]) -> bool:
@@ -368,7 +369,33 @@ def run_emios_pipeline(
         except Exception:
             result.simulation = None
 
+    # INV 8 — populate counterfactual_statement on every recommendation.
+    # Template: "Without this action, the baseline on-time probability was X%."
+    if result.recommendations and result.monte_carlo is not None:
+        baseline_pct = round(result.monte_carlo.on_time_probability * 100)
+        for rec in result.recommendations:
+            if not rec.counterfactual_statement:
+                rec.counterfactual_statement = (
+                    f"Without this action, the baseline on-time probability was {baseline_pct}%. "
+                    f"This intervention directly addresses the conditions driving that risk."
+                )
+
     # ===== EMIOS cognitive pipeline (Stages 1-11 LIVE) ======================
+    # Phase 3 — SignalMapper: project metrics into flat signal stream
+    # (ObservationEngine inlines its own signal logic; this gives the
+    # reasoning-trace endpoint a structured pre-observation signal view)
+    try:
+        from app.pipeline.signal_mapper import SignalMapper
+        result.signal_map = [
+            s.model_dump() for s in SignalMapper().map_to_observation_signals(
+                metrics=result.metrics,
+                forecast=result.forecast,
+                monte_carlo=result.monte_carlo,
+            )
+        ]
+    except Exception:
+        result.signal_map = None  # never crash the pipeline over supplementary data
+
     result.observation_cluster = _stage_01_observe(state, result)
     result.validation_result = _stage_02_validate(state, result.observation_cluster)
     result.evidence_bundle = _stage_03_collect_evidence(state, result.validation_result, result)

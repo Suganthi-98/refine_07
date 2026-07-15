@@ -30,6 +30,7 @@ from app.engines.narrative_service import NarrativeService
 from app.api.routes.diagnosis import router as diagnosis_router
 from app.api.routes.learning import router as learning_router
 from app.api.routes.historical import router as historical_router
+from app.api.routes.reasoning_trace import router as reasoning_trace_router
 
 def create_app() -> FastAPI:
     """Create and configure FastAPI application."""
@@ -96,6 +97,7 @@ def create_app() -> FastAPI:
     app.include_router(diagnosis_router)
     app.include_router(learning_router)
     app.include_router(historical_router)
+    app.include_router(reasoning_trace_router)
     return app
 
 
