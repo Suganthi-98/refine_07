@@ -235,22 +235,7 @@ function DelayDiagnosis({session}){
 
   const sessionId = session?.project_summary?.session_id || ''
 
-  useEffect(()=>{
-    let mounted = true
-    if(!sessionId){
-      setError(new Error('Missing session id'))
-      setLoading(false)
-      return () => { mounted = false }
-    }
-    setLoading(true)
-    setError(null)
-    // Use sessionSnapshot (already cached by HeroBanner — browser dedupes the request)
-    api.sessionSnapshot(sessionId)
-      .then(snap=>{ if(mounted){ setForecast(snap?.forecast ?? null); setLoading(false) }})
-      .catch(err=>{ if(mounted){ setError(err); setLoading(false) }})
-    return ()=>{ mounted = false }
-  }, [sessionId])
-
+  
   if(loading){
     return (
       <section className="rounded-3xl border border-slate-700 bg-slate-900 p-6 shadow-inner shadow-black/20 mt-6">
@@ -1408,18 +1393,6 @@ export function Dashboard({session, onReset}){
 
   const sessionId = session?.project_summary?.session_id || ''
 
-  useEffect(()=>{
-    let mounted = true
-    if(!sessionId){
-      setMetricsError(new Error('Missing session id'))
-      setMetricsLoading(false)
-      return () => { mounted = false }
-    }
-    setMetricsLoading(true)
-    setMetricsError(null)
-
-    return ()=>{ mounted = false }
-  }, [sessionId])
 
   if (!session) return null
 
