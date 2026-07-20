@@ -82,7 +82,6 @@ class PipelineResult:
     historical_analysis: Optional[HistoricalAnalysis] = None     # Stage 17b (Phase 6b)
     knowledge_node: Optional[KnowledgeNode] = None               # Stage 18
     advisor_output: Optional[object] = None                       # Phase 7 — EMIOSAdvisorOutput
-    signal_map: Optional[list] = None                              # Phase 3 — SignalMapper output (pre-Observation)
 
 
 def _velocity_artifact_suppressed(validation: Optional[ValidationResult]) -> bool:
@@ -218,13 +217,11 @@ def _stage_14_decide(
 def _stage_15_plan(state: ProjectState, result: PipelineResult):
     """Stage 15 — RecoveryPlanBuilder.
 
-    NOTE: this is an adapter, not a new engine. The repo already has a
-    mature RecoveryPlanEngine (app/engines/recovery_plan_engine/) that
-    generates 3 ranked, simulated, scored plans (SAFE / AGGRESSIVE /
-    MINIMAL_DISRUPTION) with composite scores and narrative explanations.
-    Stage 15's job is just to feed it this pipeline's already-computed
-    upstream state instead of recomputing it, using the same construction
-    pattern as app/api/routes/recovery_plans.py::_build_recovery_plan_engine.
+    Feeds the mature RecoveryPlanEngine this pipeline's already-computed
+    upstream state.  Critically also passes:
+      - critical_path_item_ids: so MINIMAL_DISRUPTION avoids CP items
+      - resource_loads: so the generator knows which resources are overloaded
+    Without these, all three archetypes collapse to the same rec set.
     """
     from app.engines.recovery_plan_engine import RecoveryPlanEngine
     from app.engines.simulation_engine import SimulationEngine
@@ -232,6 +229,34 @@ def _stage_15_plan(state: ProjectState, result: PipelineResult):
     recommendations = result.recommendations or []
     if not recommendations or result.metrics is None or result.forecast is None:
         return None
+
+    # ── Extract critical path item IDs ────────────────────────────────────
+    cp_item_ids: set = set()
+    if result.critical_path is not None:
+        cp_item_ids = set(
+            getattr(result.critical_path, "items_on_critical_path", [])
+            or getattr(result.critical_path, "critical_path_items", [])
+            or getattr(result.critical_path, "critical_path", [])
+        )
+
+    # ── Extract resource load percentages from metrics ─────────────────────
+    # resource_loads: {resource_id -> load_ratio} where >1.0 means overloaded.
+    # MINIMAL_DISRUPTION uses this to avoid touching already-stressed resources.
+    resource_loads: dict = {}
+    try:
+        dev_metrics = (
+            result.metrics.resource_metrics.developer_metrics
+            if result.metrics and hasattr(result.metrics, "resource_metrics")
+            else []
+        )
+        for dm in (dev_metrics or []):
+            rid = getattr(dm, "resource_id", None) or getattr(dm, "name", None)
+            avail = getattr(dm, "availability_pct", 100.0) or 100.0
+            alloc = getattr(dm, "allocation_pct", 0.0) or 0.0
+            if rid:
+                resource_loads[rid] = round(alloc / max(avail, 1.0), 3)
+    except Exception:
+        resource_loads = {}
 
     simulation_engine = SimulationEngine(
         project_state=state,
@@ -246,7 +271,11 @@ def _stage_15_plan(state: ProjectState, result: PipelineResult):
     )
     recovery_plan_engine = RecoveryPlanEngine(simulation_engine=simulation_engine)
 
-    return recovery_plan_engine.generate_recovery_plans(recommendations=recommendations)
+    return recovery_plan_engine.generate_recovery_plans(
+        recommendations=recommendations,
+        critical_path_item_ids=cp_item_ids if cp_item_ids else None,
+        resource_loads=resource_loads if resource_loads else None,
+    )
 
 
 def _stage_16_monitor(plan, state): return None
@@ -317,6 +346,70 @@ def _stage_advisor(result: PipelineResult):
     return EMIOSAdvisor().run(advisor_input)
 
 
+def _enrich_learning_from_history(state: ProjectState, result: "PipelineResult") -> None:
+    """
+    Pre-populate the learning record with calibration signals from completed sprints.
+    Compares planned vs actual velocity across all completed sprints to compute:
+    - velocity_estimate_bias: how consistently the team over/under-delivers vs plan
+    - A Brier-score proxy: average |planned_probability - 1.0| for completed sprints
+      (completed sprints DID deliver, so actual=1.0 for each; planned=planned_velocity/cap)
+
+    This gives the learning engine real signal even before explicit outcome tagging.
+    """
+    try:
+        from datetime import datetime, timezone
+        lr = result.learning_record
+        if lr is None:
+            return
+
+        # Use state.actuals (SprintActual objects) which have both planned and actual hrs
+        actuals = getattr(state, "actuals", []) or []
+        actuals = [a for a in actuals if
+                   float(getattr(a, "planned_effort_hrs", 0) or 0) > 0
+                   and float(getattr(a, "actual_effort_hrs", 0) or 0) > 0]
+        if not actuals:
+            return
+
+        # Compute velocity bias: (actual - planned) / planned per sprint, then average
+        # Positive bias = team delivered MORE than planned (pessimistic estimates)
+        # Negative bias = team delivered LESS than planned (over-optimistic estimates)
+        biases = []
+        brier_proxies = []
+        for a in actuals:
+            planned = float(a.planned_effort_hrs)
+            actual_v = float(a.actual_effort_hrs)
+            bias = (actual_v - planned) / planned
+            biases.append(bias)
+            # Brier proxy: how far was completion_rate from 1.0 (full delivery)?
+            completion = float(getattr(a, "completion_rate", 1.0) or 1.0)
+            brier_proxies.append((1.0 - min(1.0, completion)) ** 2)
+
+        if biases:
+            import statistics
+            mean_bias = statistics.mean(biases)
+            mean_brier = statistics.mean(brier_proxies)
+
+            # Update the learning record fields that the CalibrationStore will use
+            lr.velocity_estimate_bias = round(mean_bias, 4)
+            lr.brier_score = round(mean_brier, 4)
+            lr.calibration_note = (
+                f"Auto-calibrated from {len(biases)} completed sprints: "
+                f"velocity bias={round(mean_bias*100,1)}% "
+                f"({'over-optimistic' if mean_bias < -0.05 else 'pessimistic' if mean_bias > 0.05 else 'well-calibrated'}), "
+                f"Brier proxy={round(mean_brier, 3)}"
+            )
+            # Also push into CalibrationStore so MonteCarloEngine reads it next run
+            try:
+                from app.storage.calibration_store import CalibrationStore
+                team_id = getattr(getattr(state, "project_info", None), "team_id", "default") or "default"
+                for bias_val in biases:
+                    CalibrationStore.record_episode(team_id, bias_val, 0.0, mean_brier)
+            except Exception:
+                pass
+    except Exception:
+        pass  # never crash the pipeline over learning enrichment
+
+
 def run_emios_pipeline(
     state: ProjectState,
     *,
@@ -360,7 +453,7 @@ def run_emios_pipeline(
     rec_engine = RecommendationEngineV2(
         project_state=state, simulation_count=simulation_count
     )
-    result.recommendations = rec_engine.generate(top_n=5)
+    result.recommendations = rec_engine.generate(top_n=10)
     if result.recommendations:
         try:
             result.simulation = rec_engine.simulate(
@@ -369,33 +462,7 @@ def run_emios_pipeline(
         except Exception:
             result.simulation = None
 
-    # INV 8 — populate counterfactual_statement on every recommendation.
-    # Template: "Without this action, the baseline on-time probability was X%."
-    if result.recommendations and result.monte_carlo is not None:
-        baseline_pct = round(result.monte_carlo.on_time_probability * 100)
-        for rec in result.recommendations:
-            if not rec.counterfactual_statement:
-                rec.counterfactual_statement = (
-                    f"Without this action, the baseline on-time probability was {baseline_pct}%. "
-                    f"This intervention directly addresses the conditions driving that risk."
-                )
-
     # ===== EMIOS cognitive pipeline (Stages 1-11 LIVE) ======================
-    # Phase 3 — SignalMapper: project metrics into flat signal stream
-    # (ObservationEngine inlines its own signal logic; this gives the
-    # reasoning-trace endpoint a structured pre-observation signal view)
-    try:
-        from app.pipeline.signal_mapper import SignalMapper
-        result.signal_map = [
-            s.model_dump() for s in SignalMapper().map_to_observation_signals(
-                metrics=result.metrics,
-                forecast=result.forecast,
-                monte_carlo=result.monte_carlo,
-            )
-        ]
-    except Exception:
-        result.signal_map = None  # never crash the pipeline over supplementary data
-
     result.observation_cluster = _stage_01_observe(state, result)
     result.validation_result = _stage_02_validate(state, result.observation_cluster)
     result.evidence_bundle = _stage_03_collect_evidence(state, result.validation_result, result)
@@ -417,6 +484,7 @@ def run_emios_pipeline(
     result.historical_analysis = _stage_17b_historical(state)
     result.learning_record = _stage_17a_learning(result, actual_outcome=actual_outcome, team_id=team_id)
     result.knowledge_node = _stage_18_retain(result.learning_record)
+    _enrich_learning_from_history(state, result)
     result.advisor_output = _stage_advisor(result)
 
     return result

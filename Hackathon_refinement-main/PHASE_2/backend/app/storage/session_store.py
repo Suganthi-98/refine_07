@@ -7,7 +7,7 @@ For production: replace with Redis + session tokens.
 """
 
 from typing import Dict, Optional
-from datetime import datetime
+from datetime import datetime, timezone
 from threading import Lock
 
 from app.domain.models import ProjectState
@@ -44,8 +44,8 @@ class Session:
     def __init__(self, session_id: str, project_state: ProjectState):
         self.session_id = session_id
         self.project_state = project_state
-        self.created_at = datetime.utcnow()
-        self.last_accessed = datetime.utcnow()
+        self.created_at = datetime.now(timezone.utc)
+        self.last_accessed = datetime.now(timezone.utc)
         self.descoped_item_ids = set()  # For scope change tracking
         # Lazily populated by SessionStore.get_analysis() — holds the single
         # computed truth (ProjectAnalysis) so every route reads the same numbers.
@@ -61,6 +61,11 @@ class Session:
         self.applied_plan_id = None
         # last_simulation_result: stored by POST /recommendations/simulate
         self.last_simulation_result = None
+        # pipeline_result: full PipelineResult from run_emios_pipeline(),
+        # stored by _prewarm_session / POST /api/demo/load.
+        # All routes (recovery_plans, recommendations) read from here first
+        # instead of rebuilding engines from scratch on every request.
+        self.pipeline_result = None
         # actual_outcomes: sprint_id -> ActualSprintOutcome, populated by
         # POST /api/learning/outcome once a sprint closes. Stage 17a
         # (LearningEngine) reads the most recent entry here instead of the
@@ -69,15 +74,17 @@ class Session:
     
     def touch(self) -> None:
         """Update last accessed timestamp."""
-        self.last_accessed = datetime.utcnow()
+        self.last_accessed = datetime.now(timezone.utc)
 
     def invalidate_analysis(self) -> None:
         """
         Drop the cached ProjectAnalysis so it is recomputed on the next
         get_analysis() call.  Must be called whenever project_state is mutated
         (e.g. scope change, descope).
+        Also drops the pipeline_result so EMIOS is re-run with the new state.
         """
         self._analysis = None
+        self.pipeline_result = None
 
 
 class SessionStore:
@@ -198,6 +205,17 @@ class SessionStore:
             session.pre_apply_snapshot = _snapshot_from_analysis(analysis)
             session.applied_plan_id = plan_id
 
+    def set_pipeline_result(self, session_id: str, pipeline_result) -> None:
+        """Store the full PipelineResult from run_emios_pipeline() on the session."""
+        session = self.get_session(session_id)
+        if session is not None:
+            session.pipeline_result = pipeline_result
+
+    def get_pipeline_result(self, session_id: str):
+        """Return the stored PipelineResult, or None if not yet run."""
+        session = self.get_session(session_id)
+        return session.pipeline_result if session is not None else None
+
     def invalidate_analysis(self, session_id: str) -> None:
         """
         Drop the cached ProjectAnalysis for a session so it is rebuilt on
@@ -205,6 +223,7 @@ class SessionStore:
 
         Call this whenever project_state is mutated (scope change, descope,
         blocker resolution, etc.) so routes don't serve stale numbers.
+        Also invalidates the stored pipeline_result so EMIOS is re-run.
 
         Args:
             session_id: Session identifier.

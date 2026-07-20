@@ -476,6 +476,7 @@ class RecommendationSummary(BaseModel):
     blocker_overdue_days: Optional[int] = Field(None, description="Days the targeted blocker is past its target resolution date, if applicable")
     simulation_evidence: Optional[RecommendationSimulationEvidence] = Field(None, description="Baseline/simulated/delta metrics plus forecast levers changed by the recommendation")
     validation: Optional[RecommendationValidationResponse] = Field(None, description="Why this recommendation was selected and how it compares to alternatives")
+    counterfactual_statement: Optional[str] = Field(None, description="What happens if this action is NOT taken, e.g. 'Without this action, on-time probability stays at 34%'")
 
 
 class RecommendationSimulationRequest(BaseModel):

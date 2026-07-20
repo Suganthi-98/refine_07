@@ -100,7 +100,7 @@ class NarrativeService:
     async def explain(
         self,
         advisor_input: AdvisorInput,
-        fallback_text_by_recommendation: Dict[str, str],
+        fallback_text_by_recommendation: Dict[str, str] = None,
     ) -> Dict[str, Any]:
         """
         Generate (or retrieve from cache) an AI narrative for the given

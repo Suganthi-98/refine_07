@@ -51,7 +51,7 @@ from __future__ import annotations
 
 from typing import Literal, Optional
 
-from pydantic import Field
+from pydantic import Field, validator
 from pydantic_settings import BaseSettings
 from pathlib import Path
 import os
@@ -66,7 +66,15 @@ class AISettings(BaseSettings):
     """
 
     # ─── Provider selector ───────────────────────────────────────────────────
-    ai_provider: Literal["bosch", "anthropic"] = "bosch"
+    ai_provider: str = "bosch"
+
+    @validator("ai_provider")
+    @classmethod
+    def _validate_ai_provider(cls, v: str) -> str:
+        allowed = {"bosch", "anthropic"}
+        if v not in allowed:
+            raise ValueError(f"ai_provider must be one of {allowed}, got '{v}'")
+        return v
 
     # ─── Bosch LLM Farm ──────────────────────────────────────────────────────
     # Env-var names match Bosch's own credential distribution exactly.

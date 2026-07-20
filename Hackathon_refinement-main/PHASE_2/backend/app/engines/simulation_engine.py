@@ -996,7 +996,7 @@ class ActionApplicatorV2:
                         break
                 if unchanged:
                     logging.getLogger(__name__).warning(
-                        "Applicator did not modify declared forecast levers for %s: %s",
+                        "Applicator skipping — did not modify declared forecast levers for %s: %s",
                         rec.recommendation_id,
                         list(sampled.keys()),
                     )
@@ -1011,7 +1011,12 @@ class ActionApplicatorV2:
             blocker = next((b for b in state.blockers if b.blocker_id == blocker_id), None)
             if blocker is not None:
                 blocker.status = BlockerStatus.RESOLVED
-                blocker.actual_resolution_date = blocker.raised_date
+                # S2 fix: use now() not raised_date — resolution is happening now in simulation
+                # Use naive datetime to match raised_date which may be naive in test fixtures
+                _now = datetime.now(timezone.utc)
+                if blocker.raised_date and blocker.raised_date.tzinfo is None:
+                    _now = _now.replace(tzinfo=None)
+                blocker.actual_resolution_date = _now
                 self._unblock_impacted_items(state, blocker)
 
     def _unblock_impacted_items(self, state: ProjectState, blocker: Blocker) -> None:

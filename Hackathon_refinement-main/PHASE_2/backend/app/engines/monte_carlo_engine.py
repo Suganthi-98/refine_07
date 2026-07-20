@@ -28,6 +28,7 @@ from app.api.models_phase3 import (
 
 
 from app.engines.project_calibration import ProjectCalibration
+from app.storage.calibration_store import CalibrationStore, MIN_EPISODES_FOR_CORRECTION
 
 class MonteCarloEngine:
     """Monte Carlo simulation engine for probabilistic forecasting.
@@ -79,8 +80,10 @@ class MonteCarloEngine:
         self.velocity_std_dev_pct = velocity_std_dev_pct
         self.remaining_work_std_dev_pct = remaining_work_std_dev_pct
 
-        if seed is not None:
-            random.seed(seed)
+        # Use an instance-level RNG so multiple SimulationEngineV2 calls
+        # in the same process don't share (and reset) the global random state.
+        # This ensures baseline and simulated Monte Carlo draws are independent.
+        self._rng = random.Random(seed)
 
     def calculate(self) -> MonteCarloResult:
         # Override hardcoded defaults with project-calibrated values
@@ -88,6 +91,24 @@ class MonteCarloEngine:
         self.velocity_std_dev_pct = _cal.velocity_std_dev_pct
         self.remaining_work_std_dev_pct = _cal.work_std_dev_pct
         self._velocity_floor_pct = _cal.velocity_floor_pct
+
+        # C1 fix: apply learned velocity bias from CalibrationStore.
+        # If the model has over-estimated velocity in past sprints (positive bias →
+        # team was slower than predicted), reduce base_velocity accordingly.
+        # Only applied once MIN_EPISODES_FOR_CORRECTION episodes are available
+        # so one bad sprint doesn't distort the whole forecast.
+        self._velocity_bias_correction = 0.0
+        try:
+            team_id = getattr(project_state.project_info, "team_id", "default") or "default"
+            profile = CalibrationStore.get(team_id)
+            if profile and profile.episode_count >= MIN_EPISODES_FOR_CORRECTION:
+                # velocity_bias = (actual - forecast) / forecast
+                # Negative bias → model was over-optimistic → scale velocity down
+                # Positive bias → model was pessimistic → scale velocity up
+                # Clamp to ±20% to avoid over-correction from small samples
+                self._velocity_bias_correction = max(-0.20, min(0.20, profile.velocity_bias))
+        except Exception:
+            self._velocity_bias_correction = 0.0
 
         """Run Monte Carlo simulation and return results."""
 
@@ -138,7 +159,7 @@ class MonteCarloEngine:
 
         # 2) Add variation to remaining work (normal distribution)
         std_dev_remaining = base_remaining * self.remaining_work_std_dev_pct
-        remaining_work = random.gauss(base_remaining, std_dev_remaining)
+        remaining_work = self._rng.gauss(base_remaining, std_dev_remaining)
         remaining_work = max(0.0, remaining_work)  # Clamp to non-negative
 
         # 3) Account for critical path sequencing using REMAINING effort
@@ -169,7 +190,7 @@ class MonteCarloEngine:
             try:
                 total_spill = sum(self.spillover.predicted_spillover_by_sprint.values())
                 # Sample 0-100% random spillover materialization (sometimes items don't spill)
-                spillover_factor = random.uniform(0.0, 1.0)
+                spillover_factor = self._rng.uniform(0.0, 1.0)
                 spillover_hours = float(total_spill) * avg_item_effort * spillover_factor
             except Exception:
                 spillover_hours = 0.0
@@ -201,15 +222,33 @@ class MonteCarloEngine:
                     base_velocity = max(base_velocity, avg_remaining_planned_velocity)
         except Exception:
             pass
-        # 6) Sample blocker impact between 0 and max (uniform)
+        # C1 fix: apply learned velocity bias correction
+        if self._velocity_bias_correction != 0.0:
+            # bias < 0 means model over-estimated → team was slower → reduce velocity
+            base_velocity = base_velocity * (1.0 + self._velocity_bias_correction)
+            base_velocity = max(base_velocity, 1.0)  # never drive to zero
+
+        # 6) Sample blocker impact — truncated normal centered at 80% of max
+        # (blockers either fully bite or they're partially mitigated — uniform 0-max
+        # underestimates the expected impact by 50%; this is more realistic)
         blocker_impact_max = float(getattr(self.metrics, "estimated_blocker_velocity_impact", 0.0) or 0.0)
-        blocker_impact_actual = random.uniform(0.0, blocker_impact_max)
+        # S1 fix: truncated normal centered at 80% of max impact
+        # (most of the time blockers do materially bite; occasionally they resolve early)
+        if blocker_impact_max > 0.0:
+            _mean_impact = blocker_impact_max * 0.80
+            _std_impact = blocker_impact_max * 0.15
+            blocker_impact_actual = max(0.0, min(blocker_impact_max,
+                self._rng.gauss(_mean_impact, _std_impact)))
+        else:
+            blocker_impact_actual = 0.0
         sprint_days = float(self.project_state.project_info.sprint_duration_days or 14)
 
         # spillover_fraction: this trial's spillover-driven share of remaining
         # schedule delay, capped so a single trial's velocity can never be driven
         # to near-zero by spillover alone. Mirrors ForecastEngine's cap exactly.
-        velocity_without_spillover = max(base_velocity * (1.0 - blocker_impact_actual), base_velocity * self._velocity_floor_pct)
+        # M2 fix: apply floor only once — in mean_velocity below, not here
+        # velocity_without_spillover is an intermediate term for spillover fraction calc only
+        velocity_without_spillover = max(base_velocity * (1.0 - blocker_impact_actual), base_velocity * self._velocity_floor_pct * 0.5)
         spillover_penalty_days = (
             (spillover_hours / velocity_without_spillover) * sprint_days
             if velocity_without_spillover > 0 else 0.0
@@ -238,7 +277,7 @@ class MonteCarloEngine:
         mean_velocity = max(mean_velocity, base_velocity * self._velocity_floor_pct)
 
         projected_velocity = max(
-            random.gauss(
+            self._rng.gauss(
                 mean_velocity,
                 mean_velocity * self.velocity_std_dev_pct,
             ),

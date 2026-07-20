@@ -210,7 +210,7 @@ def test_recommendation_engine_v2_caches_upstream_once(monkeypatch):
     engine.generate(top_n=5)
     engine.generate(top_n=3)
 
-    assert len(calls) == 2
+    assert len(calls) == 1  # Second generate() returns cached result, _compute_upstream not called again
 
 
 def test_recommendation_engine_v2_simulate_without_prior_generate():

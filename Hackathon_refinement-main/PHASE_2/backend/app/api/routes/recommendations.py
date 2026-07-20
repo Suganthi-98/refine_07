@@ -375,6 +375,11 @@ def _recommendation_to_summary(
         blocker_overdue_days=blocker_overdue_days,
         simulation_evidence=simulation_evidence,
         validation=validation_response,
+        counterfactual_statement=(
+            f"Without this action, on-time probability stays at "
+            f"{round(baseline_prob * 100, 1)}% and the project remains "
+            f"{round(baseline_delay, 1)} day(s) behind schedule."
+        ),
     )
 
 def _build_engine(session_id: str) -> RecommendationEngineV2:
@@ -443,10 +448,24 @@ async def get_recommendations(
 ):
     try:
         session_id = session_id.strip()
-        recommendation_engine = _build_engine(session_id)
-        candidates = recommendation_engine.generate(top_n=top_n)
 
-        upstream = recommendation_engine._compute_upstream()
+        # ── Fast path: read recommendations from stored PipelineResult ────────
+        # POST /api/demo/load runs the full EMIOS pipeline and stores the result.
+        # Reading from it here ensures recommendations are consistent with the
+        # diagnosis, decision, and recovery plans shown on other tabs.
+        pipeline_result = store.get_pipeline_result(session_id)
+        if pipeline_result and getattr(pipeline_result, "recommendations", None):
+            # Rebuild the engine so we can call _compute_upstream() for advisor
+            # input — but skip generate() since we already have the recs.
+            recommendation_engine = _build_engine(session_id)
+            candidates = list(pipeline_result.recommendations)
+            # Re-rank with beam search using the same upstream (no extra pipeline run)
+            upstream = recommendation_engine._compute_upstream()
+        else:
+            # ── Slow path: rebuild and generate from scratch ──────────────────
+            recommendation_engine = _build_engine(session_id)
+            candidates = recommendation_engine.generate(top_n=top_n)
+            upstream = recommendation_engine._compute_upstream()
 
         baseline_metrics = {
             "on_time_probability": round(upstream.monte_carlo.on_time_probability, 4),

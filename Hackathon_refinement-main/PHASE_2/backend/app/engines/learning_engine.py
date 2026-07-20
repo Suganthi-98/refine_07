@@ -92,8 +92,9 @@ class LearningEngine:
         elif brier_score is not None and brier_score < 0.05:
             prior_adjustment = 0.02  # model was well-calibrated, slight confidence boost
 
+        _record_id = f"lr-{uuid4().hex[:10]}"
         record = LearningRecord(
-            id=f"lr-{uuid4().hex[:10]}",
+            id=_record_id,
             episode_date=datetime.now(timezone.utc),
             forecast_probability=forecast_prob,
             actual_outcome=actual,
@@ -103,8 +104,8 @@ class LearningEngine:
             calibration_note=note,
             retained_pattern=retained_pattern,
             recommended_prior_adjustment=prior_adjustment,
-            # legacy aliases
-            record_id=f"lr-{uuid4().hex[:10]}",
+            # M1 fix: same ID for both fields
+            record_id=_record_id,
             diagnosis_was_correct=(
                 actual_outcome.diagnosis_confirmed if actual_outcome else None
             ),

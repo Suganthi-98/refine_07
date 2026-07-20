@@ -1,8 +1,8 @@
 import React, {useState, useEffect} from 'react'
 import { api } from '../api/client'
-import MetricsRow from './components/MetricsRow'
 import RecoveryPlansPage from './components/RecoveryPlans'
 import { ReasoningTrace } from './components/ReasoningTrace'
+import { SprintHealth } from './components/SprintHealth'
 
 const tabs = [
   { key: 'overview', label: 'Overview' },
@@ -12,6 +12,7 @@ const tabs = [
   { key: 'recovery-plans', label: 'Recovery Plans' },
   { key: 'actions', label: 'Actions' },
   { key: 'compare', label: '📊 Compare' },
+  { key: 'sprint-health', label: '🏥 Sprint Health' },
   { key: 'reasoning-trace', label: '🧠 Reasoning Trace' },
 ]
 
@@ -24,13 +25,11 @@ function MetricCard({label, value}){
   )
 }
 
-function OverviewPage({ session, metrics, onNavigate }) {
+function OverviewPage({ session, onNavigate }) {
   const summary = session.project_summary
   return (
     <div>
       <HeroBanner session={session} onNavigate={onNavigate} />
-      <MonteCarloStrip session={session} />
-      <ProjectSummaryCard session={session} />
       <section className="rounded-3xl border border-slate-700 bg-slate-900 p-6 shadow-inner shadow-black/20 mt-6">
         <div className="flex flex-col gap-4 sm:flex-row sm:items-end sm:justify-between">
           <div>
@@ -38,15 +37,14 @@ function OverviewPage({ session, metrics, onNavigate }) {
             <h2 className="mt-2 text-3xl font-extrabold text-white">{summary.project_name}</h2>
             <p className="mt-2 text-sm text-slate-400">{summary.customer} · Managed by {summary.project_manager}</p>
           </div>
-          <div className="rounded-3xl bg-slate-950 px-4 py-3 text-sm text-slate-300">Session {summary.session_id}</div>
+
         </div>
 
-        <div className="mt-8 grid gap-4 sm:grid-cols-2 xl:grid-cols-6">
-          <MetricCard label="Target sprints" value={`${summary.completed_sprints}/${summary.total_sprints}`} />
-          <MetricCard label="Work items" value={summary.total_work_items} />
-          <MetricCard label="Dependencies" value={summary.total_dependencies} />
-          <MetricCard label="Blockers" value={summary.total_blockers} />
-          <MetricsRow metrics={metrics} />
+        <div className="mt-8 grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
+          <MetricCard label="Sprints" value={`${summary.completed_sprints ?? '—'} / ${summary.total_sprints ?? '—'}`} />
+          <MetricCard label="Blockers active" value={summary.total_blockers ?? '—'} />
+          <MetricCard label="Work items" value={summary.total_work_items ?? '—'} />
+          <MetricCard label="Dependencies" value={summary.total_dependencies ?? '—'} />
         </div>
       </section>
     </div>
@@ -56,8 +54,7 @@ function OverviewPage({ session, metrics, onNavigate }) {
 function HeroBanner({ session, onNavigate }) {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
-  const [forecast, setForecast] = useState(null)
-  const [mc, setMc] = useState(null)
+  const [snap, setSnap] = useState(null)
   const sessionId = session?.project_summary?.session_id || ''
 
   const fetchData = async () => {
@@ -65,9 +62,9 @@ function HeroBanner({ session, onNavigate }) {
     setLoading(true)
     setError(null)
     try {
-      const [f, m] = await Promise.all([api.forecast(sessionId), api.monteCarlo(sessionId)])
-      setForecast(f?.forecast ?? f)
-      setMc(m?.monte_carlo ?? m)
+      // Single call returns forecast + MC + risk + EMIOS strip
+      const s = await api.sessionSnapshot(sessionId)
+      setSnap(s)
       setLoading(false)
     } catch (err) {
       setError(err)
@@ -94,8 +91,13 @@ function HeroBanner({ session, onNavigate }) {
     </section>
   )
 
-  const prob = mc && mc.on_time_probability !== undefined ? Math.round(mc.on_time_probability * 100) : null
-  const expected = forecast && typeof forecast.expected_delay_days === 'number' ? Math.round(forecast.expected_delay_days) : null
+  const mc = snap?.monte_carlo || {}
+  const forecast = snap?.forecast || {}
+  const strip = snap?.emios_strip || {}
+
+  const prob = mc.on_time_probability !== undefined ? Math.round(mc.on_time_probability * 100) : null
+  const expected = typeof forecast.expected_delay_days === 'number' ? Math.round(forecast.expected_delay_days) : null
+  const riskLevel = snap?.risk?.overall_risk_level || mc.on_time_risk_level || null
 
   const probColor = prob === null ? 'text-slate-400'
     : prob >= 70 ? 'text-emerald-400'
@@ -141,18 +143,73 @@ function HeroBanner({ session, onNavigate }) {
             What should I do? →
           </button>
           <button
-            onClick={() => onNavigate && onNavigate('compare')}
+            onClick={() => onNavigate && onNavigate('recovery-plans')}
+            className="rounded-2xl border border-sky-500 bg-sky-500/10 px-6 py-3 text-sm font-semibold text-sky-200 hover:bg-sky-500/20 transition text-center"
+          >
+            Recovery Plans →
+          </button>
+          <button
+            onClick={() => onNavigate && onNavigate('reasoning-trace')}
             className="rounded-2xl border border-slate-600 bg-slate-800 px-6 py-3 text-sm font-semibold text-slate-200 hover:bg-slate-700 transition text-center"
           >
-            Compare forecasts →
+            🧠 Why? →
           </button>
-          {mc?.on_time_risk_level && (
+          {riskLevel && (
             <div className="text-center text-xs uppercase tracking-[0.2em] text-slate-500">
-              Risk level: <span className={`font-semibold ${probColor}`}>{mc.on_time_risk_level}</span>
+              Risk level: <span className={`font-semibold ${probColor}`}>{riskLevel}</span>
             </div>
           )}
         </div>
       </div>
+
+      {/* EMIOS Diagnosis Strip — data from sessionSnapshot.emios_strip */}
+      {snap && (strip.root_cause || strip.chosen_action || strip.recovery_state || strip.executive_summary) && (
+        <div className="mt-6 border-t border-slate-800 pt-5 space-y-4">
+          {strip.root_cause && (
+            <div className="flex flex-wrap items-start gap-3">
+              <span className="flex-none text-xs uppercase tracking-[0.15em] text-slate-500 pt-1 w-28">Root cause</span>
+              <div className="flex-1">
+                <span className="text-sm font-semibold text-rose-200">{strip.root_cause}</span>
+                {strip.confidence_pct !== null && strip.confidence_pct !== undefined && (
+                  <span className={`ml-3 text-xs font-semibold px-2 py-0.5 rounded-full ${
+                    strip.confidence_pct >= 70 ? 'bg-emerald-500/20 text-emerald-300' :
+                    strip.confidence_pct >= 50 ? 'bg-amber-500/20 text-amber-300' :
+                    'bg-rose-500/20 text-rose-300'
+                  }`}>
+                    {strip.confidence_pct}% confidence
+                  </span>
+                )}
+              </div>
+            </div>
+          )}
+          {strip.chosen_action && (
+            <div className="flex flex-wrap items-start gap-3">
+              <span className="flex-none text-xs uppercase tracking-[0.15em] text-slate-500 pt-1 w-28">Recommended</span>
+              <span className="flex-1 text-sm text-emerald-200 font-semibold">{strip.chosen_action}</span>
+            </div>
+          )}
+          {strip.recovery_state && (
+            <div className="flex flex-wrap items-start gap-3">
+              <span className="flex-none text-xs uppercase tracking-[0.15em] text-slate-500 pt-1 w-28">Project state</span>
+              <span className={`text-xs font-bold px-3 py-1 rounded-full ${
+                strip.recovery_state === 'CRITICAL' ? 'bg-rose-500/20 text-rose-300 border border-rose-500/40' :
+                strip.recovery_state === 'RECOVERY' ? 'bg-orange-500/20 text-orange-300 border border-orange-500/40' :
+                strip.recovery_state === 'WARNING' ? 'bg-amber-500/20 text-amber-300 border border-amber-500/40' :
+                strip.recovery_state === 'WATCH' ? 'bg-sky-500/20 text-sky-300 border border-sky-500/40' :
+                'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40'
+              }`}>
+                {strip.recovery_state}
+              </span>
+            </div>
+          )}
+          {strip.executive_summary && (
+            <div className="rounded-2xl border border-amber-500/20 bg-amber-500/5 px-4 py-3">
+              <span className="text-xs uppercase tracking-[0.15em] text-amber-400">AI Advisor</span>
+              <p className="mt-1 text-sm text-amber-100 leading-6">{strip.executive_summary}</p>
+            </div>
+          )}
+        </div>
+      )}
     </section>
   )
 }
@@ -170,198 +227,6 @@ function daysBetween(a,b){
   return Math.round((b - a)/msPerDay)
 }
 
-function ProjectSummaryCard({session}){
-  const summary = session.project_summary || {}
-  const [forecast, setForecast] = useState(null)
-  const [loading, setLoading] = useState(true)
-  const [error, setError] = useState(null)
-
-  const sessionId = session?.project_summary?.session_id || ''
-
-  useEffect(()=>{
-    let mounted = true
-    if(!sessionId){
-      setError(new Error('Missing session id'))
-      setLoading(false)
-      return () => { mounted = false }
-    }
-    setLoading(true)
-    api.forecast(sessionId).then(f=>{ if(mounted){ setForecast(f?.forecast ?? f); setLoading(false) }}).catch(err=>{ if(mounted){ setError(err); setLoading(false) }})
-    return ()=>{ mounted=false }
-  }, [sessionId])
-
-  if(loading) return (
-    <section className="rounded-3xl border border-slate-700 bg-slate-900 p-6">
-      <p className="text-sm uppercase tracking-[0.3em] text-amber-400">Project summary</p>
-      <div className="mt-2 text-sm text-slate-400">Loading summary…</div>
-    </section>
-  )
-
-  if(error) return (
-    <section className="rounded-3xl border border-rose-600 bg-rose-900/10 p-6">
-      <p className="text-sm uppercase tracking-[0.3em] text-rose-400">Project summary</p>
-      <div className="mt-2 text-sm text-rose-300">{error.message || 'Failed to load forecast'}</div>
-    </section>
-  )
-
-  // fields
-  const startIso = summary.start_date
-  const targetIso = summary.target_end_date || (forecast && forecast.target_end_date)
-  const expectedIso = forecast && forecast.expected_finish_date
-
-  // compute days elapsed/remaining
-  const today = new Date()
-  const startDate = startIso ? new Date(startIso) : null
-  const targetDate = targetIso ? new Date(targetIso) : null
-  let daysElapsed = null
-  if(forecast && forecast.delay_breakdown && typeof forecast.delay_breakdown.days_elapsed === 'number'){
-    daysElapsed = forecast.delay_breakdown.days_elapsed
-  }else if(startDate){
-    daysElapsed = daysBetween(startDate, today)
-  }
-  let daysRemaining = null
-  if(forecast && forecast.delay_breakdown && typeof forecast.delay_breakdown.remaining_days_total === 'number'){
-    daysRemaining = forecast.delay_breakdown.remaining_days_total
-  }else if(targetDate){
-    daysRemaining = daysBetween(today, targetDate)
-  }
-
-  return (
-    <section className="rounded-3xl border border-slate-700 bg-slate-900 p-6">
-      <p className="text-sm uppercase tracking-[0.3em] text-amber-400">Project summary</p>
-      <div className="mt-3 grid grid-cols-1 sm:grid-cols-2 gap-4">
-        <div>
-          <div className="text-lg font-semibold text-white">{summary.project_name}</div>
-          <div className="mt-1 text-sm text-slate-400">{summary.customer} · Managed by {summary.project_manager}</div>
-        </div>
-        <div className="space-y-1">
-          <div className="text-sm text-slate-400">Start date</div>
-          <div className="text-white font-medium">{formatDate(startIso)}</div>
-
-          <div className="text-sm text-slate-400 mt-2">Target end date</div>
-          <div className="text-white font-medium">{formatDate(targetIso)}</div>
-
-          <div className="text-sm text-slate-400 mt-2">Expected finish</div>
-          <div className="text-white font-medium">{formatDate(expectedIso)}</div>
-        </div>
-      </div>
-
-      <div className="mt-4 flex gap-6">
-        <div className="rounded-lg bg-slate-800/40 px-4 py-2">
-          <div className="text-sm text-slate-400">Days elapsed</div>
-          <div className="text-white font-semibold">{daysElapsed !== null ? `${daysElapsed} days` : '—'}</div>
-        </div>
-        <div className="rounded-lg bg-slate-800/40 px-4 py-2">
-          <div className="text-sm text-slate-400">Days remaining</div>
-          <div className="text-white font-semibold">{daysRemaining !== null ? `${daysRemaining} days` : '—'}</div>
-        </div>
-      </div>
-    </section>
-  )
-}
-
-function MonteCarloStrip({session}){
-  const [loading, setLoading] = useState(true)
-  const [error, setError] = useState(null)
-  const [mc, setMc] = useState(null)
-
-  const sessionId = session?.project_summary?.session_id || ''
-
-  useEffect(()=>{
-    let mounted = true
-    if(!sessionId){
-      setError(new Error('Missing session id'))
-      setLoading(false)
-      return () => { mounted = false }
-    }
-    setLoading(true)
-    setError(null)
-    api.monteCarlo(sessionId)
-      .then(response=>{ if(mounted){ setMc(response?.monte_carlo ?? response); setLoading(false) }})
-      .catch(err=>{ if(mounted){ setError(err); setLoading(false) }})
-    return ()=>{ mounted = false }
-  }, [sessionId])
-
-  if(loading){
-    return (
-      <section className="rounded-3xl border border-slate-700 bg-slate-900 p-6 shadow-inner shadow-black/20 mt-6">
-        <p className="text-sm uppercase tracking-[0.3em] text-amber-400">Monte Carlo simulation</p>
-        <p className="mt-3 text-sm text-slate-400">Loading simulated finish-date range…</p>
-      </section>
-    )
-  }
-
-  if(error){
-    return (
-      <section className="rounded-3xl border border-rose-600 bg-rose-900/10 p-6 shadow-inner shadow-black/20 mt-6">
-        <div className="flex items-center justify-between gap-4">
-          <div>
-            <p className="text-sm uppercase tracking-[0.3em] text-rose-400">Monte Carlo simulation</p>
-            <h2 className="mt-2 text-2xl font-semibold text-rose-100">Unable to load simulations</h2>
-            <p className="mt-2 text-sm text-rose-300">{error.message || 'Monte Carlo data could not be retrieved.'}</p>
-          </div>
-          <button onClick={()=>{ setLoading(true); setError(null); api.monteCarlo(sessionId).then(response=>{ setMc(response?.monte_carlo ?? response); setLoading(false)}).catch(err=>{ setError(err); setLoading(false) }) }} className="rounded-2xl border border-rose-500 bg-rose-500/10 px-4 py-2 text-sm font-semibold text-rose-200">Retry</button>
-        </div>
-      </section>
-    )
-  }
-
-  if(!mc){
-    return (
-      <section className="rounded-3xl border border-slate-700 bg-slate-900 p-6 shadow-inner shadow-black/20 mt-6">
-        <p className="text-sm uppercase tracking-[0.3em] text-amber-400">Monte Carlo simulation</p>
-        <p className="mt-3 text-sm text-slate-400">No simulation results are available for this session.</p>
-      </section>
-    )
-  }
-
-  const timeline = [
-    { label: 'Best case (P10)', date: mc.best_case_finish_date, color: 'bg-emerald-500' },
-    { label: 'Most likely (P50)', date: mc.most_likely_finish_date, color: 'bg-sky-500' },
-    { label: 'P80', date: mc.p80_finish_date, color: 'bg-amber-500' },
-    { label: 'P90', date: mc.p90_finish_date, color: 'bg-rose-500' },
-  ]
-
-  const formatDateLabel = (iso) => {
-    if(!iso) return '—'
-    try{ return new Date(iso).toLocaleDateString(undefined, { day: '2-digit', month: 'short' }) }catch(e){ return iso }
-  }
-
-  return (
-    <section className="rounded-3xl border border-slate-700 bg-slate-900 p-6 shadow-inner shadow-black/20 mt-6">
-      <div className="flex flex-col gap-2 sm:flex-row sm:items-end sm:justify-between">
-        <div>
-          <p className="text-sm uppercase tracking-[0.3em] text-amber-400">Monte Carlo simulation</p>
-          <h2 className="mt-2 text-2xl font-semibold text-white">Simulated finish-date range</h2>
-          <p className="mt-2 max-w-2xl text-sm text-slate-400">Based on {mc.simulation_count.toLocaleString()} simulated outcomes.</p>
-        </div>
-        <div className="rounded-3xl border border-slate-700 bg-slate-950/80 px-4 py-3 text-sm text-slate-300">
-          {mc.simulation_count.toLocaleString()} simulations
-        </div>
-      </div>
-
-      <div className="mt-6 space-y-4">
-        <div className="relative h-14 rounded-full bg-slate-800/80 p-3">
-          <div className="absolute inset-y-3 left-0 right-0 rounded-full bg-slate-700/60" />
-          {timeline.map((point, index)=>(
-            <div key={point.label} className="absolute top-0 grid h-full w-1/5 place-items-center" style={{ left: `${index * 24}%` }}>
-              <div className={`h-7 w-7 rounded-full ${point.color} border border-slate-900 shadow-lg`} />
-            </div>
-          ))}
-        </div>
-
-        <div className="grid grid-cols-1 gap-3 sm:grid-cols-4">
-          {timeline.map(point => (
-            <div key={point.label} className="rounded-3xl border border-slate-700 bg-slate-950/80 p-4 text-center">
-              <div className="text-sm uppercase tracking-[0.2em] text-slate-400">{point.label}</div>
-              <div className="mt-2 text-lg font-semibold text-white">{formatDateLabel(point.date)}</div>
-            </div>
-          ))}
-        </div>
-      </div>
-    </section>
-  )
-}
 
 function DelayDiagnosis({session}){
   const [loading, setLoading] = useState(true)
@@ -379,8 +244,9 @@ function DelayDiagnosis({session}){
     }
     setLoading(true)
     setError(null)
-    api.forecast(sessionId)
-      .then(f=>{ if(mounted){ setForecast(f?.forecast ?? f); setLoading(false) }})
+    // Use sessionSnapshot (already cached by HeroBanner — browser dedupes the request)
+    api.sessionSnapshot(sessionId)
+      .then(snap=>{ if(mounted){ setForecast(snap?.forecast ?? null); setLoading(false) }})
       .catch(err=>{ if(mounted){ setError(err); setLoading(false) }})
     return ()=>{ mounted = false }
   }, [sessionId])
@@ -537,15 +403,7 @@ function ForecastPage({session}){
 
   const formatDateLabel = (iso) => { if(!iso) return '—'; try{ return new Date(iso).toLocaleDateString(undefined, { day: '2-digit', month: 'short' }) }catch(e){ return iso } }
 
-  // Effort breakdown stats
-  const eb = forecast && forecast.effort_breakdown ? forecast.effort_breakdown : null
-  const effortItems = eb ? [
-    { key: 'raw', label: 'Raw remaining effort', value: eb.raw_remaining_effort_hours, color: 'bg-emerald-500', description: 'Raw remaining effort from open work.' },
-    { key: 'critical', label: 'Critical path effort (completed)', value: eb.critical_path_remaining_hours, color: 'bg-sky-500', description: 'All critical path items are complete — delay is driven by spillover and blocker impact.' },
-    { key: 'spillover', label: 'Spillover penalty (equivalent hours)', value: eb.spillover_penalty_hours, color: 'bg-amber-400', description: 'Equivalent hours from spillover impact.' },
-    { key: 'blocker', label: 'Blocker penalty (equivalent hours)', value: eb.blocker_penalty_hours, color: 'bg-rose-500', description: 'Equivalent hours from blocker impact.' },
-  ] : []
-  const adjusted = eb ? eb.forecast_adjusted_effort_hours : null
+
 
   return (
     <div className="space-y-6">
@@ -581,66 +439,23 @@ function ForecastPage({session}){
             </div>
           </div>
 
-          <div className="mt-4 grid grid-cols-2 gap-3 sm:grid-cols-4">
-            {percentiles.map(pt => (
-              <div key={pt.p} className="rounded-3xl border border-slate-700 bg-slate-950/80 p-3 text-center">
-                <div className="text-sm uppercase tracking-[0.2em] text-slate-400">P{pt.p}</div>
-                <div className="mt-2 text-lg font-semibold text-white">{formatDateLabel(pt.iso)}</div>
-              </div>
-            ))}
-          </div>
-        </div>
-      </section>
-
-      <section className="rounded-3xl border border-slate-700 bg-slate-900 p-6 shadow-inner shadow-black/20">
-        <div className="flex items-center justify-between">
-          <div>
-            <p className="text-sm uppercase tracking-[0.3em] text-amber-400">Statistics</p>
-            <h2 className="mt-2 text-2xl font-semibold text-white">Mean & median delay</h2>
-            <p className="mt-2 text-sm text-slate-400">Comparison of mean and median delay vs target.</p>
-          </div>
-          <div className="grid grid-cols-2 gap-3 sm:grid-cols-2">
-            <div className="rounded-3xl border border-slate-700 bg-slate-950/80 p-4 text-center">
-              <div className="text-sm text-slate-400">Mean delay</div>
-              <div className="mt-1 text-2xl font-semibold text-white">{stats?.mean_delay_days !== undefined ? `${stats.mean_delay_days.toFixed(1)}d` : '—'}</div>
-            </div>
-            <div className="rounded-3xl border border-slate-700 bg-slate-950/80 p-4 text-center">
-              <div className="text-sm text-slate-400">Median delay</div>
-              <div className="mt-1 text-2xl font-semibold text-white">{stats?.median_delay_days !== undefined ? `${stats.median_delay_days.toFixed(1)}d` : '—'}</div>
-            </div>
-          </div>
-        </div>
-      </section>
-
-      <section className="rounded-3xl border border-slate-700 bg-slate-900 p-6 shadow-inner shadow-black/20">
-        <div className="flex items-center justify-between">
-          <div>
-            <p className="text-sm uppercase tracking-[0.3em] text-amber-400">Effort breakdown</p>
-            <h2 className="mt-2 text-2xl font-semibold text-white">Effort breakdown</h2>
-            <p className="mt-2 text-sm text-slate-400">Individual effort components and the forecast-adjusted effort value.</p>
-          </div>
-          <div className="text-sm text-slate-400">
-            Forecast-adjusted effort:
-            <div className="mt-1 font-semibold text-white">{adjusted ? `${Math.round(adjusted)}h` : '—'}</div>
-            <div className="mt-1 text-xs text-slate-500">Raw remaining + critical path uplift only</div>
-          </div>
-        </div>
-
-        <div className="mt-6 grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
-          {effortItems.map(item => (
-            <div key={item.key} className="rounded-3xl border border-slate-700 bg-slate-950/80 p-4">
-              <div className="flex items-center justify-between gap-3">
-                <div>
-                  <div className="text-sm text-slate-400">{item.label}</div>
-                  <div className="mt-2 text-3xl font-semibold text-white">{item.value !== undefined ? `${Math.round(item.value)}h` : '—'}</div>
+          <div className="mt-4 grid grid-cols-3 gap-3">
+            {[50, 80, 95].map(p => {
+              const pt = percentiles.find(x => x.p === p)
+              return pt ? (
+                <div key={p} className="rounded-3xl border border-slate-700 bg-slate-950/80 p-3 text-center">
+                  <div className="text-xs uppercase tracking-[0.2em] text-slate-400">P{p} {p === 50 ? '· Most likely' : p === 80 ? '· Safe target' : '· Worst case'}</div>
+                  <div className="mt-2 text-lg font-semibold text-white">{formatDateLabel(pt.iso)}</div>
                 </div>
-                <div className={`h-4 w-4 rounded-full ${item.color}`} />
-              </div>
-              <div className="mt-3 text-xs leading-5 text-slate-500">{item.description}</div>
-            </div>
-          ))}
+              ) : null
+            })}
+          </div>
         </div>
       </section>
+
+
+
+
     </div>
   )
 }
@@ -956,7 +771,7 @@ function ActionsPage({ session, onSimulated }) {
           <div>
             <p className="text-sm uppercase tracking-[0.3em] text-amber-400">Actions</p>
             <h2 className="mt-2 text-2xl font-semibold text-white">Recommendations</h2>
-            <p className="mt-2 text-sm text-slate-400">Select recommendations to simulate their effect on delivery.</p>
+
           </div>
           <div className="flex items-center gap-3">
             <button onClick={runScenario} disabled={selected.length===0 || scenarioLoading} className="rounded-2xl border border-emerald-500 bg-emerald-500/10 px-4 py-2 text-sm font-semibold text-emerald-200 disabled:opacity-50">{scenarioLoading ? 'Simulating selection…' : `Simulate selection (${selected.length})`}</button>
@@ -983,6 +798,34 @@ function ActionsPage({ session, onSimulated }) {
                   )}
                   <h3 className="mt-1 text-lg font-semibold text-white">{rec.action}</h3>
                   <div className="mt-2 text-sm text-slate-300">{rec.impact_summary}</div>
+
+                  {/* Probability gain bar */}
+                  {rec.baseline_probability !== undefined && rec.after_probability !== undefined && (
+                    <div className="mt-3 space-y-1">
+                      <div className="flex items-center justify-between text-xs text-slate-400">
+                        <span>On-time probability</span>
+                        <span className="font-semibold text-white">
+                          {Math.round(rec.baseline_probability * 100)}%
+                          <span className="text-emerald-400 ml-1">→ {Math.round(rec.after_probability * 100)}%</span>
+                          {rec.expected_probability_gain > 0 && (
+                            <span className="ml-2 text-emerald-300">(+{Math.round(rec.expected_probability_gain * 100)}pp)</span>
+                          )}
+                        </span>
+                      </div>
+                      <div className="relative h-2 rounded-full bg-slate-800 overflow-hidden">
+                        <div className="absolute h-2 rounded-full bg-slate-600" style={{ width: `${Math.round(rec.baseline_probability * 100)}%` }} />
+                        <div className="absolute h-2 rounded-full bg-emerald-500" style={{ width: `${Math.round(rec.after_probability * 100)}%` }} />
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Counterfactual */}
+                  {rec.counterfactual_statement && (
+                    <div className="mt-2 rounded-xl border border-slate-700 bg-slate-900/60 px-3 py-2 text-xs text-slate-400 italic">
+                      {rec.counterfactual_statement}
+                    </div>
+                  )}
+
                   <div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-4 text-sm text-slate-400">
                     <div>Effort: <span className="text-white font-semibold">{rec.implementation_effort}</span></div>
                     <div>Confidence: <span className="text-white font-semibold">{rec.confidence}</span></div>
@@ -1253,19 +1096,11 @@ function RiskPage({session}){
             <div className={`mt-4 inline-flex items-center rounded-full px-3 py-1 text-sm font-semibold ${getRiskColor(risk.overall_risk_score).textBg}`}>
               {risk.overall_risk_level}
             </div>
-            <p className="mt-4 max-w-2xl text-sm text-slate-400">Overall risk is computed from schedule, dependency, resource, and scope exposure. Use the top drivers below to identify the highest-impact fixes.</p>
+
           </div>
           <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
-            <div className="rounded-3xl border border-slate-700 bg-slate-950/80 p-5 text-sm text-slate-300">
-              <div className="uppercase tracking-[0.2em] text-slate-500">Score scale</div>
-              <div className="mt-3 text-3xl font-semibold text-white">0–100</div>
-              <div className="mt-2 text-sm text-slate-400">Higher is more risky.</div>
-            </div>
-            <div className="rounded-3xl border border-slate-700 bg-slate-950/80 p-5 text-sm text-slate-300">
-              <div className="uppercase tracking-[0.2em] text-slate-500">Risk drivers</div>
-              <div className="mt-3 text-3xl font-semibold text-white">{risk.top_risk_drivers?.length || 0}</div>
-              <div className="mt-2 text-sm text-slate-400">Top contributors to project risk.</div>
-            </div>
+
+
           </div>
         </div>
       </section>
@@ -1274,9 +1109,9 @@ function RiskPage({session}){
         <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
           <div>
             <p className="text-sm uppercase tracking-[0.3em] text-amber-400">Risk breakdown</p>
-            <h2 className="mt-2 text-2xl font-semibold text-white">Sub-score explanations</h2>
+            <h2 className="mt-2 text-2xl font-semibold text-white">Risk by category</h2>
           </div>
-          <div className="text-sm text-slate-400">Expand each category to inspect the top reasons.</div>
+
         </div>
 
         <div className="mt-6 grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
@@ -1488,11 +1323,10 @@ function CriticalPathPage({session}){
           <div>
             <p className="text-sm uppercase tracking-[0.3em] text-amber-400">Critical path</p>
             <h2 className="mt-2 text-3xl font-extrabold text-white">Project critical path</h2>
-            <p className="mt-3 text-sm text-slate-400">This analysis shows the path of work items driving completion and whether the path is growing versus baseline.</p>
+
           </div>
           <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
             <MetricCard label="Path duration" value={`${deps.critical_path_duration_days?.toFixed(1) ?? '—'} days`} />
-            <MetricCard label="Path hours" value={`${deps.critical_path_duration_hours?.toFixed(1) ?? '—'}h`} />
             <MetricCard label="Items on path" value={deps.critical_path_item_count ?? chain.length} />
             <MetricCard label="Growth vs baseline" value={`${deps.critical_path_growth_percent?.toFixed(1) ?? '—'}%`} />
           </div>
@@ -1505,7 +1339,7 @@ function CriticalPathPage({session}){
             <p className="text-sm uppercase tracking-[0.3em] text-amber-400">Dependency chain</p>
             <h2 className="mt-2 text-2xl font-semibold text-white">Ordered critical path</h2>
           </div>
-          <div className="text-sm text-slate-400">Works with item IDs only, as returned by the backend.</div>
+
         </div>
         <div className="mt-6 overflow-x-auto pb-2">
           <div className="inline-flex items-center gap-3 whitespace-nowrap">
@@ -1516,13 +1350,16 @@ function CriticalPathPage({session}){
         </div>
       </section>
 
-      <section className="rounded-3xl border border-slate-700 bg-slate-900 p-6 shadow-inner shadow-black/20">
-        <div className="grid gap-4 lg:grid-cols-3">
-          <RiskGroupList title="High risk items" items={highRisk} color="rose" />
-          <RiskGroupList title="Medium risk items" items={mediumRisk} color="amber" />
-          <RiskGroupList title="Low risk items" items={lowRisk} color="emerald" />
-        </div>
-      </section>
+      {highRisk.length > 0 && (
+        <section className="rounded-3xl border border-rose-500/40 bg-rose-950/20 p-6">
+          <p className="text-xs uppercase tracking-[0.2em] text-rose-400">High risk items on critical path</p>
+          <div className="mt-3 flex flex-wrap gap-2">
+            {highRisk.map((id, i) => (
+              <span key={i} className="rounded-full border border-rose-500/30 bg-rose-500/10 px-3 py-1 text-sm font-semibold text-rose-200">{id}</span>
+            ))}
+          </div>
+        </section>
+      )}
     </div>
   )
 }
@@ -1568,9 +1405,7 @@ function SectionPlaceholder({title, description}){
 
 export function Dashboard({session, onReset}){
   const [active, setActive] = useState('overview')
-  const [metrics, setMetrics] = useState(null)
-  const [metricsLoading, setMetricsLoading] = useState(true)
-  const [metricsError, setMetricsError] = useState(null)
+
   const sessionId = session?.project_summary?.session_id || ''
 
   useEffect(()=>{
@@ -1582,7 +1417,7 @@ export function Dashboard({session, onReset}){
     }
     setMetricsLoading(true)
     setMetricsError(null)
-    api.metrics(sessionId).then(m=>{ if(mounted){ setMetrics(m); setMetricsLoading(false) }}).catch(err=>{ if(mounted){ setMetricsError(err); setMetricsLoading(false) }})
+
     return ()=>{ mounted = false }
   }, [sessionId])
 
@@ -1601,9 +1436,17 @@ export function Dashboard({session, onReset}){
           </button>
         </div>
 
-        <div className="mt-5 flex flex-wrap gap-3">
+        <div className="sticky top-0 z-20 mt-5 -mx-2 px-2 pt-2 pb-2 flex flex-wrap gap-2 bg-slate-950/95 backdrop-blur border-b border-slate-800">
           {tabs.map(tab => (
-            <button key={tab.key} onClick={() => setActive(tab.key)} className={`rounded-full px-4 py-2 text-sm font-semibold ${active===tab.key ? 'bg-emerald-500 text-slate-950' : 'bg-slate-800 text-slate-300 hover:bg-slate-700'}`}>
+            <button
+              key={tab.key}
+              onClick={() => setActive(tab.key)}
+              className={`rounded-full px-4 py-2 text-sm font-semibold transition whitespace-nowrap ${
+                active === tab.key
+                  ? 'bg-amber-500 text-slate-950 shadow-lg shadow-amber-500/30'
+                  : 'bg-slate-800 text-slate-300 hover:bg-slate-700 hover:text-white'
+              }`}
+            >
               {tab.label}
             </button>
           ))}
@@ -1611,7 +1454,7 @@ export function Dashboard({session, onReset}){
       </div>
 
       {active === 'overview' && <>
-        <OverviewPage session={session} metrics={metrics} onNavigate={setActive} />
+        <OverviewPage session={session} onNavigate={setActive} />
         <DelayDiagnosis session={session} />
       </>}
       {active === 'risk' && <RiskPage session={session} />}
@@ -1620,6 +1463,7 @@ export function Dashboard({session, onReset}){
       {active === 'recovery-plans' && <RecoveryPlansPage session={session} />}
       {active === 'actions' && <ActionsPage session={session} onSimulated={() => setActive('compare')} />}
       {active === 'compare' && <ReforecastPage session={session} />}
+      {active === 'sprint-health' && <SprintHealth session={session} />}
       {active === 'reasoning-trace' && <ReasoningTrace session={session} />}
     </div>
   )

@@ -33,34 +33,42 @@ from app.engines.risk_engine import RiskEngine
 router = APIRouter(prefix="/api/demo", tags=["Demo"])
 
 def _prewarm_session(session_id: str) -> None:
-    """Run all engines immediately so the dashboard loads with data pre-populated."""
+    """
+    Run the full EMIOS pipeline immediately so the dashboard loads with
+    data pre-populated and all routes read from a shared PipelineResult
+    rather than rebuilding engines from scratch on every request.
+    """
     try:
         project_state = store.get_project_state(session_id)
         if not project_state:
             return
 
-        metrics = MetricsEngine(project_state).calculate()
-        dag = DependencyGraphEngine(project_state).build_dag()
-        cp_result = CriticalPathEngine(project_state, dag).analyze()
-        spillover = SpilloverAnalysisEngine(project_state, metrics.average_item_effort).analyze()
-        from app.engines.forecast_engine import ForecastEngine
+        # Run the full EMIOS pipeline (includes metrics, forecast, Monte Carlo,
+        # recommendations, recovery plans, diagnosis, advisor, etc.)
+        from app.pipeline.emios_pipeline import run_emios_pipeline
+        pipeline_result = run_emios_pipeline(project_state, simulation_count=1000, seed=42)
 
-        forecast = ForecastEngine(project_state, metrics, cp_result, spillover).calculate()
-        mc = MonteCarloEngine(project_state, metrics, cp_result, spillover, seed=42).simulate()
-        impact = ImpactScoringEngine(project_state, dag).calculate()
-        risk = RiskEngine(project_state, metrics, cp_result, spillover, mc, impact).calculate()
+        # Store the full result so all routes can read from it
+        store.set_pipeline_result(session_id, pipeline_result)
 
+        # Also build and cache the ProjectAnalysis (used by legacy routes)
+        store.get_analysis(session_id)
+
+        # Capture baseline snapshot from pipeline Monte Carlo output
         session = store.get_session(session_id)
-        if session:
+        if session and pipeline_result.monte_carlo:
+            mc = pipeline_result.monte_carlo
+            forecast = pipeline_result.forecast
+            risk = pipeline_result.risk_result
             session.baseline_snapshot = {
                 "on_time_probability": round(mc.on_time_probability * 100, 1),
-                "expected_delay_days": round(forecast.expected_delay_days, 1),
-                "overall_risk_score": round(risk.overall_risk_score, 1),
-                "p50_date": mc.most_likely_finish_date.isoformat() if mc.most_likely_finish_date else None,
-                "p80_date": mc.p80_finish_date.isoformat() if mc.p80_finish_date else None,
-                "p95_date": mc.p95_finish_date.isoformat() if mc.p95_finish_date else None,
-                "target_end_date": mc.target_end_date.isoformat() if mc.target_end_date else None,
-                "on_time_risk_level": mc.on_time_risk_level.value if hasattr(mc.on_time_risk_level, "value") else str(mc.on_time_risk_level),
+                "expected_delay_days": round(getattr(forecast, "expected_delay_days", 0), 1),
+                "overall_risk_score": round(getattr(risk, "overall_risk_score", 0), 1),
+                "p50_date": mc.most_likely_finish_date.isoformat() if getattr(mc, "most_likely_finish_date", None) else None,
+                "p80_date": mc.p80_finish_date.isoformat() if getattr(mc, "p80_finish_date", None) else None,
+                "p95_date": mc.p95_finish_date.isoformat() if getattr(mc, "p95_finish_date", None) else None,
+                "target_end_date": mc.target_end_date.isoformat() if getattr(mc, "target_end_date", None) else None,
+                "on_time_risk_level": mc.on_time_risk_level.value if hasattr(mc, "on_time_risk_level") and hasattr(mc.on_time_risk_level, "value") else str(getattr(mc, "on_time_risk_level", "UNKNOWN")),
             }
     except Exception:
         pass  # Never crash demo load due to pre-warm failure

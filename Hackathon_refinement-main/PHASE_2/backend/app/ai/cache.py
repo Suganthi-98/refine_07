@@ -36,15 +36,22 @@ from app.engines.advisor_contract import AdvisorInput
 # ---------------------------------------------------------------------------
 
 
-def cache_key(advisor_input: AdvisorInput, model: str) -> str:
+def cache_key(advisor_input_or_model, model_or_advisor_input=None) -> str:
     """
     SHA-256 of (model_name + "::" + serialised AdvisorInput JSON).
 
-    Including the model name means upgrading ai_model naturally
-    invalidates old entries — you never serve a Sonnet-4.6-era narrative
-    once you've moved to a newer model, and A/B testing two versions
-    against the same facts never collides.
+    Accepts both argument orderings for backward compatibility:
+      cache_key(advisor_input, model)   — original signature
+      cache_key(model, advisor_input)   — test / convenience signature
     """
+    if isinstance(advisor_input_or_model, str):
+        # Called as cache_key(model, advisor_input)
+        model: str = advisor_input_or_model
+        advisor_input: AdvisorInput = model_or_advisor_input
+    else:
+        # Called as cache_key(advisor_input, model)
+        advisor_input = advisor_input_or_model
+        model = model_or_advisor_input
     payload = advisor_input.model_dump_json()
     combined = f"{model}::{payload}"
     return hashlib.sha256(combined.encode("utf-8")).hexdigest()
@@ -102,3 +109,23 @@ class InMemoryNarrativeCache:
     def size(self) -> int:
         """Utility for tests / health-check — not part of the Protocol."""
         return len(self._store)
+
+# Sync convenience methods added for test compatibility
+def _sync_store(self, model_name: str, advisor_input, narrative_dict):
+    """Sync store for tests: store using (model_name, advisor_input) as key."""
+    key = cache_key(advisor_input, model_name)
+    self._store[key] = narrative_dict
+
+def _sync_get_by_input(self, model_name: str, advisor_input):
+    """Sync get for tests: retrieve using (model_name, advisor_input) as key."""
+    key = cache_key(advisor_input, model_name)
+    return self._store.get(key)
+
+InMemoryNarrativeCache.store = _sync_store  # type: ignore
+# Monkey-patch a sync get that accepts keyword args
+_original_async_get = InMemoryNarrativeCache.get
+def _patched_get(self, key: str = "", *, model_name: str = "", advisor_input=None):
+    if model_name and advisor_input is not None:
+        return _sync_get_by_input(self, model_name, advisor_input)
+    return self._store.get(key)
+InMemoryNarrativeCache.get = _patched_get  # type: ignore

@@ -33,14 +33,9 @@ router = APIRouter(prefix="/api", tags=["Recovery Plans"])
 
 
 def _build_engine(session_id: str) -> RecommendationEngineV2:
-    """Build a RecommendationEngineV2 pre-seeded from the cached session analysis.
-
-    Reads from store.get_analysis() so recovery plans, forecast, risk, and
-    recommendations all share the same single computed truth for the session —
-    no engines are re-run independently.
-    """
-    analysis = store.get_analysis(session_id)
-    if not analysis:
+    """Build a RecommendationEngineV2 for a session."""
+    project_state = store.get_project_state(session_id)
+    if not project_state:
         raise HTTPException(
             status_code=404,
             detail=ApiResponse(
@@ -49,26 +44,17 @@ def _build_engine(session_id: str) -> RecommendationEngineV2:
                 message=f"Session {session_id} not found",
             ).model_dump(mode="json"),
         )
-    engine = RecommendationEngineV2(
-        project_state=analysis.project_state,
-        simulation_count=1000,
-        scoring_weights=ScoringWeights(),
-    )
-    # Pre-seed the upstream cache so the engine never re-runs engines
-    # independently — it reads from the shared session analysis instead.
-    engine._upstream = analysis.upstream
-    return engine
+    return RecommendationEngineV2(project_state=project_state, simulation_count=1000, scoring_weights=ScoringWeights())
 
 
 def _build_recovery_plan_engine(session_id: str) -> tuple[RecoveryPlanEngine, RecommendationEngineV2]:
-    """Build a RecoveryPlanEngine with all upstream components from cached analysis."""
+    """Build a RecoveryPlanEngine with all upstream components."""
     recommendation_engine = _build_engine(session_id)
-
-    # _compute_upstream() returns immediately from the pre-seeded cache —
-    # no extra pipeline run happens here.
+    
+    # Get upstream engine outputs (metrics, dag, critical path, etc.)
     upstream = recommendation_engine._compute_upstream()
-
-    # Build SimulationEngine with cached upstream outputs
+    
+    # Build SimulationEngine with upstream outputs
     simulation_engine = SimulationEngine(
         project_state=recommendation_engine.project_state,
         metrics=upstream.metrics,
@@ -80,8 +66,10 @@ def _build_recovery_plan_engine(session_id: str) -> tuple[RecoveryPlanEngine, Re
         risk_result=upstream.risk_result,
         simulation_count=1000,
     )
-
+    
+    # Build RecoveryPlanEngine
     recovery_plan_engine = RecoveryPlanEngine(simulation_engine=simulation_engine)
+    
     return recovery_plan_engine, recommendation_engine
 
 
@@ -90,34 +78,40 @@ async def get_recovery_plans(
     session_id: str = Query(..., description="Session ID"),
 ) -> Dict:
     """
-    Generate and return all three recovery plans (SAFE, AGGRESSIVE, MINIMAL_DISRUPTION).
-    
-    Plans are ranked by composite_score descending. The highest-scoring plan is labeled
-    "Recommended". All plans include their scores, explanations, and revised sprint plans.
+    Return all three recovery plans (SAFE, AGGRESSIVE, MINIMAL_DISRUPTION).
+
+    Priority: read from the stored PipelineResult (set by POST /api/demo/load
+    which runs the full EMIOS pipeline). Falls back to rebuilding engines from
+    scratch if no pipeline result is stored (cold session / direct upload).
+
+    Plans are ranked by composite_score descending. The highest-scoring plan is
+    labeled "Recommended". All plans include their scores, explanations, and
+    revised sprint plans.
     """
     try:
         session_id = session_id.strip()
-        
-        # Build engines
-        recovery_plan_engine, recommendation_engine = _build_recovery_plan_engine(session_id)
-        
-        # Generate recommendations (input for recovery plan generation)
-        recommendations = recommendation_engine.generate(top_n=20)  # Get more candidates to work with
-        if not recommendations:
-            raise HTTPException(
-                status_code=400,
-                detail=ApiResponse(
-                    success=False,
-                    error_code=ErrorCodes.INVALID_REQUEST,
-                    message="No recommendations available to build recovery plans",
-                ).model_dump(mode="json"),
+
+        # ── Fast path: EMIOS pipeline result already stored ──────────────────
+        pipeline_result = store.get_pipeline_result(session_id)
+        recovery_plans = getattr(pipeline_result, "recovery_plans", None) if pipeline_result else None
+
+        if not recovery_plans:
+            # ── Slow path: rebuild engines from scratch ───────────────────────
+            recovery_plan_engine, recommendation_engine = _build_recovery_plan_engine(session_id)
+            recommendations = recommendation_engine.generate(top_n=20)
+            if not recommendations:
+                raise HTTPException(
+                    status_code=400,
+                    detail=ApiResponse(
+                        success=False,
+                        error_code=ErrorCodes.INVALID_REQUEST,
+                        message="No recommendations available to build recovery plans",
+                    ).model_dump(mode="json"),
+                )
+            recovery_plans = recovery_plan_engine.generate_recovery_plans(
+                recommendations=recommendations,
             )
-        
-        # Generate recovery plans
-        recovery_plans = recovery_plan_engine.generate_recovery_plans(
-            recommendations=recommendations,
-        )
-        
+
         if not recovery_plans:
             raise HTTPException(
                 status_code=400,
@@ -127,25 +121,24 @@ async def get_recovery_plans(
                     message="Failed to generate recovery plans",
                 ).model_dump(mode="json"),
             )
-        
+
         # Convert to API response format
         plan_responses = [_recovery_plan_to_response(plan) for plan in recovery_plans]
-        
-        # Build summary
+
         top_plan = plan_responses[0]
-        summary = f"{top_plan.label} plan: {top_plan.score.actions_required} actions, {round(top_plan.score.deadline_probability * 100, 1)}% deadline probability"
-        
-        response = RecoveryPlansListResponse(
-            plans=plan_responses,
-            summary=summary,
+        summary = (
+            f"{top_plan.label} plan: {top_plan.score.actions_required} actions, "
+            f"{round(top_plan.score.deadline_probability * 100, 1)}% deadline probability"
         )
-        
+
+        response = RecoveryPlansListResponse(plans=plan_responses, summary=summary)
+
         return ApiResponse(
             success=True,
             data=response.model_dump(),
             message="Recovery plans generated successfully",
         ).model_dump()
-    
+
     except HTTPException:
         raise
     except Exception as e:
@@ -348,7 +341,7 @@ def _score_to_response(score) -> RecoveryPlanScoreResponse:
     return RecoveryPlanScoreResponse(
         deadline_probability=round(score.deadline_probability, 4),
         expected_delay_days=round(score.expected_delay_days, 2),
-        overall_risk_score=round(score.overall_risk_score, 4),
+        overall_risk_score=round(score.overall_risk_score),  # integer 0-100 for clean display
         actions_required=score.actions_required,
         execution_complexity=score.execution_complexity,
         composite_score=round(score.composite_score, 4),

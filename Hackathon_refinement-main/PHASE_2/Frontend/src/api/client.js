@@ -7,7 +7,6 @@ async function unwrapResponse(resp){
   try{ json = text ? JSON.parse(text) : null }catch(e){ }
 
   if(!resp.ok){
-    // FastAPI HTTPException uses {detail: {...}}
     const detail = json && json.detail ? json.detail : null
     const message = detail && detail.message ? detail.message : (json && json.message) ? json.message : resp.statusText
     const err = new Error(message)
@@ -16,7 +15,6 @@ async function unwrapResponse(resp){
     throw err
   }
 
-  // success envelope: {success: true, data: {...}, message}
   if(json && json.success===false){
     const msg = json.message || (json.data && json.data.message) || 'Request failed'
     const err = new Error(msg)
@@ -27,151 +25,141 @@ async function unwrapResponse(resp){
   return json && json.data !== undefined ? json.data : json
 }
 
+function sessionUrl(path, sessionId){
+  let url = `${API_ROOT}${path}`
+  if(sessionId) url += `?session_id=${encodeURIComponent(sessionId)}`
+  return url
+}
+
 export const api = {
-  health: async ()=>{
+  health: async () => {
     const resp = await fetch(`${API_ROOT}/health`)
     return unwrapResponse(resp)
   },
-  upload: async (formData)=>{
-    const resp = await fetch(`${API_ROOT}/upload`,{method:'POST', body: formData})
+  upload: async (formData) => {
+    const resp = await fetch(`${API_ROOT}/upload`, { method: 'POST', body: formData })
     return unwrapResponse(resp)
   },
-  demoLoad: async ()=>{
-    const resp = await fetch(`${API_ROOT}/demo/load`,{method:'POST'})
+  demoLoad: async () => {
+    const resp = await fetch(`${API_ROOT}/demo/load`, { method: 'POST' })
     return unwrapResponse(resp)
   },
-  demoReset: async ()=>{
-    const resp = await fetch(`${API_ROOT}/demo/reset`,{method:'POST'})
+  demoReset: async () => {
+    const resp = await fetch(`${API_ROOT}/demo/reset`, { method: 'POST' })
     return unwrapResponse(resp)
   },
-  metrics: async (sessionId='')=>{
-    let url = `${API_ROOT}/metrics`
-    if(sessionId){
-      url += `?session_id=${encodeURIComponent(sessionId)}`
-    }
-    const resp = await fetch(url)
+
+  // ── Single-call overview snapshot (replaces separate forecast + MC + risk + trace calls) ──
+  sessionSnapshot: async (sessionId = '') => {
+    const resp = await fetch(sessionUrl('/session-snapshot', sessionId))
     return unwrapResponse(resp)
   },
-  dependencies: async (sessionId='')=>{
-    let url = `${API_ROOT}/dependencies`
-    if(sessionId){
-      url += `?session_id=${encodeURIComponent(sessionId)}`
-    }
-    const resp = await fetch(url)
+
+  metrics: async (sessionId = '') => {
+    const resp = await fetch(sessionUrl('/metrics', sessionId))
     return unwrapResponse(resp)
   },
-  spillover: async ()=>{
+  dependencies: async (sessionId = '') => {
+    const resp = await fetch(sessionUrl('/dependencies', sessionId))
+    return unwrapResponse(resp)
+  },
+  spillover: async () => {
     const resp = await fetch(`${API_ROOT}/spillover`)
     return unwrapResponse(resp)
   },
-  forecast: async (sessionId='')=>{
-    let url = `${API_ROOT}/forecast`
-    if(sessionId){
-      url += `?session_id=${encodeURIComponent(sessionId)}`
-    }
-    const resp = await fetch(url)
+  forecast: async (sessionId = '') => {
+    const resp = await fetch(sessionUrl('/forecast', sessionId))
     return unwrapResponse(resp)
   },
-  monteCarlo: async (sessionId='')=>{
-    let url = `${API_ROOT}/monte-carlo`
-    if(sessionId){
-      url += `?session_id=${encodeURIComponent(sessionId)}`
-    }
-    const resp = await fetch(url)
+  monteCarlo: async (sessionId = '') => {
+    const resp = await fetch(sessionUrl('/monte-carlo', sessionId))
     return unwrapResponse(resp)
   },
-  risk: async (sessionId='')=>{
-    let url = `${API_ROOT}/risk`
-    if(sessionId){
-      url += `?session_id=${encodeURIComponent(sessionId)}`
-    }
-    const resp = await fetch(url)
+  risk: async (sessionId = '') => {
+    const resp = await fetch(sessionUrl('/risk', sessionId))
     return unwrapResponse(resp)
   },
-  recommendations: async (sessionId='')=>{
-    let url = `${API_ROOT}/recommendations`
-    if(sessionId){
-      url += `?session_id=${encodeURIComponent(sessionId)}`
-    }
-    const resp = await fetch(url)
+  recommendations: async (sessionId = '') => {
+    const resp = await fetch(sessionUrl('/recommendations', sessionId))
     return unwrapResponse(resp)
   },
-  simulateRecommendation: async (body, sessionId='')=>{
-    let url = `${API_ROOT}/recommendations/simulate`
-    if(sessionId){
-      url += `?session_id=${encodeURIComponent(sessionId)}`
-    }
-    const resp = await fetch(url,{method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)})
+  simulateRecommendation: async (body, sessionId = '') => {
+    let url = sessionUrl('/recommendations/simulate', sessionId)
+    const resp = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    })
     return unwrapResponse(resp)
   },
-  simulateScenario: async (body, sessionId='')=>{
-    let url = `${API_ROOT}/recommendations/scenario`
-    if(sessionId){
-      url += `?session_id=${encodeURIComponent(sessionId)}`
-    }
-    const resp = await fetch(url,{method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)})
+  simulateScenario: async (body, sessionId = '') => {
+    let url = sessionUrl('/recommendations/scenario', sessionId)
+    const resp = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    })
     return unwrapResponse(resp)
   },
-  scopeChange: async (body)=>{
-    const resp = await fetch(`${API_ROOT}/scope-change`,{method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)})
+  scopeChange: async (body) => {
+    const resp = await fetch(`${API_ROOT}/scope-change`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    })
     return unwrapResponse(resp)
   },
-  export: async ()=>{
+  export: async () => {
     const resp = await fetch(`${API_ROOT}/export`)
-    if(!resp.ok){
-      const text = await resp.text();
-      let json=null; try{json=JSON.parse(text)}catch(e){}
+    if (!resp.ok) {
+      const text = await resp.text()
+      let json = null; try { json = JSON.parse(text) } catch (e) {}
       const detail = json && json.detail ? json.detail : null
       const message = detail && detail.message ? detail.message : resp.statusText
-      const err = new Error(message)
-      throw err
+      throw new Error(message)
     }
-    const blob = await resp.blob()
-    return blob
-  },
-  // Generic GET method
-  get: async (path, params = {})=>{
-    let url = `${API_ROOT}${path.startsWith('/') ? path : '/' + path}`
-    const queryString = new URLSearchParams(params).toString()
-    if(queryString){
-      url += `${url.includes('?') ? '&' : '?'}${queryString}`
-    }
-    const resp = await fetch(url)
-    return unwrapResponse(resp)
-  },
-  // Generic POST method
-  post: async (path, body = null, params = {})=>{
-    let url = `${API_ROOT}${path.startsWith('/') ? path : '/' + path}`
-    const queryString = new URLSearchParams(params).toString()
-    if(queryString){
-      url += `${url.includes('?') ? '&' : '?'}${queryString}`
-    }
-    const options = {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-    }
-    if(body){
-      options.body = JSON.stringify(body)
-    }
-    const resp = await fetch(url, options)
-    return unwrapResponse(resp)
+    return resp.blob()
   },
   reforecastComparison: async (sessionId = '') => {
-    let url = `${API_ROOT}/reforecast-comparison`
-    if (sessionId) url += `?session_id=${encodeURIComponent(sessionId)}`
-    const resp = await fetch(url)
+    const resp = await fetch(sessionUrl('/reforecast-comparison', sessionId))
     return unwrapResponse(resp)
   },
   narrative: async (sessionId = '') => {
-    let url = `${API_ROOT}/narrative`
-    if (sessionId) url += `?session_id=${encodeURIComponent(sessionId)}`
-    const resp = await fetch(url)
+    const resp = await fetch(sessionUrl('/narrative', sessionId))
     return unwrapResponse(resp)
   },
   reasoningTrace: async (sessionId = '') => {
-    let url = `${API_ROOT}/reasoning-trace`
-    if (sessionId) url += `?session_id=${encodeURIComponent(sessionId)}`
+    const resp = await fetch(sessionUrl('/reasoning-trace', sessionId))
+    return unwrapResponse(resp)
+  },
+  sprintHealth: async (sessionId = '') => {
+    const resp = await fetch(sessionUrl('/sprint-health', sessionId))
+    return unwrapResponse(resp)
+  },
+  learningOutcome: async (body) => {
+    const resp = await fetch(`${API_ROOT}/learning/outcome`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    })
+    return unwrapResponse(resp)
+  },
+  get: async (path, params = {}) => {
+    let url = `${API_ROOT}${path.startsWith('/') ? path : '/' + path}`
+    const qs = new URLSearchParams(params).toString()
+    if (qs) url += `${url.includes('?') ? '&' : '?'}${qs}`
     const resp = await fetch(url)
     return unwrapResponse(resp)
-  }
+  },
+  post: async (path, body = null, params = {}) => {
+    let url = `${API_ROOT}${path.startsWith('/') ? path : '/' + path}`
+    const qs = new URLSearchParams(params).toString()
+    if (qs) url += `${url.includes('?') ? '&' : '?'}${qs}`
+    const resp = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      ...(body ? { body: JSON.stringify(body) } : {}),
+    })
+    return unwrapResponse(resp)
+  },
 }

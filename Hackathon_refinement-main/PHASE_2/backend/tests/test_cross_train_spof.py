@@ -50,7 +50,7 @@ def make_spof_project_state() -> ProjectState:
             resource_id="backup_dev",
             name="Backup Dev",
             role="Engineer",
-            primary_skill="General",
+            primary_skill="Testing",
             secondary_skill=None,
             skill_level=SkillLevel.MID,
             daily_capacity_hrs=8.0,

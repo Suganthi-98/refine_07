@@ -67,10 +67,34 @@ class PriorityEngine:
         return None
 
     def _score(self, candidate: RecommendationCandidate, impact: ImpactEstimate) -> float:
-        blocker_factor = 1.0 if RecommendationAction.RESOLVE_BLOCKER == candidate.action_type else 0.0
-        schedule_factor = 1.0 if impact.estimated_delay_reduction_days > 0.0 else 0.0
-        cp_factor = 1.0 if candidate.action_type in {RecommendationAction.ADVANCE_ITEM_TO_EARLIER_SPRINT, RecommendationAction.PARALLELIZE_ITEMS} else 0.0
-        capacity_factor = 1.0 if candidate.action_type in {RecommendationAction.REASSIGN_ITEM, RecommendationAction.ADD_RESOURCE_SKILL} else 0.0
+        # C3 fix: use continuous factors instead of binary 0/1
+        # so high-severity, high-impact actions score proportionally higher.
+
+        # Blocker factor: severity-weighted (Critical=1.0, High=0.7, Medium=0.4, Low=0.2)
+        if RecommendationAction.RESOLVE_BLOCKER == candidate.action_type:
+            _sev = str(candidate.simulation_params.get("blocker_severity", "Medium")) if candidate.simulation_params else "Medium"
+            blocker_factor = {"Critical": 1.0, "CRITICAL": 1.0, "High": 0.7, "HIGH": 0.7,
+                              "Medium": 0.4, "MEDIUM": 0.4, "Low": 0.2, "LOW": 0.2}.get(_sev, 0.4)
+            # Scale up further for blockers affecting many items
+            _impacted = len(candidate.affected_item_ids or []) + len(candidate.affected_blocker_ids or [])
+            blocker_factor = min(1.0, blocker_factor * (1.0 + min(0.5, (_impacted - 1) * 0.1)))
+        else:
+            blocker_factor = 0.0
+
+        # Schedule factor: proportional to estimated delay reduction (capped at 1.0 for >= 5 days)
+        schedule_factor = min(1.0, max(0.0, impact.estimated_delay_reduction_days) / 5.0) if impact.estimated_delay_reduction_days > 0 else 0.0
+
+        # CP factor: 1.0 if directly on critical path, 0.6 for related actions
+        cp_factor = (1.0 if candidate.action_type in {RecommendationAction.ADVANCE_ITEM_TO_EARLIER_SPRINT,
+                                                        RecommendationAction.PARALLELIZE_ITEMS}
+                     else 0.6 if candidate.action_type == RecommendationAction.REMOVE_DEPENDENCY_BOTTLENECK
+                     else 0.0)
+
+        # Capacity factor: proportional — skill mismatch fix scores higher than generic reassign
+        capacity_factor = (0.9 if candidate.action_type == RecommendationAction.ADD_RESOURCE_SKILL
+                          else 0.6 if candidate.action_type == RecommendationAction.REASSIGN_ITEM
+                          else 0.0)
+
         risk_factor = min(1.0, impact.estimated_risk_reduction)
 
         hours_factor = min(1.0, impact.estimated_hours_recovered / max(1.0, self.upstream.forecast.remaining_effort_hours))
