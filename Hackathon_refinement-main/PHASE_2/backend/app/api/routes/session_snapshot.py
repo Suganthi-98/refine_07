@@ -121,10 +121,19 @@ def get_session_snapshot(session_id: str = Query(...)):
 
     emios_strip: Dict = {}
     if diagnosis:
-        emios_strip["root_cause"] = (
+        raw_root_cause = (
             _safe_val(diagnosis, "actionable_root_cause")
             or _safe_val(diagnosis, "root_cause")
         )
+        # diagnosis.root_cause is a 2-sentence narrative, e.g.
+        # "Resource over-allocation (...) is the root cause. Rebalance load or add capacity."
+        # The 2nd sentence is an action recommendation that can differ from (and visually
+        # collide with) the separate `chosen_action` recommendation rendered below, so we
+        # only surface the causal statement here and let `chosen_action` own "what to do".
+        if raw_root_cause and ". " in raw_root_cause:
+            emios_strip["root_cause"] = raw_root_cause.split(". ", 1)[0] + "."
+        else:
+            emios_strip["root_cause"] = raw_root_cause
         conf = _safe_val(diagnosis, "confidence")
         emios_strip["confidence_pct"] = round(conf * 100) if conf is not None else None
 
@@ -138,7 +147,11 @@ def get_session_snapshot(session_id: str = Query(...)):
         emios_strip["recovery_state"] = _safe_val(rsm, "current_state")
 
     if advisor:
-        emios_strip["executive_summary"] = _safe_val(advisor, "executive_summary")
+        # executive_summary restates root_cause + action (already shown above), so it's
+        # dropped from the Overview strip to avoid a 3rd repetition. reasoning_explanation
+        # ("what the engine ruled out") is genuinely new content, not shown elsewhere on
+        # Overview, so that's what we surface instead.
+        emios_strip["reasoning_explanation"] = _safe_val(advisor, "reasoning_explanation")
 
     # ── Baseline snapshot (stored on session at prewarm time) ─────────────────
     baseline = getattr(session, "baseline_snapshot", None) or {}

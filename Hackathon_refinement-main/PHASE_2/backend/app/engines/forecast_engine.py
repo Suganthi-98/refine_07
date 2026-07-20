@@ -262,16 +262,15 @@ class ForecastEngine:
             forecast_assumptions=assumptions,
             forecast_explanation=explanation,
             forecast_vs_montecarlo_note=(
-                "The deterministic forecast applies worst-credible-case assumptions: "
-                "full blocker velocity reduction and a capped velocity penalty from "
-                "predicted spillover (spillover reduces effective throughput rather "
-                "than adding a separate block of schedule time). "
-                "Monte Carlo samples the full uncertainty range: spillover impact "
-                "between 0-100% of predicted and blocker impact between 0% and the "
-                "maximum estimated value. "
-                "The on-time probability reflects how often optimistic scenarios occur. "
-                "The delay figure reflects the pessimistic single-point estimate. "
-                "Both are correct — they answer different questions."
+                "You'll see two different numbers on this dashboard: an on-time probability "
+                "and a delay estimate in days. They can look like they disagree, but they're "
+                "answering two different questions. The delay estimate assumes a tougher, "
+                "pessimistic scenario — that open blockers and predicted spillover hit at full "
+                "strength. The on-time probability instead looks across a wide range of "
+                "possible outcomes, including better-case ones, and reports how often the "
+                "project finishes on time across that range. So it's normal for the delay "
+                "figure to look worse than the probability suggests — one is a cautious "
+                "worst-case estimate, the other is an overall likelihood."
             ),
         )
 

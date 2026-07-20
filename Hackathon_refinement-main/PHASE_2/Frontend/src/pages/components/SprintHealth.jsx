@@ -249,11 +249,11 @@ function PersonDetail({ person, spilloverItems, overbillingItems }) {
         </div>
 
         {/* Root cause breakdown */}
-        {Object.keys(person.root_cause_breakdown).length > 0 && (
+        {Object.keys(person.root_cause_breakdown ?? {}).length > 0 && (
           <div className="mt-4">
             <div className="text-xs uppercase tracking-[0.12em] text-slate-500 mb-2">Issues breakdown</div>
             <div className="flex flex-wrap gap-2">
-              {Object.entries(person.root_cause_breakdown).map(([rc, cnt]) => {
+              {Object.entries(person.root_cause_breakdown ?? {}).map(([rc, cnt]) => {
                 const m = RC_META[rc] || { label: rc, color: 'slate', icon: '•' }
                 return <Badge key={rc} color={m.color} size="xs">{m.icon} {m.label} ({cnt})</Badge>
               })}

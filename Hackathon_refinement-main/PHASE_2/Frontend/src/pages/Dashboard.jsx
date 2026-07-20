@@ -163,7 +163,7 @@ function HeroBanner({ session, onNavigate }) {
       </div>
 
       {/* EMIOS Diagnosis Strip — data from sessionSnapshot.emios_strip */}
-      {snap && (strip.root_cause || strip.chosen_action || strip.recovery_state || strip.executive_summary) && (
+      {snap && (strip.root_cause || strip.chosen_action || strip.recovery_state || strip.reasoning_explanation) && (
         <div className="mt-6 border-t border-slate-800 pt-5 space-y-4">
           {strip.root_cause && (
             <div className="flex flex-wrap items-start gap-3">
@@ -202,10 +202,10 @@ function HeroBanner({ session, onNavigate }) {
               </span>
             </div>
           )}
-          {strip.executive_summary && (
+          {strip.reasoning_explanation && (
             <div className="rounded-2xl border border-amber-500/20 bg-amber-500/5 px-4 py-3">
-              <span className="text-xs uppercase tracking-[0.15em] text-amber-400">AI Advisor</span>
-              <p className="mt-1 text-sm text-amber-100 leading-6">{strip.executive_summary}</p>
+              <span className="text-xs uppercase tracking-[0.15em] text-amber-400">Why this diagnosis</span>
+              <p className="mt-1 text-sm text-amber-100 leading-6">{strip.reasoning_explanation}</p>
             </div>
           )}
         </div>
@@ -235,7 +235,17 @@ function DelayDiagnosis({session}){
 
   const sessionId = session?.project_summary?.session_id || ''
 
-  
+  const fetchData = () => {
+    if (!sessionId) { setError(new Error('Missing session id')); setLoading(false); return }
+    setLoading(true)
+    setError(null)
+    api.forecast(sessionId)
+      .then(f => { setForecast(f?.forecast ?? f); setLoading(false) })
+      .catch(err => { setError(err); setLoading(false) })
+  }
+
+  useEffect(() => { fetchData() }, [sessionId])
+
   if(loading){
     return (
       <section className="rounded-3xl border border-slate-700 bg-slate-900 p-6 shadow-inner shadow-black/20 mt-6">
@@ -254,7 +264,7 @@ function DelayDiagnosis({session}){
             <h2 className="mt-2 text-2xl font-semibold text-rose-100">Unable to load diagnostics</h2>
             <p className="mt-2 text-sm text-rose-300">{error.message || 'Forecast diagnostics could not be retrieved.'}</p>
           </div>
-          <button onClick={()=>{ setLoading(true); setError(null); api.forecast(sessionId).then(f=>{ setForecast(f?.forecast ?? f); setLoading(false)}).catch(err=>{ setError(err); setLoading(false) }) }} className="rounded-2xl border border-rose-500 bg-rose-500/10 px-4 py-2 text-sm font-semibold text-rose-200">Retry</button>
+          <button onClick={fetchData} className="rounded-2xl border border-rose-500 bg-rose-500/10 px-4 py-2 text-sm font-semibold text-rose-200">Retry</button>
         </div>
       </section>
     )
@@ -270,15 +280,37 @@ function DelayDiagnosis({session}){
   }
 
   const diag = forecast.schedule_diagnostics
+  const baseSchedule = diag.base_schedule_days
+  const scopeGrowth = typeof forecast.scope_growth_percent === 'number' && forecast.scope_growth_percent > 0.01
+  // Only real delay CAUSES compete here -- base schedule is the planned duration,
+  // not something going wrong, so it's shown separately as context rather than as
+  // a bar competing on the same scale (it will almost always dwarf the day-level
+  // impact numbers, which made "biggest factor: base schedule" a meaningless,
+  // confusing comparison).
+  //
+  // IMPORTANT: these three numbers answer "how many EXTRA days does this add to
+  // the forecast, on top of what's already reflected in current pace?" -- not
+  // "does this exist in the project?". That's a different, narrower question than
+  // what Sprint Health / Critical Path / Recovery Plans show, which is why this
+  // can legitimately read 0.0d even when spillover items or critical-path items
+  // are visible elsewhere:
+  //  - Spillover here = only spillover PREDICTED for upcoming sprints. Spillover
+  //    that already happened is baked into current velocity (and so into "Base
+  //    schedule" above), not counted again here.
+  //  - Critical path here = only counts extra days if the critical-path chain is
+  //    LONGER than the rest of the remaining work combined. Critical-path items
+  //    can absolutely exist and still add 0 extra days if there's more non-CP
+  //    work to do anyway -- the CP isn't the bottleneck in that case.
   const factors = [
-    { key: 'base', label: 'Base schedule', value: diag.base_schedule_days, color: 'bg-emerald-500' },
-    { key: 'spillover', label: 'Spillover impact', value: diag.spillover_days, color: 'bg-amber-500' },
-    { key: 'blocker', label: 'Blocker impact', value: diag.blocker_days, color: 'bg-rose-500' },
-    { key: 'critical', label: 'Critical path impact', value: diag.critical_path_days, color: 'bg-sky-500' },
+    { key: 'spillover', label: 'Spillover impact', caption: 'Extra days from spillover predicted in upcoming sprints (not counting spillover that already happened — that\u2019s folded into the current pace above).', zeroCaption: 'No additional spillover is predicted for upcoming sprints. (Past spillover, if any, is already reflected in the current pace above — see Sprint Health for the history.)', value: diag.spillover_days, color: 'bg-amber-500' },
+    { key: 'blocker', label: 'Blocker impact', caption: 'Extra days from blockers currently holding up work.', zeroCaption: 'No open blockers are currently adding delay.', value: diag.blocker_days, color: 'bg-rose-500' },
+    { key: 'critical', label: 'Critical path impact', caption: 'Extra days added only if the critical-path chain is longer than the rest of the remaining work combined.', zeroCaption: 'The critical path isn\u2019t the bottleneck right now — there\u2019s at least as much other work to do, so the critical-path chain itself isn\u2019t adding extra time. (See the Critical Path tab for the actual chain.)', value: diag.critical_path_days, color: 'bg-sky-500' },
   ]
   const maxValue = Math.max(...factors.map(item => Math.max(0, item.value || 0)), 1)
-  const dominant = factors.reduce((best, item) => item.value > (best.value || 0) ? item : best, factors[0])
-  const scopeGrowth = typeof forecast.scope_growth_percent === 'number' && forecast.scope_growth_percent > 0.01
+  const hasAnyImpact = factors.some(item => (item.value || 0) > 0)
+  const dominant = hasAnyImpact
+    ? factors.reduce((best, item) => item.value > (best.value || 0) ? item : best, factors[0])
+    : null
 
   return (
     <section className="rounded-3xl border border-slate-700 bg-slate-900 p-6 shadow-inner shadow-black/20 mt-6">
@@ -286,25 +318,41 @@ function DelayDiagnosis({session}){
         <div>
           <p className="text-sm uppercase tracking-[0.3em] text-amber-400">Delay diagnosis</p>
           <h2 className="mt-2 text-2xl font-semibold text-white">Why the schedule is shifted</h2>
-          <p className="mt-2 text-sm text-slate-400">Breakdown of the forecast drivers affecting completion.</p>
+          <p className="mt-2 text-sm text-slate-400">
+            The plan is {typeof baseSchedule === 'number' ? <><span className="font-semibold text-white">{baseSchedule.toFixed(0)} days</span> at baseline</> : 'a baseline duration'}, already reflecting current pace and any scope added so far. Below is what's projected to add <span className="text-slate-300">extra</span> time on top of that.
+          </p>
         </div>
-        <div className="rounded-3xl border border-slate-700 bg-slate-950/80 px-4 py-3 text-sm text-slate-300">
-          Dominant driver: <span className="font-semibold text-white">{dominant.label}</span>
-        </div>
+        {dominant && (
+          <div className="rounded-3xl border border-slate-700 bg-slate-950/80 px-4 py-3 text-sm text-slate-300 flex-none">
+            Biggest extra-delay driver: <span className="font-semibold text-white">{dominant.label}</span>
+          </div>
+        )}
       </div>
 
-      <div className="mt-6 space-y-4">
+      <div className="mt-4 rounded-2xl border border-sky-500/20 bg-sky-500/5 px-4 py-3 text-xs text-sky-200 leading-5">
+        These three bars only count <span className="font-semibold">additional</span> days on top of current pace — not whether spillover or critical-path items exist. Items that already happened (or are already part of your current pace) show up in Sprint Health, Recovery Plans, and the Critical Path tab even if they read 0.0d here.
+      </div>
+
+      {!hasAnyImpact && (
+        <div className="mt-4 rounded-2xl border border-emerald-500/30 bg-emerald-500/5 px-4 py-3 text-sm text-emerald-300">
+          ✓ Based on current pace, nothing is projected to add extra delay beyond the baseline above.
+        </div>
+      )}
+
+      <div className="mt-6 space-y-5">
         {factors.map(item => {
           const width = Math.round(((item.value || 0) / maxValue) * 100)
+          const isZero = !item.value
           return (
-            <div key={item.key} className="space-y-2">
+            <div key={item.key} className="space-y-1.5">
               <div className="flex items-center justify-between text-sm text-slate-300">
-                <span>{item.label}</span>
-                <span className="font-semibold text-white">{typeof item.value === 'number' ? `${item.value.toFixed(1)}d` : '—'}</span>
+                <span className="font-medium">{item.label}</span>
+                <span className={`font-semibold ${isZero ? 'text-slate-500' : 'text-white'}`}>{typeof item.value === 'number' ? `${item.value.toFixed(1)}d` : '—'}</span>
               </div>
               <div className="h-3 rounded-full bg-slate-800">
                 <div className={`${item.color} h-3 rounded-full`} style={{ width: `${width}%` }} />
               </div>
+              <p className="text-xs text-slate-500">{isZero ? (item.zeroCaption || item.caption) : item.caption}</p>
             </div>
           )
         })}
@@ -314,11 +362,15 @@ function DelayDiagnosis({session}){
         <div className="mt-6 rounded-3xl border border-amber-500/30 bg-amber-500/5 p-4">
           <p className="text-sm uppercase tracking-[0.3em] text-amber-300">Scope growth</p>
           <p className="mt-2 text-sm text-slate-100">{forecast.scope_growth_message || `Scope has grown by ${(forecast.scope_growth_percent * 100).toFixed(0)}% beyond the original estimate.`}</p>
+          <p className="mt-1 text-xs text-amber-200/70">This is already counted inside "{baseSchedule?.toFixed?.(0)} days at baseline" above — it's called out here for visibility, not as a separate extra delay.</p>
         </div>
       )}
 
       {forecast.forecast_vs_montecarlo_note && (
-        <div className="mt-4 text-sm text-slate-500">Note: {forecast.forecast_vs_montecarlo_note}</div>
+        <div className="mt-6 rounded-3xl border border-slate-700 bg-slate-950/60 p-4">
+          <p className="text-xs uppercase tracking-[0.25em] text-slate-400">Why the delay estimate and on-time % can look different</p>
+          <p className="mt-2 text-sm text-slate-300 leading-6">{forecast.forecast_vs_montecarlo_note}</p>
+        </div>
       )}
     </section>
   )

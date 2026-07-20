@@ -84,21 +84,53 @@ def render_fallback(inp: EMIOSAdvisorInput) -> EMIOSAdvisorOutput:
     impact = inp.impact_summary
     decision = inp.decision_summary
 
+    # diag.root_cause is often a 2-sentence narrative already ending in
+    # "... is the root cause. <embedded action clause>." Pull out just the causal
+    # clause (dropping a trailing "is the root cause" suffix) so it reads naturally
+    # when interpolated into a larger sentence below, instead of producing
+    # grammatically broken duplication like "root cause is X is the root cause."
+    _cause_clause = (diag.root_cause or "").split(". ", 1)[0]
+    _cause_clause = _cause_clause[:-len(" is the root cause")] if _cause_clause.endswith(" is the root cause") else _cause_clause
+
     executive_summary = (
-        f"{obs.primary_signal}; root cause is {diag.root_cause} "
-        f"({diag.confidence_pct}% confidence) — recommended action: {decision.chosen_action}."
+        f"{obs.primary_signal}. Root cause: {_cause_clause or diag.root_cause} "
+        f"({diag.confidence_pct}% confidence). Recommended: {decision.chosen_action}."
     )
 
+    def _plain_causal_narrative(chain: list) -> str:
+        """
+        The engine's causal_chain is an internal 5-Whys Q&A trace, e.g.
+        ["Why is the project delayed? Some work streams are slow.",
+         "Why slow? Resources are over-allocated.", ..., "Root: rebalance load."].
+        That's useful for the Reasoning Trace tab, but dumped verbatim (with
+        '→' arrows and repeated "Why...?" questions) it reads like a debug log,
+        not something a PM would want to read. This keeps only the answers,
+        drops the "Root:" action line (already shown separately as the
+        recommendation), and joins them into one flowing sentence.
+        """
+        if not chain:
+            return ""
+        answers = []
+        for step in chain:
+            step = (step or "").strip()
+            if not step or step.lower().startswith("root:"):
+                continue
+            answer = step.split("? ", 1)[1] if "? " in step else step
+            answer = answer.rstrip(". ")
+            if answer:
+                answers.append(answer[0].lower() + answer[1:])
+        return "; ".join(answers) + "." if answers else ""
+
+    narrative = _plain_causal_narrative(diag.causal_chain)
+
     ruled_out = (
-        f" It ruled out: {diag.top_eliminated_hypothesis}."
+        f" Other possibilities were reviewed and ruled out — {diag.top_eliminated_hypothesis}."
         if diag.top_eliminated_hypothesis
-        else " No competing hypotheses were strong enough to record."
+        else " No other cause was strong enough to be a serious contender."
     )
+    lede = f"In short: {narrative[0].upper() + narrative[1:]}" if narrative else f"{_cause_clause or diag.root_cause}."
     reasoning_explanation = (
-        f"The engine identified {diag.root_cause} as the leading cause, following the chain "
-        f"{' → '.join(diag.causal_chain) if diag.causal_chain else 'observed to root cause'}. "
-        f"The dominant impact is on {impact.dominant_dimension.lower()} "
-        f"(magnitude {impact.dominant_magnitude:.1f}).{ruled_out}"
+        f"{lede} This is currently the biggest risk driver on the {impact.dominant_dimension.lower()} side of the project.{ruled_out}"
     )
 
     sacrifice = f" This means accepting: {impact.sacrifice_statement}." if impact.sacrifice_statement else ""

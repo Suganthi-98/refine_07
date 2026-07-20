@@ -111,7 +111,7 @@ def test_fallback_handles_no_eliminated_hypothesis_gracefully():
         }
     )
     out = render_fallback(inp)
-    assert "No competing hypotheses" in out.reasoning_explanation
+    assert "no other cause" in out.reasoning_explanation.lower()
 
 
 def test_emios_advisor_run_uses_fallback():
