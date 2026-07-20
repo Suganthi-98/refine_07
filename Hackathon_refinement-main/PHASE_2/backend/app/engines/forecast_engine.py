@@ -22,10 +22,15 @@ from app.api.models_phase3 import (
     ForecastEvidence,
     ForecastAssumptions,
     ForecastExplanation,
+    ForecastSteeringDriver,
+    ForecastSteeringBlocker,
+    ForecastSteeringOverload,
+    ForecastSteeringBrief,
 )
 
 
 from app.engines.project_calibration import ProjectCalibration
+from app.engines import cognition_common as cc
 
 class ForecastEngine:
     """Deterministic forecast engine.
@@ -223,6 +228,21 @@ class ForecastEngine:
         )
 
         confidence = self._build_confidence()
+        steering_brief = self._build_steering_brief(
+            expected_delay_days=expected_delay_days,
+            expected_finish=expected_finish,
+            target_end_date=target_end_date,
+            completion_pct=completion_pct,
+            days_elapsed=days_elapsed,
+            remaining_days_base_work=remaining_days_base_work,
+            planned_window_days=planned_window_days,
+            remaining_days_blocker_loss=remaining_days_blocker_loss,
+            spillover_delay_days=spillover_delay_days,
+            scope_growth_percent=scope_growth_percent,
+            scope_impact_days=scope_impact_days,
+            sprint_days=sprint_days,
+            confidence_level=confidence.confidence_level,
+        )
         forecast_drivers = self._build_forecast_drivers(
             scope_impact_days=scope_impact_days,
             remaining_days_blocker_loss=remaining_days_blocker_loss,
@@ -272,6 +292,7 @@ class ForecastEngine:
                 "figure to look worse than the probability suggests — one is a cautious "
                 "worst-case estimate, the other is an overall likelihood."
             ),
+            steering_brief=steering_brief,
         )
 
     def _build_confidence(self) -> ForecastConfidence:
@@ -317,6 +338,226 @@ class ForecastEngine:
                 "dependency_density": round(dependency_density, 4),
                 "historical_stability": round(historical_stability, 4),
             },
+        )
+
+    def _build_steering_brief(
+        self,
+        *,
+        expected_delay_days: float,
+        expected_finish: datetime,
+        target_end_date: datetime,
+        completion_pct: float,
+        days_elapsed: float,
+        remaining_days_base_work: float,
+        planned_window_days: float,
+        remaining_days_blocker_loss: float,
+        spillover_delay_days: float,
+        scope_growth_percent: float,
+        scope_impact_days: float,
+        sprint_days: float,
+        confidence_level: str,
+    ) -> ForecastSteeringBrief:
+        """Build the manager-facing steering-meeting summary.
+
+        The waterfall here uses the SAME additive basis as `delay_breakdown`
+        (not the diagnostic `schedule_diagnostics`, which is intentionally
+        non-additive). This guarantees the bars always sum exactly to
+        `expected_delay_days`, so the total never looks "made up" in a room
+        full of stakeholders.
+
+        pace_scope_days = (days_elapsed + remaining_days_base_work) - planned_window_days
+            -> the gap between plan and "how long the remaining work takes at
+               current pace", which bundles scope growth and any velocity
+               shortfall against plan. scope_impact_days is surfaced
+               separately as an informational split of this bucket (it can
+               exceed the bucket itself if pace is otherwise ahead of plan,
+               so it's clipped for display).
+        blocker_days = remaining_days_blocker_loss  -> extra days from open blockers
+        spillover_days = spillover_delay_days       -> extra days from predicted spillover
+        """
+        pace_scope_days = float(round((days_elapsed + remaining_days_base_work) - planned_window_days, 2))
+        blocker_days = float(round(remaining_days_blocker_loss, 2))
+        spillover_days = float(round(spillover_delay_days, 2))
+
+        scope_note = None
+        if scope_growth_percent and scope_growth_percent > 0.5:
+            if pace_scope_days > 0:
+                # Behind plan overall: scope's share of that gap is bounded by the
+                # gap itself (can't blame scope for more days than are actually late).
+                scope_days_shown = max(0.0, min(scope_impact_days, pace_scope_days))
+                scope_note = (
+                    f"Scope has grown {scope_growth_percent:.0f}% since baseline, contributing "
+                    f"~{scope_days_shown:.1f} of the days above."
+                )
+            else:
+                # Ahead of plan overall: scope growth still cost real days, it's just
+                # being offset by the team running faster than planned elsewhere. Show
+                # the true cost rather than clipping it to 0, which reads as "scope
+                # growth was free" — it wasn't.
+                scope_note = (
+                    f"Scope has grown {scope_growth_percent:.0f}% since baseline (~{scope_impact_days:.1f} days "
+                    f"of added work), but the team is currently running ahead of plan by enough to absorb it."
+                )
+
+        overloaded_resources: List[ForecastSteeringOverload] = []
+        try:
+            loads = getattr(self.metrics, "resource_sprint_loads", None) or {}
+            blocker_owners_early = {
+                (getattr(b, "owner", None) or "").strip().lower()
+                for b in cc.open_blockers(self.project_state)
+                if getattr(b, "owner", None)
+            }
+            sprint_by_id_early = {s.sprint_id: s for s in self.project_state.sprints}
+            active_sprint_ids_early = {
+                s.sprint_id for s in self.project_state.sprints
+                if s.status in (SprintStatus.IN_PROGRESS, SprintStatus.NOT_STARTED)
+            }
+            rows_early = []
+            for resource_name, per_sprint in loads.items():
+                for sprint_id, ratio in (per_sprint or {}).items():
+                    if ratio <= 1.0 or sprint_id not in active_sprint_ids_early:
+                        continue
+                    sprint = sprint_by_id_early.get(sprint_id)
+                    rows_early.append(ForecastSteeringOverload(
+                        resource_name=resource_name,
+                        sprint_id=sprint_id,
+                        sprint_name=getattr(sprint, "sprint_name", sprint_id),
+                        load_pct=float(round(ratio * 100.0, 0)),
+                        is_blocker_owner=resource_name.strip().lower() in blocker_owners_early,
+                    ))
+            rows_early.sort(key=lambda r: (not r.is_blocker_owner, -r.load_pct))
+            overloaded_resources = rows_early[:5]
+        except Exception:
+            overloaded_resources = []
+
+        # spillover_days now genuinely factors in per-resource overload (see
+        # SpilloverAnalysisEngine._resource_overload_excess_hours), not just
+        # team-wide sprint utilization. The caveat below is only for the residual
+        # case where overload exists but is too small to move spillover_days at
+        # the current item-size granularity.
+        if spillover_days > 0 and overloaded_resources:
+            names = ", ".join(f"{r.resource_name} ({r.load_pct:.0f}% in {r.sprint_name})" for r in overloaded_resources[:2])
+            spillover_detail = f"Includes overload from {names}, on top of standard sprint-capacity risk."
+        elif spillover_days > 0:
+            spillover_detail = "Extra days from items expected to carry over into future sprints."
+        elif overloaded_resources:
+            names = ", ".join(f"{r.resource_name} ({r.load_pct:.0f}% in {r.sprint_name})" for r in overloaded_resources[:2])
+            spillover_detail = (
+                f"{names} " + ("are" if len(overloaded_resources) > 1 else "is")
+                + " over-allocated, but not by enough to move the day estimate yet — worth watching. See Resource overload below."
+            )
+        else:
+            spillover_detail = "No material spillover is predicted, and no individual is over-allocated in upcoming sprints either."
+
+        pace_detail = "Remaining work is exactly on pace with plan." if pace_scope_days == 0 else (
+            f"Excluding blockers and spillover, team velocity alone would finish {abs(pace_scope_days):.1f} day(s) early — the delay below is what's pulling the date back." if pace_scope_days < 0 else
+            "Remaining work is taking longer than planned"
+            + (f" — largely scope growth ({scope_growth_percent:.0f}%)." if scope_growth_percent and scope_growth_percent > 5 else " at the team's current velocity.")
+        )
+        waterfall = [
+            ForecastSteeringDriver(
+                key="pace_scope",
+                label="Pace vs. plan",
+                days=pace_scope_days,
+                detail=pace_detail,
+                tone="risk" if pace_scope_days > 0 else "good",
+            ),
+            ForecastSteeringDriver(
+                key="blockers",
+                label="Open blockers",
+                days=blocker_days,
+                detail="Extra days from blockers currently reducing team velocity." if blocker_days > 0 else "No open blockers are dragging on velocity right now.",
+                tone="risk" if blocker_days > 0 else "neutral",
+            ),
+            ForecastSteeringDriver(
+                key="spillover",
+                label="Predicted spillover",
+                days=spillover_days,
+                detail=spillover_detail,
+                tone="risk" if (spillover_days > 0 or overloaded_resources) else "neutral",
+            ),
+        ]
+
+        # Named, owned blockers for the room to make a decision on.
+        top_blockers: List[ForecastSteeringBlocker] = []
+        try:
+            cp_ids = cc.critical_path_ids(self.cp_result)
+            open_blockers = cc.open_blockers(self.project_state)
+            ranked = sorted(open_blockers, key=cc.blocker_delay_days, reverse=True)
+            for b in ranked[:3]:
+                top_blockers.append(ForecastSteeringBlocker(
+                    blocker_id=getattr(b, "blocker_id", "?"),
+                    description=getattr(b, "description", "") or "No description provided",
+                    owner=getattr(b, "owner", None),
+                    severity=str(getattr(getattr(b, "severity", None), "value", getattr(b, "severity", "Medium"))),
+                    category=str(getattr(getattr(b, "category", None), "value", getattr(b, "category", "Other"))),
+                    delay_days=float(round(cc.blocker_delay_days(b), 1)),
+                    on_critical_path=cc.blocker_hits_critical_path(b, cp_ids),
+                    target_resolution_date=getattr(b, "target_resolution_date", None),
+                ))
+        except Exception:
+            top_blockers = []
+
+        # Status thresholds: within one sprint late = at risk (recoverable in-cycle),
+        # beyond that = late (needs a scope/timeline/resourcing decision).
+        if expected_delay_days <= 0:
+            status = "ON_TRACK"
+        elif expected_delay_days <= max(sprint_days, 1.0):
+            status = "AT_RISK"
+        else:
+            status = "LATE"
+
+        finish_str = expected_finish.strftime("%d %b %Y")
+        target_str = target_end_date.strftime("%d %b %Y")
+        if status == "ON_TRACK":
+            headline = f"On track — projected to finish {finish_str}, {abs(expected_delay_days):.0f} day(s) ahead of the {target_str} target."
+        else:
+            headline = f"Projected {expected_delay_days:.0f} day(s) late — {finish_str} vs. the {target_str} target."
+        subheadline = f"{completion_pct * 100:.0f}% complete. " + (
+            f"Biggest driver: {max(waterfall, key=lambda d: d.days).label}." if any(d.days > 0 for d in waterfall) else "No active driver is adding delay beyond plan."
+        )
+
+        dominant = max(waterfall, key=lambda d: d.days) if any(d.days > 0 for d in waterfall) else None
+        compounding_owner_overload = next((r for r in overloaded_resources if r.is_blocker_owner), None)
+        if status == "ON_TRACK":
+            decision_ask = "No decision needed this cycle — hold current plan and re-check next steering meeting."
+        elif compounding_owner_overload:
+            decision_ask = (
+                f"Needs a decision: {compounding_owner_overload.resource_name} owns the top blocker and is "
+                f"{compounding_owner_overload.load_pct:.0f}% allocated in {compounding_owner_overload.sprint_name} — "
+                "reassign the blocker, add support, or expect the blocker to slip further."
+            )
+        elif dominant and dominant.key == "blockers" and top_blockers:
+            names = ", ".join(f"{b.blocker_id} ({b.owner or 'unassigned owner'})" for b in top_blockers[:2])
+            decision_ask = f"Needs a decision: escalate/resource the open blockers ({names}) or accept the schedule slip."
+        elif dominant and dominant.key == "spillover":
+            decision_ask = "Needs a decision: trim scope from upcoming sprints or accept the spillover-driven delay."
+        elif dominant and dominant.key == "pace_scope" and scope_growth_percent and scope_growth_percent > 5:
+            decision_ask = "Needs a decision: approve the scope growth's schedule impact, or de-scope to protect the date."
+        elif overloaded_resources:
+            top = overloaded_resources[0]
+            decision_ask = (
+                f"Needs a decision: {top.resource_name} is {top.load_pct:.0f}% allocated in {top.sprint_name} — "
+                "rebalance the load before that sprint starts."
+            )
+        else:
+            decision_ask = "Needs a decision: add capacity, trim scope, or accept the revised finish date."
+
+        return ForecastSteeringBrief(
+            status=status,
+            headline=headline,
+            subheadline=subheadline,
+            target_end_date=target_end_date,
+            expected_finish_date=expected_finish,
+            expected_delay_days=float(round(expected_delay_days, 1)),
+            completion_percentage=completion_pct,
+            waterfall=waterfall,
+            scope_growth_percent=scope_growth_percent,
+            scope_note=scope_note,
+            top_blockers=top_blockers,
+            overloaded_resources=overloaded_resources,
+            decision_ask=decision_ask,
+            confidence_level=confidence_level,
         )
 
     def _build_forecast_drivers(

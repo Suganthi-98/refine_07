@@ -221,10 +221,52 @@ class SpilloverAnalysisEngine:
 
             # Estimated spillover items (rough heuristic: items beyond capacity)
             expected_spillover = max(0.0, (total_effort - avg_actual_velocity) / self.avg_item_effort)
-            
+
+            # DEEPER FIX: the check above only compares team-wide effort against
+            # team-wide capacity, so it can read "no spillover" even when a specific
+            # resource is individually over 100% allocated in this sprint (other
+            # resources being under-loaded masks it in the aggregate). Work assigned
+            # to a specific resource can't be silently done by someone else in this
+            # deterministic model, so that resource's own excess is a real spillover
+            # risk this sprint even when the team total has headroom. Use whichever
+            # is larger -- team-level or resource-level excess -- rather than only
+            # ever looking at the team aggregate.
+            resource_excess_hours = self._resource_overload_excess_hours(sprint_num, spillover_candidates)
+            if resource_excess_hours > 0:
+                resource_driven_spillover = resource_excess_hours / self.avg_item_effort
+                expected_spillover = max(expected_spillover, resource_driven_spillover)
+
             predictions[sprint_num] = expected_spillover
         
         return predictions
+
+    def _resource_overload_excess_hours(self, sprint_num: int, spillover_candidates: list) -> float:
+        """Sum of (assigned remaining effort - individual capacity) across any
+        resource individually over-allocated in this sprint. Mirrors the capacity
+        formula MetricsEngine uses for resource_sprint_loads so the two numbers
+        agree with each other."""
+        team = getattr(self.project_state, "team", None) or []
+        if not team:
+            return 0.0
+        sprint_days = float(self.project_state.project_info.sprint_duration_days or 10)
+        total_excess = 0.0
+        for resource in team:
+            assigned_hrs = sum(
+                i.remaining_effort_hrs for i in spillover_candidates
+                if getattr(i, "assigned_resource", None) in {resource.resource_id, resource.name}
+            )
+            if assigned_hrs <= 0:
+                continue
+            capacity = (
+                (resource.daily_capacity_hrs or 0.0)
+                * sprint_days
+                * (resource.availability_pct or 1.0)
+                * (resource.allocation_pct or 1.0)
+            )
+            if capacity <= 0:
+                continue
+            total_excess += max(0.0, assigned_hrs - capacity)
+        return total_excess
 
     def _effective_capacity(self, sprint, avg_velocity: float) -> float:
         """Return the sprint's usable capacity for spillover math.

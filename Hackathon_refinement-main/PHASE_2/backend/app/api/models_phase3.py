@@ -135,6 +135,77 @@ class ForecastExplanation(BaseModel):
     delay_signal: str = Field(..., description="Whether the project is projected to be early, on track, or late")
 
 
+class ForecastSteeringDriver(BaseModel):
+    """One bar in the manager-facing delay waterfall. These are additive —
+    the full set of `days` values sums exactly to `expected_delay_days`,
+    so the waterfall always reconciles with the headline number."""
+
+    key: str = Field(..., description="Stable identifier, e.g. 'pace_scope', 'blockers', 'spillover'")
+    label: str = Field(..., description="Short manager-facing label")
+    days: float = Field(..., description="Signed days contributed to the delay by this driver")
+    detail: str = Field(..., description="One-line explanation in plain language")
+    tone: str = Field(..., description="'risk' | 'neutral' | 'good' — for UI coloring")
+
+
+class ForecastSteeringBlocker(BaseModel):
+    """A named, owned blocker surfaced for a steering-committee decision."""
+
+    blocker_id: str
+    description: str
+    owner: Optional[str] = None
+    severity: str
+    category: str
+    delay_days: float
+    on_critical_path: bool
+    target_resolution_date: Optional[datetime] = None
+
+
+class ForecastSteeringOverload(BaseModel):
+    """A resource over-allocated in a specific upcoming/in-progress sprint.
+    Surfaced separately from spillover because sprint-level utilization is a
+    team-wide average and can mask an individual running over 100% while the
+    sprint total still looks fine."""
+
+    resource_name: str
+    sprint_id: str
+    sprint_name: str
+    load_pct: float = Field(..., description="Allocation as a percent, e.g. 129.0 for 129%")
+    is_blocker_owner: bool = Field(
+        False, description="True if this resource also owns an open blocker — compounding risk"
+    )
+
+
+class ForecastSteeringBrief(BaseModel):
+    """Executive summary of the forecast, structured for a steering meeting:
+    status, the one-line why, an exact waterfall reconciling to the delay
+    figure, the named blockers driving it, and the decision being asked of
+    management."""
+
+    status: str = Field(..., description="'ON_TRACK' | 'AT_RISK' | 'LATE'")
+    headline: str = Field(..., description="One-sentence bottom line for the room")
+    subheadline: str = Field(..., description="Supporting context sentence")
+    target_end_date: datetime
+    expected_finish_date: datetime
+    expected_delay_days: float
+    completion_percentage: float
+    waterfall: List[ForecastSteeringDriver] = Field(
+        default_factory=list,
+        description="Additive drivers; sum of `days` == expected_delay_days",
+    )
+    scope_growth_percent: float = 0.0
+    scope_note: Optional[str] = None
+    top_blockers: List[ForecastSteeringBlocker] = Field(default_factory=list)
+    overloaded_resources: List[ForecastSteeringOverload] = Field(
+        default_factory=list,
+        description=(
+            "Individuals over 100% allocation in an upcoming/in-progress sprint. "
+            "A leading risk indicator that team-average spillover prediction can miss."
+        ),
+    )
+    decision_ask: str = Field(..., description="What management is being asked to decide/unblock")
+    confidence_level: str = Field(..., description="HIGH | MEDIUM | LOW")
+
+
 class ForecastResult(BaseModel):
     """Deterministic single-point forecast result."""
 
@@ -182,6 +253,10 @@ class ForecastResult(BaseModel):
             "Explains why the deterministic delay and Monte Carlo "
             "on-time probability can appear contradictory"
         ),
+    )
+    steering_brief: Optional[ForecastSteeringBrief] = Field(
+        None,
+        description="Manager-facing executive summary of the forecast for steering meetings",
     )
 
 

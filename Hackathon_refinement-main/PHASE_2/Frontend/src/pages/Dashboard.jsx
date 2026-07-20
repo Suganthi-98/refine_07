@@ -228,6 +228,27 @@ function daysBetween(a,b){
 }
 
 
+const STATUS_STYLES = {
+  ON_TRACK: { pill: 'border-emerald-500/40 bg-emerald-500/10 text-emerald-300', dot: 'bg-emerald-400', label: 'On track' },
+  AT_RISK:  { pill: 'border-amber-500/40 bg-amber-500/10 text-amber-300',   dot: 'bg-amber-400',   label: 'At risk' },
+  LATE:     { pill: 'border-rose-500/40 bg-rose-500/10 text-rose-300',      dot: 'bg-rose-400',    label: 'Late' },
+}
+
+const TONE_STYLES = {
+  risk:    { bar: 'bg-rose-500',    value: 'text-rose-300' },
+  good:    { bar: 'bg-emerald-500', value: 'text-emerald-300' },
+  neutral: { bar: 'bg-slate-600',   value: 'text-slate-400' },
+}
+
+function SeverityBadge({severity}){
+  const s = (severity || '').toLowerCase()
+  const cls = s === 'critical' ? 'border-rose-500/50 bg-rose-500/10 text-rose-300'
+    : s === 'high' ? 'border-orange-500/50 bg-orange-500/10 text-orange-300'
+    : s === 'medium' ? 'border-amber-500/50 bg-amber-500/10 text-amber-300'
+    : 'border-slate-600 bg-slate-800 text-slate-300'
+  return <span className={`rounded-full border px-2 py-0.5 text-[11px] font-semibold uppercase tracking-wide ${cls}`}>{severity || 'Unknown'}</span>
+}
+
 function DelayDiagnosis({session}){
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
@@ -249,7 +270,7 @@ function DelayDiagnosis({session}){
   if(loading){
     return (
       <section className="rounded-3xl border border-slate-700 bg-slate-900 p-6 shadow-inner shadow-black/20 mt-6">
-        <p className="text-sm uppercase tracking-[0.3em] text-amber-400">Delay diagnosis</p>
+        <p className="text-sm uppercase tracking-[0.3em] text-amber-400">Steering summary</p>
         <p className="mt-3 text-sm text-slate-400">Loading delay diagnostics…</p>
       </section>
     )
@@ -260,7 +281,7 @@ function DelayDiagnosis({session}){
       <section className="rounded-3xl border border-rose-600 bg-rose-900/10 p-6 shadow-inner shadow-black/20 mt-6">
         <div className="flex items-center justify-between gap-4">
           <div>
-            <p className="text-sm uppercase tracking-[0.3em] text-rose-400">Delay diagnosis</p>
+            <p className="text-sm uppercase tracking-[0.3em] text-rose-400">Steering summary</p>
             <h2 className="mt-2 text-2xl font-semibold text-rose-100">Unable to load diagnostics</h2>
             <p className="mt-2 text-sm text-rose-300">{error.message || 'Forecast diagnostics could not be retrieved.'}</p>
           </div>
@@ -270,107 +291,164 @@ function DelayDiagnosis({session}){
     )
   }
 
-  if(!forecast || !forecast.schedule_diagnostics){
+  const brief = forecast?.steering_brief
+
+  if(!forecast || !brief){
     return (
       <section className="rounded-3xl border border-slate-700 bg-slate-900 p-6 shadow-inner shadow-black/20 mt-6">
-        <p className="text-sm uppercase tracking-[0.3em] text-amber-400">Delay diagnosis</p>
+        <p className="text-sm uppercase tracking-[0.3em] text-amber-400">Steering summary</p>
         <p className="mt-3 text-sm text-slate-400">No schedule diagnostics are available for this session.</p>
       </section>
     )
   }
 
-  const diag = forecast.schedule_diagnostics
-  const baseSchedule = diag.base_schedule_days
-  const scopeGrowth = typeof forecast.scope_growth_percent === 'number' && forecast.scope_growth_percent > 0.01
-  // Only real delay CAUSES compete here -- base schedule is the planned duration,
-  // not something going wrong, so it's shown separately as context rather than as
-  // a bar competing on the same scale (it will almost always dwarf the day-level
-  // impact numbers, which made "biggest factor: base schedule" a meaningless,
-  // confusing comparison).
-  //
-  // IMPORTANT: these three numbers answer "how many EXTRA days does this add to
-  // the forecast, on top of what's already reflected in current pace?" -- not
-  // "does this exist in the project?". That's a different, narrower question than
-  // what Sprint Health / Critical Path / Recovery Plans show, which is why this
-  // can legitimately read 0.0d even when spillover items or critical-path items
-  // are visible elsewhere:
-  //  - Spillover here = only spillover PREDICTED for upcoming sprints. Spillover
-  //    that already happened is baked into current velocity (and so into "Base
-  //    schedule" above), not counted again here.
-  //  - Critical path here = only counts extra days if the critical-path chain is
-  //    LONGER than the rest of the remaining work combined. Critical-path items
-  //    can absolutely exist and still add 0 extra days if there's more non-CP
-  //    work to do anyway -- the CP isn't the bottleneck in that case.
-  const factors = [
-    { key: 'spillover', label: 'Spillover impact', caption: 'Extra days from spillover predicted in upcoming sprints (not counting spillover that already happened — that\u2019s folded into the current pace above).', zeroCaption: 'No additional spillover is predicted for upcoming sprints. (Past spillover, if any, is already reflected in the current pace above — see Sprint Health for the history.)', value: diag.spillover_days, color: 'bg-amber-500' },
-    { key: 'blocker', label: 'Blocker impact', caption: 'Extra days from blockers currently holding up work.', zeroCaption: 'No open blockers are currently adding delay.', value: diag.blocker_days, color: 'bg-rose-500' },
-    { key: 'critical', label: 'Critical path impact', caption: 'Extra days added only if the critical-path chain is longer than the rest of the remaining work combined.', zeroCaption: 'The critical path isn\u2019t the bottleneck right now — there\u2019s at least as much other work to do, so the critical-path chain itself isn\u2019t adding extra time. (See the Critical Path tab for the actual chain.)', value: diag.critical_path_days, color: 'bg-sky-500' },
-  ]
-  const maxValue = Math.max(...factors.map(item => Math.max(0, item.value || 0)), 1)
-  const hasAnyImpact = factors.some(item => (item.value || 0) > 0)
-  const dominant = hasAnyImpact
-    ? factors.reduce((best, item) => item.value > (best.value || 0) ? item : best, factors[0])
-    : null
+  const statusStyle = STATUS_STYLES[brief.status] || STATUS_STYLES.AT_RISK
+  const maxAbs = Math.max(...brief.waterfall.map(d => Math.abs(d.days || 0)), 1)
 
   return (
     <section className="rounded-3xl border border-slate-700 bg-slate-900 p-6 shadow-inner shadow-black/20 mt-6">
+      {/* Header: this is the slide a manager reads out loud */}
       <div className="flex flex-col gap-4 md:flex-row md:items-start md:justify-between">
         <div>
-          <p className="text-sm uppercase tracking-[0.3em] text-amber-400">Delay diagnosis</p>
-          <h2 className="mt-2 text-2xl font-semibold text-white">Why the schedule is shifted</h2>
-          <p className="mt-2 text-sm text-slate-400">
-            The plan is {typeof baseSchedule === 'number' ? <><span className="font-semibold text-white">{baseSchedule.toFixed(0)} days</span> at baseline</> : 'a baseline duration'}, already reflecting current pace and any scope added so far. Below is what's projected to add <span className="text-slate-300">extra</span> time on top of that.
-          </p>
-        </div>
-        {dominant && (
-          <div className="rounded-3xl border border-slate-700 bg-slate-950/80 px-4 py-3 text-sm text-slate-300 flex-none">
-            Biggest extra-delay driver: <span className="font-semibold text-white">{dominant.label}</span>
+          <div className="flex items-center gap-3">
+            <p className="text-sm uppercase tracking-[0.3em] text-amber-400">Steering summary</p>
+            <span className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-0.5 text-xs font-semibold ${statusStyle.pill}`}>
+              <span className={`h-1.5 w-1.5 rounded-full ${statusStyle.dot}`} />
+              {statusStyle.label}
+            </span>
           </div>
-        )}
+          <h2 className="mt-2 text-2xl font-semibold text-white">{brief.headline}</h2>
+          <p className="mt-2 text-sm text-slate-400">{brief.subheadline}</p>
+        </div>
+        <div className="grid grid-cols-2 gap-3 md:flex-none">
+          <div className="rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 text-center min-w-[110px]">
+            <p className="text-[11px] uppercase tracking-wide text-slate-500">Target</p>
+            <p className="mt-1 text-sm font-semibold text-white">{formatDate(brief.target_end_date)}</p>
+          </div>
+          <div className="rounded-2xl border border-slate-700 bg-slate-950/80 px-4 py-3 text-center min-w-[110px]">
+            <p className="text-[11px] uppercase tracking-wide text-slate-500">Projected finish</p>
+            <p className={`mt-1 text-sm font-semibold ${brief.status === 'ON_TRACK' ? 'text-emerald-300' : 'text-rose-300'}`}>{formatDate(brief.expected_finish_date)}</p>
+          </div>
+        </div>
       </div>
 
-      <div className="mt-4 rounded-2xl border border-sky-500/20 bg-sky-500/5 px-4 py-3 text-xs text-sky-200 leading-5">
-        These three bars only count <span className="font-semibold">additional</span> days on top of current pace — not whether spillover or critical-path items exist. Items that already happened (or are already part of your current pace) show up in Sprint Health, Recovery Plans, and the Critical Path tab even if they read 0.0d here.
+      {/* Decision ask -- what the room needs to act on, up top and impossible to miss */}
+      <div className={`mt-5 rounded-2xl border px-4 py-3 text-sm ${brief.status === 'ON_TRACK' ? 'border-emerald-500/30 bg-emerald-500/5 text-emerald-200' : 'border-amber-500/40 bg-amber-500/10 text-amber-100'}`}>
+        <span className="font-semibold uppercase tracking-wide text-xs mr-2">{brief.status === 'ON_TRACK' ? 'Status' : 'Decision needed'}</span>
+        {brief.decision_ask}
       </div>
 
-      {!hasAnyImpact && (
-        <div className="mt-4 rounded-2xl border border-emerald-500/30 bg-emerald-500/5 px-4 py-3 text-sm text-emerald-300">
-          ✓ Based on current pace, nothing is projected to add extra delay beyond the baseline above.
+      {/* Waterfall: exact reconciliation to the headline delay number */}
+      <div className="mt-6">
+        <div className="flex items-center justify-between">
+          <p className="text-xs uppercase tracking-[0.25em] text-slate-400">Where the {brief.expected_delay_days >= 0 ? 'delay' : 'buffer'} is coming from</p>
+          <p className="text-xs text-slate-500">Adds up to the {Math.abs(brief.expected_delay_days).toFixed(1)}-day {brief.expected_delay_days >= 0 ? 'delay' : 'cushion'} above</p>
+        </div>
+        <div className="mt-4 space-y-4">
+          {brief.waterfall.map(d => {
+            const tone = TONE_STYLES[d.tone] || TONE_STYLES.neutral
+            const width = Math.max(4, Math.round((Math.abs(d.days || 0) / maxAbs) * 100))
+            return (
+              <div key={d.key} className="space-y-1.5">
+                <div className="flex items-center justify-between text-sm text-slate-300">
+                  <span className="font-medium">{d.label}</span>
+                  <span className={`font-semibold ${tone.value}`}>{d.days > 0 ? '+' : ''}{d.days.toFixed(1)}d</span>
+                </div>
+                <div className="h-3 rounded-full bg-slate-800">
+                  <div className={`${tone.bar} h-3 rounded-full transition-all`} style={{ width: `${width}%` }} />
+                </div>
+                <p className="text-xs text-slate-500">{d.detail}</p>
+              </div>
+            )
+          })}
+        </div>
+      </div>
+
+      {brief.scope_note && (
+        <div className="mt-5 rounded-2xl border border-amber-500/30 bg-amber-500/5 px-4 py-3 text-sm text-amber-100">
+          <span className="font-semibold uppercase tracking-wide text-xs mr-2 text-amber-300">Scope</span>
+          {brief.scope_note}
         </div>
       )}
 
-      <div className="mt-6 space-y-5">
-        {factors.map(item => {
-          const width = Math.round(((item.value || 0) / maxValue) * 100)
-          const isZero = !item.value
-          return (
-            <div key={item.key} className="space-y-1.5">
-              <div className="flex items-center justify-between text-sm text-slate-300">
-                <span className="font-medium">{item.label}</span>
-                <span className={`font-semibold ${isZero ? 'text-slate-500' : 'text-white'}`}>{typeof item.value === 'number' ? `${item.value.toFixed(1)}d` : '—'}</span>
-              </div>
-              <div className="h-3 rounded-full bg-slate-800">
-                <div className={`${item.color} h-3 rounded-full`} style={{ width: `${width}%` }} />
-              </div>
-              <p className="text-xs text-slate-500">{isZero ? (item.zeroCaption || item.caption) : item.caption}</p>
-            </div>
-          )
-        })}
-      </div>
-
-      {scopeGrowth && (
-        <div className="mt-6 rounded-3xl border border-amber-500/30 bg-amber-500/5 p-4">
-          <p className="text-sm uppercase tracking-[0.3em] text-amber-300">Scope growth</p>
-          <p className="mt-2 text-sm text-slate-100">{forecast.scope_growth_message || `Scope has grown by ${(forecast.scope_growth_percent * 100).toFixed(0)}% beyond the original estimate.`}</p>
-          <p className="mt-1 text-xs text-amber-200/70">This is already counted inside "{baseSchedule?.toFixed?.(0)} days at baseline" above — it's called out here for visibility, not as a separate extra delay.</p>
+      {/* Named, owned blockers -- exactly what a steering committee needs to unblock */}
+      {brief.top_blockers?.length > 0 && (
+        <div className="mt-6">
+          <p className="text-xs uppercase tracking-[0.25em] text-slate-400 mb-3">Blockers driving the schedule</p>
+          <div className="overflow-hidden rounded-2xl border border-slate-700">
+            <table className="w-full text-sm">
+              <thead className="bg-slate-950/60 text-left text-[11px] uppercase tracking-wide text-slate-500">
+                <tr>
+                  <th className="px-4 py-2 font-medium">Blocker</th>
+                  <th className="px-4 py-2 font-medium">Owner</th>
+                  <th className="px-4 py-2 font-medium">Severity</th>
+                  <th className="px-4 py-2 font-medium text-right">Delay</th>
+                  <th className="px-4 py-2 font-medium">Target date</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-800">
+                {brief.top_blockers.map(b => (
+                  <tr key={b.blocker_id} className="bg-slate-900/40">
+                    <td className="px-4 py-3 align-top">
+                      <div className="font-semibold text-white">{b.blocker_id} {b.on_critical_path && <span className="ml-1 rounded-full border border-sky-500/40 bg-sky-500/10 px-1.5 py-0.5 text-[10px] text-sky-300 align-middle">Critical path</span>}</div>
+                      <div className="text-xs text-slate-400 mt-0.5">{b.description}</div>
+                    </td>
+                    <td className="px-4 py-3 align-top text-slate-300">{b.owner || <span className="text-rose-400">Unassigned</span>}</td>
+                    <td className="px-4 py-3 align-top"><SeverityBadge severity={b.severity} /></td>
+                    <td className="px-4 py-3 align-top text-right font-semibold text-rose-300">{b.delay_days.toFixed(1)}d</td>
+                    <td className="px-4 py-3 align-top text-slate-400">{b.target_resolution_date ? formatDate(b.target_resolution_date) : '—'}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
         </div>
       )}
+
+      {/* Resource overload -- catches individuals over 100% even when sprint-average utilization looks fine */}
+      {brief.overloaded_resources?.length > 0 && (
+        <div className="mt-6">
+          <p className="text-xs uppercase tracking-[0.25em] text-slate-400 mb-3">Resource overload ahead</p>
+          <div className="overflow-hidden rounded-2xl border border-slate-700">
+            <table className="w-full text-sm">
+              <thead className="bg-slate-950/60 text-left text-[11px] uppercase tracking-wide text-slate-500">
+                <tr>
+                  <th className="px-4 py-2 font-medium">Resource</th>
+                  <th className="px-4 py-2 font-medium">Sprint</th>
+                  <th className="px-4 py-2 font-medium text-right">Allocation</th>
+                  <th className="px-4 py-2 font-medium"></th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-800">
+                {brief.overloaded_resources.map((r, i) => (
+                  <tr key={`${r.resource_name}-${r.sprint_id}-${i}`} className="bg-slate-900/40">
+                    <td className="px-4 py-3 align-top font-semibold text-white">{r.resource_name}</td>
+                    <td className="px-4 py-3 align-top text-slate-300">{r.sprint_name}</td>
+                    <td className="px-4 py-3 align-top text-right font-semibold text-amber-300">{r.load_pct.toFixed(0)}%</td>
+                    <td className="px-4 py-3 align-top">
+                      {r.is_blocker_owner && (
+                        <span className="rounded-full border border-rose-500/50 bg-rose-500/10 px-2 py-0.5 text-[11px] font-semibold text-rose-300">Also owns a blocker</span>
+                      )}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <p className="mt-2 text-xs text-slate-500">Sprint-level utilization can look fine on average while a specific person is over-allocated — this table surfaces the individuals, not the average.</p>
+        </div>
+      )}
+
+      <div className="mt-6 flex items-center justify-between text-xs text-slate-500">
+        <span>{Math.round((brief.completion_percentage || 0) * 100)}% of scope complete</span>
+        <span>Forecast confidence: <span className="text-slate-300 font-medium">{brief.confidence_level}</span></span>
+      </div>
 
       {forecast.forecast_vs_montecarlo_note && (
-        <div className="mt-6 rounded-3xl border border-slate-700 bg-slate-950/60 p-4">
-          <p className="text-xs uppercase tracking-[0.25em] text-slate-400">Why the delay estimate and on-time % can look different</p>
+        <details className="mt-5 rounded-2xl border border-slate-700 bg-slate-950/60 p-4">
+          <summary className="cursor-pointer text-xs uppercase tracking-[0.25em] text-slate-400">Why this can differ from the on-time probability</summary>
           <p className="mt-2 text-sm text-slate-300 leading-6">{forecast.forecast_vs_montecarlo_note}</p>
-        </div>
+        </details>
       )}
     </section>
   )
