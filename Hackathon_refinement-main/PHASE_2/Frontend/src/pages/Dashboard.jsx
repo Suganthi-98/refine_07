@@ -8,7 +8,7 @@ import { ManagementSummary } from './ManagementSummary'
 
 const tabs = [
   { key: 'overview', label: 'Overview' },
-  { key: 'mgmt-summary', label: '📋 Mgmt Summary' },
+  { key: 'delivery_intelligence', label: '📋 Delivery Intelligence' },
   { key: 'risk', label: 'Risk' },
   { key: 'critical-path', label: 'Critical Path' },
   { key: 'forecast', label: 'Forecast' },
@@ -1633,7 +1633,7 @@ export function Dashboard({session, onReset}){
         </div>
       </div>
 
-      {active === 'mgmt-summary' && <ManagementSummary session={session} />}
+      {active === 'delivery_intelligence' && <ManagementSummary session={session} />}
       {active === 'overview' && <>
         <OverviewPage session={session} onNavigate={setActive} />
         <DelayDiagnosis session={session} />

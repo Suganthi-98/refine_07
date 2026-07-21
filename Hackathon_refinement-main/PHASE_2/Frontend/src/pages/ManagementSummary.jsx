@@ -64,7 +64,7 @@ function FinishDateWindow({ sessionId }) {
           <p className="text-[10px] uppercase tracking-[0.28em] text-slate-500 mb-1">Finish-date window</p>
           <h3 className="text-lg font-bold text-white">Plan against a range</h3>
           <p className="text-xs text-teal-400 mt-0.5">
-            Monte Carlo completion dates{refreshedAgo !== null ? `, refreshed ${refreshedAgo}s ago` : ''}
+            
           </p>
         </div>
         <span className="flex-none rounded-full border border-slate-600 bg-slate-800 px-3 py-1 text-[11px] font-semibold text-slate-300">
@@ -297,7 +297,7 @@ export function ManagementSummary({ session }) {
         <p className="text-[10px] uppercase tracking-[0.3em] text-amber-400 mb-1">Delivery intelligence</p>
         <h2 className="text-3xl font-bold text-white">Dates and dependency math</h2>
         <p className="mt-1 text-sm text-slate-400">
-          No duplicate status narrative here. This tab answers one question: what delivery window are we planning against, and which chain controls it?
+          This tab answers one question: what delivery window are we planning against, and which chain controls it?
         </p>
       </div>
 
