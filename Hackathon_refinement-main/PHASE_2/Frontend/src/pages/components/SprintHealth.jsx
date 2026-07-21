@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback } from 'react'
-import { api } from '../../api/client'
+import { api } from '../api/client'
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 const RC_META = {
@@ -535,28 +535,7 @@ function SystemicPanel({ actions, historical }) {
         </div>
       )}
 
-      {/* Engine recommendations — visually separated */}
-      {historical?.length > 0 && (
-        <div className="space-y-2">
-          <div className="flex items-center gap-3 px-1 pb-1">
-            <p className="text-[11px] uppercase tracking-[0.2em] text-sky-400">Engine recommendations</p>
-            <div className="flex-1 h-px bg-sky-400/10" />
-            <span className="text-[11px] text-slate-600">{historical.length} action{historical.length > 1 ? 's' : ''}</span>
-          </div>
-          {historical.map((r, i) => (
-            <SystemicCard
-              key={`h-${i}`}
-              priority={r.confidence > 0.7 ? 'HIGH' : 'MEDIUM'}
-              sprint={`Apply by Sprint ${r.sprint_to_apply}`}
-              trigger={r.action}
-              finding={`Trigger: ${r.trigger}`}
-              action={r.action}
-              confidence={r.confidence}
-              evidence={r.evidence}
-            />
-          ))}
-        </div>
-      )}
+
     </div>
   )
 }
@@ -608,7 +587,7 @@ export function SprintHealth({ session }) {
     { key: 'people',     label: `👤 Team (${people.length})` },
     { key: 'spillover',  label: `→ Spillover (${spillover_items.length})` },
     { key: 'overbilling',label: `⚠ Overbilling (${overbilling_items.length})` },
-    { key: 'systemic',   label: `🛡 Systemic Actions (${(summary.systemic_actions?.length || 0) + (summary.historical_prevention?.length || 0)})` },
+    { key: 'systemic',   label: `🛡 Systemic Actions (${summary.systemic_actions?.length || 0})` },
   ]
 
   return (
