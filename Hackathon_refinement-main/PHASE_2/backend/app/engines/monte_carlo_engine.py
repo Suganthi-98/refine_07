@@ -29,6 +29,7 @@ from app.api.models_phase3 import (
 
 from app.engines.project_calibration import ProjectCalibration
 from app.storage.calibration_store import CalibrationStore, MIN_EPISODES_FOR_CORRECTION
+from app.core import working_calendar
 
 class MonteCarloEngine:
     """Monte Carlo simulation engine for probabilistic forecasting.
@@ -114,6 +115,12 @@ class MonteCarloEngine:
 
         # Target date is constant (business commitment)
         target_end_date = self.project_state.project_info.target_end_date
+
+        # Build the national-holiday index once, sized generously around the
+        # project's timeline, rather than per-simulation -- with 10,000 draws
+        # a day-by-day holiday scan on every draw would be prohibitively slow.
+        anchor = self.project_state.project_info.forecast_anchor_date()
+        self._holiday_index = working_calendar.HolidayIndex.covering(anchor)
 
         # Collect finish dates from all simulations
         finish_dates: List[datetime] = []
@@ -299,7 +306,21 @@ class MonteCarloEngine:
 
         # Expected finish = project_start + elapsed + remaining
         # (spillover already baked into remaining_days via projected_velocity)
-        expected_finish = project_start + timedelta(days=days_elapsed + remaining_days)
+        # National holidays are added as explicit extra non-working days on top,
+        # same reasoning as ForecastEngine: they're irregular and can't already
+        # be priced into the velocity draw the way recurring weekly weekends
+        # are. Uses the prebuilt HolidayIndex (bisect) rather than a day-by-day
+        # scan since this runs once per simulation draw (~10,000x per call).
+        holiday_index = getattr(self, "_holiday_index", None)
+        finish_candidate = project_start + timedelta(days=days_elapsed + remaining_days)
+        if holiday_index is not None:
+            for _ in range(5):
+                holidays_in_range = holiday_index.count_between(project_start, finish_candidate)
+                new_finish = project_start + timedelta(days=days_elapsed + remaining_days + holidays_in_range)
+                if new_finish == finish_candidate:
+                    break
+                finish_candidate = new_finish
+        expected_finish = finish_candidate
 
         return expected_finish
 

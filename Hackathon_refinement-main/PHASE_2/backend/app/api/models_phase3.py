@@ -13,8 +13,12 @@ class ForecastDelayBreakdown(BaseModel):
     All components use the same `projected_velocity` basis as the forecast,
     so these fields sum exactly to `expected_delay_days`.
 
-    expected_delay_days = days_elapsed + remaining_days_total - planned_window_days
+    expected_delay_days = days_elapsed + remaining_days_total + remaining_days_holidays - planned_window_days
     where remaining_days_total = adjusted_remaining / projected_velocity * sprint_days
+    and remaining_days_holidays counts mandatory national holidays landing in
+    the remaining window (see app.core.working_calendar) -- weekly weekends are
+    NOT double-counted here since they're already implicit in the historical
+    velocity rate.
     """
 
     planned_window_days: float = Field(
@@ -40,11 +44,19 @@ class ForecastDelayBreakdown(BaseModel):
             "Extra days caused by blocker-reduced velocity: equivalent days compared against base velocity"
         ),
     )
+    remaining_days_holidays: float = Field(
+        0.0,
+        description=(
+            "Extra calendar days added for mandatory national holidays (Republic Day, "
+            "Independence Day, Gandhi Jayanti) landing within the remaining window. "
+            "Not part of remaining_days_total; added separately in expected_delay_days."
+        ),
+    )
     expected_delay_days: float = Field(
         ...,
         description=(
             "Days late vs target (mirrors ForecastResult.expected_delay_days). "
-            "= days_elapsed + remaining_days_total - planned_window_days"
+            "= days_elapsed + remaining_days_total + remaining_days_holidays - planned_window_days"
         ),
     )
 

@@ -33,6 +33,7 @@ from app.api.models_phase3 import (
 
 from app.engines.project_calibration import ProjectCalibration
 from app.engines import cognition_common as cc
+from app.core import working_calendar
 
 def _normalize_name(name: str) -> str:
     """Lowercase, strip punctuation/initials-dots, collapse whitespace, so
@@ -195,11 +196,29 @@ class ForecastEngine:
 
         project_start = self.project_state.project_info.forecast_anchor_date()
         days_elapsed = self._calculate_schedule_elapsed_days(sprint_days)
-        expected_finish = project_start + timedelta(days=days_elapsed + remaining_days_total)
+
+        # National holidays (Republic Day, Independence Day, Gandhi Jayanti) are
+        # irregular and can't already be priced into the velocity average the way
+        # recurring weekly weekends are (see working_calendar module docstring),
+        # so they're added as explicit extra non-working days on top of the
+        # existing calendar-day math. Fixed-point iterate a few times since
+        # pushing the finish date further out can expose additional holidays
+        # that weren't in range on the first pass.
+        holiday_padding_days = 0
+        finish_candidate = project_start + timedelta(days=days_elapsed + remaining_days_total)
+        for _ in range(5):
+            holidays_in_range = working_calendar.count_holidays_between(project_start, finish_candidate)
+            new_finish = project_start + timedelta(days=days_elapsed + remaining_days_total + holidays_in_range)
+            if new_finish == finish_candidate:
+                holiday_padding_days = holidays_in_range
+                break
+            finish_candidate = new_finish
+            holiday_padding_days = holidays_in_range
+        expected_finish = finish_candidate
 
         target_end_date = self.project_state.project_info.target_end_date
         planned_window_days = float((target_end_date - project_start).days)
-        expected_delay_raw = days_elapsed + remaining_days_total - planned_window_days
+        expected_delay_raw = days_elapsed + remaining_days_total + holiday_padding_days - planned_window_days
         expected_delay_days = float(round(expected_delay_raw, 2))
         on_track = expected_delay_days <= 0
 
@@ -242,7 +261,8 @@ class ForecastEngine:
             remaining_days_base_work=float(round(remaining_days_base_work, 2)),
             remaining_days_spillover=float(round(spillover_delay_days, 2)),
             remaining_days_blocker_loss=float(round(remaining_days_blocker_loss, 2)),
-            expected_delay_days=float(round(days_elapsed + remaining_days_total - planned_window_days, 2)),
+            remaining_days_holidays=float(round(holiday_padding_days, 2)),
+            expected_delay_days=float(round(days_elapsed + remaining_days_total + holiday_padding_days - planned_window_days, 2)),
         )
         schedule_diagnostics = ForecastScheduleDiagnostics(
             is_additive=False,
@@ -278,6 +298,7 @@ class ForecastEngine:
             sprint_days=sprint_days,
             confidence_level=confidence.confidence_level,
             velocity_std_dev_pct=_cal.velocity_std_dev_pct,
+            holiday_padding_days=holiday_padding_days,
         )
         forecast_drivers = self._build_forecast_drivers(
             scope_impact_days=scope_impact_days,
@@ -393,6 +414,7 @@ class ForecastEngine:
         sprint_days: float,
         confidence_level: str,
         velocity_std_dev_pct: float = 0.15,
+        holiday_padding_days: float = 0.0,
     ) -> ForecastSteeringBrief:
         """Build the manager-facing steering-meeting summary.
 
@@ -502,6 +524,7 @@ class ForecastEngine:
             "Remaining work is taking longer than planned"
             + (f" — largely scope growth ({scope_growth_percent:.0f}%)." if scope_growth_percent and scope_growth_percent > 5 else " at the team's current velocity.")
         )
+        holiday_days = float(round(holiday_padding_days, 2))
         waterfall = [
             ForecastSteeringDriver(
                 key="pace_scope",
@@ -523,6 +546,16 @@ class ForecastEngine:
                 days=spillover_days,
                 detail=spillover_detail,
                 tone="risk" if (spillover_days > 0 or overloaded_resources) else "neutral",
+            ),
+            ForecastSteeringDriver(
+                key="holidays",
+                label="Public holidays",
+                days=holiday_days,
+                detail=(
+                    f"{int(round(holiday_days))} mandatory national holiday(s) fall inside the remaining window."
+                    if holiday_days > 0 else "No mandatory national holidays fall inside the remaining window."
+                ),
+                tone="risk" if holiday_days > 0 else "neutral",
             ),
         ]
 
@@ -607,6 +640,8 @@ class ForecastEngine:
             decision_ask = f"Needs a decision: escalate/resource the open blockers ({names}{more}) or accept the schedule slip."
         elif dominant and dominant.key == "spillover":
             decision_ask = "Needs a decision: trim scope from upcoming sprints or accept the spillover-driven delay."
+        elif dominant and dominant.key == "holidays":
+            decision_ask = "No action needed — this is calendar-driven, not a team performance issue. Flag it to stakeholders so the target date reflects mandatory holidays."
         elif dominant and dominant.key == "pace_scope" and scope_growth_percent and scope_growth_percent > 5:
             decision_ask = "Needs a decision: approve the scope growth's schedule impact, or de-scope to protect the date."
         elif overloaded_resources:
@@ -624,7 +659,7 @@ class ForecastEngine:
             subheadline=subheadline,
             target_end_date=target_end_date,
             expected_finish_date=expected_finish,
-            expected_delay_days=float(round(expected_delay_days, 1)),
+            expected_delay_days=float(round(expected_delay_days, 2)),
             completion_percentage=completion_pct,
             waterfall=waterfall,
             scope_growth_percent=scope_growth_percent,
