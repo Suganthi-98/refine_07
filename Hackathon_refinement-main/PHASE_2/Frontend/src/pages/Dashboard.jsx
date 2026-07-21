@@ -4,9 +4,11 @@ import { api } from '../api/client'
 import RecoveryPlansPage from './components/RecoveryPlans'
 import { ReasoningTrace } from './components/ReasoningTrace'
 import { SprintHealth } from './components/SprintHealth'
+import { ManagementSummary } from './ManagementSummary'
 
 const tabs = [
   { key: 'overview', label: 'Overview' },
+  { key: 'mgmt-summary', label: '📋 Mgmt Summary' },
   { key: 'risk', label: 'Risk' },
   { key: 'critical-path', label: 'Critical Path' },
   { key: 'forecast', label: 'Forecast' },
@@ -1631,6 +1633,7 @@ export function Dashboard({session, onReset}){
         </div>
       </div>
 
+      {active === 'mgmt-summary' && <ManagementSummary session={session} />}
       {active === 'overview' && <>
         <OverviewPage session={session} onNavigate={setActive} />
         <DelayDiagnosis session={session} />
