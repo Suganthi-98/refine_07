@@ -16,6 +16,7 @@ from fastapi import APIRouter, HTTPException, Query
 from typing import Dict, List, Any
 from app.api.models import ApiResponse
 from app.storage.session_store import store
+from app.domain.models import WorkItemStatus
 
 router = APIRouter(prefix="/api", tags=["Sprint Health"])
 
@@ -368,10 +369,17 @@ def get_sprint_health(session_id: str = Query(...)):
         spillover_items.append(rec)
 
     # ── Overbilling items ──────────────────────────────────────────────────────
+    # Exclude items already captured as spillover — same WI can appear in both
+    # the historical_analyzer's overbilling and spillover lists when a spilled
+    # item was eventually closed with hours > estimate. Showing it in both tabs
+    # confuses readers; spillover is the primary classification in that case.
+    _spillover_ids = {s["item_id"] for s in spillover_items}
     overbilling_items = []
     for o in sorted(getattr(hist, "overbilling", []) or [], key=lambda x: x.overrun_pct, reverse=True):
         wi  = wi_map.get(o.item_id)
         if not wi:
+            continue
+        if o.item_id in _spillover_ids:
             continue
         res = res_map.get(wi.assigned_resource)
         rec = _build_item_record(
@@ -486,7 +494,8 @@ def get_sprint_health(session_id: str = Query(...)):
             })
 
         total_assigned = [w for w in state.work_items if w.assigned_resource == rid]
-        completed = [w for w in total_assigned if str(w.status).upper().startswith("COMPLET")]
+        _done_statuses = {WorkItemStatus.DONE, WorkItemStatus.COMPLETED}
+        completed = [w for w in total_assigned if w.status in _done_statuses]
 
         people.append({
             "resource_id":          rid,

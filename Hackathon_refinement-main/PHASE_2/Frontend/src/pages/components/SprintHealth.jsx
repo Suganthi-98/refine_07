@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback } from 'react'
-import { api } from "../../api/client";
+import { api } from '../../api/client'
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 const RC_META = {
@@ -234,12 +234,28 @@ function PersonDetail({ person, spilloverItems, overbillingItems }) {
           <span className={cx('text-sm font-bold px-3 py-1.5 rounded-full border', h.cls)}>{person.health_label}</span>
         </div>
 
-        <div className="mt-4 grid grid-cols-2 gap-2 sm:grid-cols-4">
+        {/* Completion progress bar */}
+        {person.total_assigned > 0 && (
+          <div className="mt-4 space-y-1.5">
+            <div className="flex justify-between text-xs text-slate-500">
+              <span>{person.completed_count} of {person.total_assigned} items completed</span>
+              <span className="font-semibold text-white">{Math.round(person.completed_count / person.total_assigned * 100)}%</span>
+            </div>
+            <div className="h-2 rounded-full bg-slate-800 overflow-hidden">
+              <div
+                className="h-2 rounded-full bg-emerald-500 transition-all"
+                style={{ width: `${Math.round(person.completed_count / person.total_assigned * 100)}%` }}
+              />
+            </div>
+          </div>
+        )}
+
+        <div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-4">
           {[
             { l: 'Assigned',   v: person.total_assigned },
-            { l: 'Completed',  v: person.completed_count },
-            { l: 'Avg overrun',v: `${person.avg_overrun_pct}%`, color: person.avg_overrun_pct > 40 ? 'text-rose-400' : person.avg_overrun_pct > 20 ? 'text-amber-400' : 'text-white' },
-            { l: 'Issues',     v: person.total_issues, color: person.total_issues > 3 ? 'text-rose-400' : 'text-white' },
+            { l: 'Completed',  v: person.completed_count, color: person.completed_count > 0 ? 'text-emerald-400' : 'text-slate-400' },
+            { l: 'Avg overrun',v: `${person.avg_overrun_pct}%`, color: person.avg_overrun_pct > 40 ? 'text-rose-400' : person.avg_overrun_pct > 20 ? 'text-amber-400' : 'text-emerald-400' },
+            { l: 'Issues',     v: person.total_issues, color: person.total_issues > 3 ? 'text-rose-400' : person.total_issues > 1 ? 'text-amber-400' : 'text-white' },
           ].map(({ l, v, color }) => (
             <div key={l} className="rounded-2xl bg-slate-800/60 border border-slate-700 p-3 text-center">
               <div className="text-xs text-slate-500">{l}</div>
@@ -380,61 +396,167 @@ function SummaryBar({ summary }) {
 }
 
 // ─── Systemic actions panel ───────────────────────────────────────────────────
-function SystemicPanel({ actions, historical }) {
-  if (!actions?.length && !historical?.length) return (
-    <div className="rounded-3xl border border-emerald-500/30 bg-emerald-500/5 p-8 text-center">
-      <p className="text-emerald-400 font-semibold">No systemic issues detected</p>
-    </div>
-  )
+const PRIORITY_CONFIG = {
+  CRITICAL: { dot: 'bg-rose-500',   ring: 'border-rose-500/30',   bg: 'bg-rose-500/5',   label: 'Critical', labelCls: 'text-rose-400',   actionBorder: 'border-rose-500/20',   actionBg: 'bg-rose-500/5'   },
+  HIGH:     { dot: 'bg-orange-400', ring: 'border-orange-400/30', bg: 'bg-orange-400/5', label: 'High',     labelCls: 'text-orange-400', actionBorder: 'border-orange-400/20', actionBg: 'bg-orange-400/5' },
+  MEDIUM:   { dot: 'bg-amber-400',  ring: 'border-amber-400/20',  bg: 'bg-amber-400/5',  label: 'Medium',   labelCls: 'text-amber-400',  actionBorder: 'border-amber-400/20',  actionBg: 'bg-amber-400/5'  },
+  INFO:     { dot: 'bg-sky-400',    ring: 'border-sky-400/20',    bg: 'bg-sky-400/5',    label: 'Info',     labelCls: 'text-sky-400',    actionBorder: 'border-sky-400/20',    actionBg: 'bg-sky-400/5'    },
+}
+
+function SystemicCard({ priority, sprint, trigger, finding, action, confidence, evidence }) {
+  const [open, setOpen] = useState(false)
+  const cfg = PRIORITY_CONFIG[priority] || PRIORITY_CONFIG.INFO
 
   return (
-    <div className="space-y-4">
-      {actions?.map((a, i) => (
-        <div key={i} className="rounded-3xl border border-slate-700 bg-slate-900 p-5">
-          <div className="flex items-start justify-between gap-3 flex-wrap">
-            <div className="min-w-0">
-              <div className="flex items-center gap-2 flex-wrap">
-                <span className={cx('text-xs font-bold px-2.5 py-1 rounded-full', PRIORITY_CLS[a.priority] || PRIORITY_CLS.INFO)}>
-                  {a.priority}
-                </span>
-                <span className="text-sm font-semibold text-white">{a.trigger}</span>
-              </div>
-              <p className="mt-2 text-sm text-slate-400 leading-6">{a.finding}</p>
-            </div>
-            <span className="flex-none text-xs text-amber-400 font-semibold whitespace-nowrap">{a.sprint}</span>
-          </div>
-          <div className="mt-3 rounded-2xl bg-emerald-500/5 border border-emerald-500/20 p-4">
-            <div className="text-xs uppercase tracking-[0.12em] text-emerald-400 mb-1.5">Recommended action</div>
-            <p className="text-sm text-emerald-200 leading-6">{a.action}</p>
-          </div>
+    <div className={cx('rounded-2xl border overflow-hidden transition-all', cfg.ring, open ? cfg.bg : 'bg-slate-900/60')}>
+      <button
+        onClick={() => setOpen(o => !o)}
+        className="w-full flex items-start gap-4 px-5 py-4 text-left group"
+      >
+        {/* Priority dot — left accent */}
+        <div className="flex-none pt-1">
+          <span className={cx('block w-2.5 h-2.5 rounded-full mt-0.5', cfg.dot)} />
         </div>
-      ))}
 
-      {historical?.map((r, i) => (
-        <div key={i} className="rounded-3xl border border-sky-500/30 bg-sky-500/5 p-5">
+        <div className="flex-1 min-w-0">
+          {/* Title row */}
           <div className="flex items-start justify-between gap-3">
-            <div className="min-w-0">
-              <div className="text-xs text-sky-400 font-semibold uppercase tracking-[0.12em] mb-1">
-                Engine recommendation · Apply by Sprint {r.sprint_to_apply}
-              </div>
-              <p className="text-sm font-semibold text-white">{r.action}</p>
-              <p className="mt-1 text-xs text-slate-400">Trigger: {r.trigger}</p>
-            </div>
-            <Badge color={r.confidence > 0.7 ? 'emerald' : 'amber'} size="xs">
-              {Math.round(r.confidence * 100)}% confident
-            </Badge>
+            <p className="text-sm font-semibold text-white leading-snug">{trigger}</p>
+            {sprint && (
+              <span className="flex-none text-[11px] font-medium text-slate-500 whitespace-nowrap mt-0.5">{sprint}</span>
+            )}
           </div>
-          {r.evidence?.length > 0 && (
-            <div className="mt-3 space-y-1">
-              {r.evidence.map((e, j) => (
-                <div key={j} className="text-xs text-slate-400 flex gap-2">
-                  <span className="text-slate-600 flex-none">→</span>{e}
+          {/* Action preview — always visible, never truncated */}
+          <p className={cx('mt-1.5 text-xs leading-5', cfg.labelCls)}>
+            {action}
+          </p>
+        </div>
+
+        {/* Chevron */}
+        <div className="flex-none pt-1 text-slate-600 group-hover:text-slate-400 transition">
+          <svg className={cx('w-4 h-4 transition-transform', open && 'rotate-180')} viewBox="0 0 16 16" fill="none">
+            <path d="M4 6l4 4 4-4" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/>
+          </svg>
+        </div>
+      </button>
+
+      {/* Expanded body */}
+      {open && (
+        <div className="px-5 pb-5 pt-1 space-y-4 border-t border-slate-800/60">
+          {finding && (
+            <p className="text-sm text-slate-400 leading-6">{finding}</p>
+          )}
+          <div className={cx('rounded-xl border px-4 py-3', cfg.actionBorder, cfg.actionBg)}>
+            <p className={cx('text-[11px] uppercase tracking-[0.15em] font-semibold mb-1.5', cfg.labelCls)}>Recommended action</p>
+            <p className="text-sm text-slate-200 leading-6">{action}</p>
+          </div>
+          {evidence?.length > 0 && (
+            <div className="space-y-1.5 pl-1">
+              {evidence.map((e, j) => (
+                <div key={j} className="flex items-start gap-2 text-xs text-slate-500">
+                  <span className="flex-none text-slate-700 mt-0.5">›</span>
+                  <span>{e}</span>
                 </div>
               ))}
             </div>
           )}
+          {confidence != null && (
+            <div className="flex justify-end">
+              <Badge color={confidence > 0.7 ? 'emerald' : 'amber'} size="xs">
+                {Math.round(confidence * 100)}% confident
+              </Badge>
+            </div>
+          )}
         </div>
-      ))}
+      )}
+    </div>
+  )
+}
+
+function SystemicPanel({ actions, historical }) {
+  if (!actions?.length && !historical?.length) return (
+    <div className="rounded-3xl border border-emerald-500/30 bg-emerald-500/5 p-10 text-center">
+      <p className="text-lg font-semibold text-emerald-300">✓ No systemic issues</p>
+      <p className="mt-1 text-sm text-slate-500">All patterns are within acceptable range.</p>
+    </div>
+  )
+
+  const priorityOrder = { CRITICAL: 0, HIGH: 1, MEDIUM: 2, INFO: 3 }
+  const sorted = [...(actions || [])].sort((a, b) =>
+    (priorityOrder[a.priority] ?? 4) - (priorityOrder[b.priority] ?? 4)
+  )
+
+  // Count by priority for the summary strip
+  const counts = sorted.reduce((acc, a) => {
+    acc[a.priority] = (acc[a.priority] || 0) + 1
+    return acc
+  }, {})
+
+  return (
+    <div className="space-y-6">
+
+      {/* Summary strip */}
+      <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+        {['CRITICAL','HIGH','MEDIUM','INFO'].map(p => {
+          const cfg = PRIORITY_CONFIG[p]
+          const n = counts[p] || 0
+          return (
+            <div key={p} className={cx(
+              'rounded-2xl border px-4 py-3 flex items-center gap-3',
+              n > 0 ? cfg.ring : 'border-slate-800',
+              n > 0 ? cfg.bg : 'bg-slate-900/40'
+            )}>
+              <span className={cx('w-2.5 h-2.5 rounded-full flex-none', n > 0 ? cfg.dot : 'bg-slate-700')} />
+              <div>
+                <p className={cx('text-xl font-extrabold', n > 0 ? cfg.labelCls : 'text-slate-600')}>{n}</p>
+                <p className="text-[10px] uppercase tracking-wide text-slate-500">{cfg.label}</p>
+              </div>
+            </div>
+          )
+        })}
+      </div>
+
+      {/* Action cards */}
+      {sorted.length > 0 && (
+        <div className="space-y-2">
+          <p className="text-[11px] uppercase tracking-[0.2em] text-slate-500 px-1 pb-1">
+            Issues requiring attention
+          </p>
+          {sorted.map((a, i) => (
+            <SystemicCard
+              key={i}
+              priority={a.priority}
+              sprint={a.sprint}
+              trigger={a.trigger}
+              finding={a.finding}
+              action={a.action}
+            />
+          ))}
+        </div>
+      )}
+
+      {/* Engine recommendations — visually separated */}
+      {historical?.length > 0 && (
+        <div className="space-y-2">
+          <div className="flex items-center gap-3 px-1 pb-1">
+            <p className="text-[11px] uppercase tracking-[0.2em] text-sky-400">Engine recommendations</p>
+            <div className="flex-1 h-px bg-sky-400/10" />
+            <span className="text-[11px] text-slate-600">{historical.length} action{historical.length > 1 ? 's' : ''}</span>
+          </div>
+          {historical.map((r, i) => (
+            <SystemicCard
+              key={`h-${i}`}
+              priority={r.confidence > 0.7 ? 'HIGH' : 'MEDIUM'}
+              sprint={`Apply by Sprint ${r.sprint_to_apply}`}
+              trigger={r.action}
+              finding={`Trigger: ${r.trigger}`}
+              action={r.action}
+              confidence={r.confidence}
+              evidence={r.evidence}
+            />
+          ))}
+        </div>
+      )}
     </div>
   )
 }
