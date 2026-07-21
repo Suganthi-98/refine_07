@@ -1,22 +1,210 @@
 """
-Sprint Health route — full per-person competency + spillover + overbilling analysis.
+Sprint Health — deep root cause analysis from a project manager's perspective.
 
 GET /api/sprint-health?session_id=<id>
 
-Returns structured data for the Sprint Health tab:
-  - per-person competency profile (skill matches, overrun patterns, recommendations)
-  - spillover items with root cause classification
-  - overbilling items with root cause classification
-  - prevention recommendations per person
-  - summary metrics
+Classifies every spillover and overbilling event into one of 8 root cause
+categories using domain-aware skill affinity (e.g. CANoe Scripting ≈ HIL Testing
+& CANoe Automation, not a mismatch). Each case gets:
+  - A plain-English explanation
+  - A concrete preventive action for future sprints
+  - Severity rating
+Per-person competency profiles and team-wide systemic prevention recommendations
+are derived from the aggregate pattern.
 """
 from fastapi import APIRouter, HTTPException, Query
-from typing import Dict, List, Optional, Any
-
+from typing import Dict, List, Any
 from app.api.models import ApiResponse
 from app.storage.session_store import store
 
 router = APIRouter(prefix="/api", tags=["Sprint Health"])
+
+# ── Domain skill affinity groups ──────────────────────────────────────────────
+# Skills in the same group are functionally related. Assigning someone whose
+# primary/secondary is in the RELATED group is a "related skill" case, not a
+# genuine mismatch — but may still show a competency gap.
+SKILL_AFFINITY: Dict[str, List[str]] = {
+    "CANoe Scripting":                  ["HIL Testing & CANoe Automation", "Regression & Integration Testing"],
+    "HIL Testing & CANoe Automation":   ["CANoe Scripting", "Regression & Integration Testing"],
+    "Regression & Integration Testing": ["HIL Testing & CANoe Automation", "CANoe Scripting"],
+    "COM Stack & Signal Mapping":       ["CAN / J1939 Protocol Development", "PDU Configuration"],
+    "CAN / J1939 Protocol Development": ["COM Stack & Signal Mapping", "PDU Configuration"],
+    "PDU Configuration":                ["ECU Integration & Gateway Routing", "CAN / J1939 Protocol Development", "COM Stack & Signal Mapping"],
+    "DCM / DEM Module Configuration":   ["UDS Diagnostics & DTC Management"],
+    "UDS Diagnostics & DTC Management": ["DCM / DEM Module Configuration"],
+    "SecOC & Secure Boot":              ["Automotive Cybersecurity (EVITA)"],
+    "Automotive Cybersecurity (EVITA)": ["SecOC & Secure Boot"],
+    "MCAL Driver Integration":          ["AUTOSAR Stack Configuration"],
+    "AUTOSAR Stack Configuration":      ["MCAL Driver Integration", "ECU Integration & Gateway Routing"],
+    "ECU Integration & Gateway Routing":["MCAL Driver Integration", "PDU Configuration", "AUTOSAR Stack Configuration"],
+    "Backend API Integration":          ["OTA Firmware Update Mechanisms", "Manifest & Delta Packaging"],
+    "OTA Firmware Update Mechanisms":   ["Backend API Integration", "Manifest & Delta Packaging"],
+    "Manifest & Delta Packaging":       ["OTA Firmware Update Mechanisms", "Backend API Integration"],
+}
+
+ROOT_CAUSE_LABELS = {
+    "GENUINE_SKILL_MISMATCH":           ("Genuine Skill Mismatch",           "rose",   "HIGH"),
+    "RELATED_SKILL_COMPETENCY_GAP":     ("Related Skill — Competency Gap",   "orange", "HIGH"),
+    "COMPETENCY_GAP_HIGH":              ("Competency Gap — Critical",        "rose",   "HIGH"),
+    "COMPETENCY_GAP_MEDIUM":            ("Competency Gap — Moderate",        "amber",  "MEDIUM"),
+    "DEPENDENCY_BLOCKED":               ("Dependency Blocked",               "sky",    "MEDIUM"),
+    "EXTERNAL_BLOCKER":                 ("External Blocker",                 "rose",   "MEDIUM"),
+    "CAPACITY_SQUEEZE_NOT_STARTED":     ("Capacity Squeeze — Not Started",   "amber",  "HIGH"),
+    "CAPACITY_OVERCOMMIT":              ("Capacity Overcommit",              "amber",  "MEDIUM"),
+    "ESTIMATION_DRIFT":                 ("Estimation Drift",                 "amber",  "LOW"),
+    "MINOR_VARIANCE":                   ("Minor Variance",                   "slate",  "LOW"),
+}
+
+PREVENTION_TEMPLATES = {
+    "GENUINE_SKILL_MISMATCH": {
+        "explanation": (
+            "Work required '{required}' but {owner} specialises in '{primary}' — "
+            "these domains are unrelated. Working outside the skill domain inflates "
+            "actual effort by 40–90% due to learning overhead and increased defect rate."
+        ),
+        "prevention": (
+            "Add a skill-gate check in sprint planning: every item must match the owner's "
+            "primary or a validated secondary skill before being committed. "
+            "If no matching resource is available, flag the item for backlog restructuring "
+            "rather than force-assigning it and absorbing the overrun silently."
+        ),
+        "sprint_action": "Skill-gate check in sprint planning",
+        "metric_to_track": "% items with skill mismatch at sprint start (target: 0%)",
+    },
+    "RELATED_SKILL_COMPETENCY_GAP": {
+        "explanation": (
+            "'{required}' and '{primary}' are in the same domain group, so the assignment "
+            "is defensible — but the {overrun}% effort overrun shows {owner} has not yet "
+            "developed full depth in '{required}'. "
+            "Example: HIL Testing & CANoe Automation is the right domain family, but "
+            "scripting-intensive diagnostic test work (CANoe Scripting) requires deeper "
+            "scripting proficiency than general automation."
+        ),
+        "prevention": (
+            "Do not treat related-skill items as equivalent to primary-skill items in estimation. "
+            "Apply a 1.4× complexity buffer for items where the owner's primary is 'related' "
+            "but not an exact match. "
+            "Schedule a targeted upskilling session for '{required}' within the next 2 sprints — "
+            "pair {owner} with a primary-skill owner on similar items to close the gap faster."
+        ),
+        "sprint_action": "Apply 1.4× buffer + pair-programme on related-skill items",
+        "metric_to_track": "Overrun % on related-skill items (target: <20%)",
+    },
+    "COMPETENCY_GAP_HIGH": {
+        "explanation": (
+            "Skill matched correctly ({owner} primary = '{required}') but actual effort "
+            "was {overrun}% above estimate. This indicates the specific task complexity "
+            "exceeded {owner}'s current depth in this skill — a common pattern for "
+            "advancing-skill engineers taking on novel or high-complexity variants "
+            "of otherwise familiar tasks."
+        ),
+        "prevention": (
+            "Run a targeted skill-depth review for {owner} on '{required}' before the next sprint. "
+            "Identify whether the overrun came from: (a) design complexity — needs senior review "
+            "at task kickoff; (b) toolchain issues — needs environment preparation time; or "
+            "(c) specification ambiguity — needs a Definition of Ready check before sprint start. "
+            "Add a 1.3× estimate buffer for this person on similar tasks until "
+            "overrun drops below 20% on two consecutive items."
+        ),
+        "sprint_action": "Skill-depth review + 1.3× buffer for next 2 sprints",
+        "metric_to_track": "Overrun on '{required}' items for {owner} (target: <20%)",
+    },
+    "COMPETENCY_GAP_MEDIUM": {
+        "explanation": (
+            "Skill matched but actual effort was {overrun}% above estimate. "
+            "{owner} has the right skills for '{required}' but is systematically "
+            "underestimating complexity in this area — likely due to hidden dependencies "
+            "or understated technical depth of the task."
+        ),
+        "prevention": (
+            "Use actuals from this item as the new baseline estimate for similar tasks. "
+            "Apply a 1.2× multiplier to '{required}' estimates for {owner} in the next sprint. "
+            "Include a brief task kickoff discussion (15 min) where {owner} walks through "
+            "their approach — this surfaces hidden complexity before it becomes an overrun."
+        ),
+        "sprint_action": "Actuals-based re-estimation + kickoff discussion",
+        "metric_to_track": "'{required}' estimation accuracy for {owner} (target: ±15%)",
+    },
+    "DEPENDENCY_BLOCKED": {
+        "explanation": (
+            "Item could not complete because an upstream dependency was not ready. "
+            "{owner} has the correct skill for '{required}' and the effort overrun "
+            "is likely from rework or wait time, not competency. "
+            "This is a planning failure, not a people failure."
+        ),
+        "prevention": (
+            "Map all item dependencies before sprint commitment. "
+            "Any item with an unresolved external dependency should be moved to a later sprint "
+            "or split into a 'foundation' sub-item that can proceed independently. "
+            "Set a mid-sprint dependency check-in (day 5) to catch blockers while there is "
+            "still time to reassign capacity."
+        ),
+        "sprint_action": "Dependency mapping gate + day-5 check-in",
+        "metric_to_track": "Items blocked by dependency at sprint end (target: 0)",
+    },
+    "EXTERNAL_BLOCKER": {
+        "explanation": (
+            "Item was impeded by an external factor (third-party team, tool unavailability, "
+            "or infrastructure issue) rather than by skill or planning. "
+            "{owner} could not progress despite having the right skills for '{required}'."
+        ),
+        "prevention": (
+            "Log all external blockers with: blocker category, date raised, owner of resolution, "
+            "and expected resolution date. Escalate to project manager if unresolved after 2 days. "
+            "In the next sprint retrospective, identify whether this blocker was predictable "
+            "and add it to the risk register if recurring."
+        ),
+        "sprint_action": "Blocker logging + 2-day escalation SLA",
+        "metric_to_track": "External blockers resolved within 2 days (target: >80%)",
+    },
+    "CAPACITY_SQUEEZE_NOT_STARTED": {
+        "explanation": (
+            "{owner} was committed to more work than their sprint capacity allowed. "
+            "'{item_title}' was not started — not because of skill gap, but because "
+            "higher-priority items consumed all available hours. "
+            "This is a capacity planning failure at sprint planning."
+        ),
+        "prevention": (
+            "Cap {owner}'s sprint commitment at 80% of their available hours "
+            "(reserve 20% for meetings, reviews, and unexpected complexity). "
+            "If {owner} already has more than 80% capacity booked, escalate to the "
+            "sprint planning meeting to explicitly defer lower-priority items rather "
+            "than letting them silently spill over."
+        ),
+        "sprint_action": "Enforce 80% capacity cap in sprint planning",
+        "metric_to_track": "Items not started at sprint end (target: 0)",
+    },
+    "CAPACITY_OVERCOMMIT": {
+        "explanation": (
+            "{owner} had the skill for '{required}' and completed the item, "
+            "but the sprint was overcommitted — leaving insufficient buffer for "
+            "the natural complexity variance that all engineering work has."
+        ),
+        "prevention": (
+            "Review {owner}'s total sprint commitment at planning. "
+            "If it exceeds 85% of sprint hours, remove the lowest-priority item. "
+            "A 15% buffer absorbs normal estimation noise without requiring spillover."
+        ),
+        "sprint_action": "85% capacity rule at sprint planning",
+        "metric_to_track": "Sprint over-commitment rate (target: <5% of sprints)",
+    },
+    "ESTIMATION_DRIFT": {
+        "explanation": (
+            "Skill matched correctly and overrun was modest ({overrun}%), "
+            "within normal engineering estimation noise for this domain. "
+            "However, if this pattern repeats it becomes a systematic drift "
+            "that compounds across sprints."
+        ),
+        "prevention": (
+            "Use historical actuals to anchor future estimates. "
+            "If '{required}' items consistently run 15–25% over, apply a "
+            "1.15–1.25× factor to the next sprint's estimates. "
+            "Track the rolling mean overrun per task category per person quarterly."
+        ),
+        "sprint_action": "Update estimates with actuals-based correction factor",
+        "metric_to_track": "Rolling mean overrun for '{required}' items (target: <15%)",
+    },
+}
 
 
 def _safe(obj, *attrs, default=None):
@@ -27,356 +215,379 @@ def _safe(obj, *attrs, default=None):
     return obj if obj is not None else default
 
 
-def _classify_spillover_root_cause(wi, res, sprint_load: float, sprint_cap: float, overrun_pct) -> Dict:
-    """Classify why an item spilled into the next sprint."""
-    skill_match = None
-    if res and wi.required_skill and hasattr(res, "covers_skill"):
-        try:
-            skill_match = res.covers_skill(wi.required_skill)
-        except Exception:
-            skill_match = None
+def _is_exact_match(required: str, primary: str, secondary: str) -> bool:
+    return required == primary or required == secondary
 
-    overload_pct = round((sprint_load / sprint_cap - 1) * 100) if sprint_cap > 0 else 0
-    overrun = round(overrun_pct * 100) if overrun_pct is not None else None
 
-    if skill_match is False:
-        root_cause = "SKILL_MISMATCH"
-        explanation = (
-            f"Work required '{wi.required_skill}' but {_safe(res,'resource_id','unknown')} "
-            f"specialises in '{_safe(res,'primary_skill','unknown')}'. "
-            "Assigning work outside primary skill area leads to learning overhead and spillover."
-        )
-        prevention = (
-            "Match work to primary skill before sprint planning. "
-            "If secondary skill coverage is needed, pair with a primary-skill owner for the first sprint."
-        )
-    elif overload_pct > 20:
-        root_cause = "OVERBOOKED"
-        explanation = (
-            f"{_safe(res,'resource_id','Owner')} was committed to {round(sprint_load)}h "
-            f"against {round(sprint_cap)}h capacity ({overload_pct}% over). "
-            "Capacity overcommitment forces items to slip regardless of skill level."
-        )
-        prevention = (
-            "Cap per-person sprint load at 85% of capacity. "
-            "Use the Resource Load view before finalising sprint assignments."
-        )
-    elif overrun is not None and overrun > 40:
-        root_cause = "COMPETENCY_GAP"
-        explanation = (
-            f"Skill was correctly matched but actual effort was {overrun}% above estimate. "
-            f"'{wi.required_skill}' was within {_safe(res,'resource_id','the owner')}'s profile "
-            "but the specific task complexity was underestimated — a signal of advancing-skill work."
-        )
-        prevention = (
-            "Flag items where overrun exceeds 30% for post-sprint review. "
-            "Pair with a senior team member on similar items next cycle and recalibrate estimates using actuals."
-        )
-    else:
-        root_cause = "CAPACITY"
-        explanation = "Sprint capacity was insufficient to complete the item within the planned window."
-        prevention = "Review sprint load balance and blocker status at the mid-sprint checkpoint."
+def _is_affinity_match(required: str, primary: str, secondary: str) -> bool:
+    related = SKILL_AFFINITY.get(required, [])
+    return primary in related or secondary in related
 
-    return {
-        "root_cause": root_cause,
-        "explanation": explanation,
-        "prevention": prevention,
-        "skill_match": skill_match,
-        "overload_pct": overload_pct if overload_pct > 0 else 0,
+
+def _classify(required: str, primary: str, secondary: str,
+              est: float, actual: float, spillover_reason: str | None) -> tuple:
+    """Return (root_cause_key, overrun_pct)."""
+    exact = _is_exact_match(required, primary, secondary)
+    affinity = _is_affinity_match(required, primary, secondary)
+    overrun = round((actual / est - 1) * 100) if est > 0 and actual > 0 else None
+
+    if not exact and not affinity:
+        return "GENUINE_SKILL_MISMATCH", overrun
+
+    if not exact and affinity:
+        if overrun is not None and overrun > 35:
+            return "RELATED_SKILL_COMPETENCY_GAP", overrun
+        return "ESTIMATION_DRIFT", overrun
+
+    # Exact match
+    if spillover_reason == "DEPENDENCY":
+        return "DEPENDENCY_BLOCKED", overrun
+    if spillover_reason == "BLOCKER":
+        return "EXTERNAL_BLOCKER", overrun
+    if actual == 0 and est > 0:
+        return "CAPACITY_SQUEEZE_NOT_STARTED", overrun
+    if overrun is None:
+        return "MINOR_VARIANCE", overrun
+    if overrun > 55:
+        return "COMPETENCY_GAP_HIGH", overrun
+    if overrun > 25:
+        return "COMPETENCY_GAP_MEDIUM", overrun
+    if overrun > 12:
+        return "ESTIMATION_DRIFT", overrun
+    return "MINOR_VARIANCE", overrun
+
+
+def _format_template(template: str, **ctx) -> str:
+    try:
+        return template.format(**ctx)
+    except KeyError:
+        return template
+
+
+def _build_item_record(item_id, title, sprint_id, owner, required_skill,
+                       primary_skill, secondary_skill, est_hrs, actual_hrs,
+                       spillover_reason, is_spillover,
+                       from_sprint=None, to_sprint=None, sprints_delayed=None) -> Dict:
+    rc_key, overrun = _classify(
+        required_skill or "",
+        primary_skill or "",
+        secondary_skill or "",
+        est_hrs, actual_hrs, spillover_reason
+    )
+    label, color, severity = ROOT_CAUSE_LABELS.get(rc_key, ("Unknown", "slate", "LOW"))
+    tmpl = PREVENTION_TEMPLATES.get(rc_key, {})
+
+    ctx = dict(
+        required=required_skill or "unknown",
+        primary=primary_skill or "unknown",
+        owner=owner or "unknown",
+        overrun=overrun if overrun is not None else 0,
+        item_title=title or item_id,
+    )
+
+    explanation = _format_template(tmpl.get("explanation", "No analysis available."), **ctx)
+    prevention  = _format_template(tmpl.get("prevention", "Review during retrospective."), **ctx)
+    metric      = _format_template(tmpl.get("metric_to_track", ""), **ctx)
+    sprint_action = tmpl.get("sprint_action", "Review during retrospective")
+
+    record = {
+        "item_id":          item_id,
+        "item_title":       title or item_id,
+        "sprint_id":        sprint_id or "",
+        "owner":            owner or "",
+        "required_skill":   required_skill or "",
+        "owner_primary":    primary_skill or "",
+        "owner_secondary":  secondary_skill or "",
+        "estimated_hrs":    est_hrs,
+        "actual_hrs":       actual_hrs,
+        "overrun_hrs":      round(actual_hrs - est_hrs, 1) if actual_hrs > 0 else None,
+        "overrun_pct":      overrun,
+        "root_cause":       rc_key,
+        "root_cause_label": label,
+        "root_cause_color": color,
+        "severity":         severity,
+        "exact_skill_match":   _is_exact_match(required_skill or "", primary_skill or "", secondary_skill or ""),
+        "affinity_match":      _is_affinity_match(required_skill or "", primary_skill or "", secondary_skill or ""),
+        "explanation":         explanation,
+        "prevention":          prevention,
+        "sprint_action":       sprint_action,
+        "metric_to_track":     metric,
+        "is_spillover":        is_spillover,
     }
-
-
-def _classify_overbilling_root_cause(wi, res, overrun_pct: float) -> Dict:
-    """Classify why an item took more hours than estimated."""
-    skill_match = None
-    if res and wi.required_skill and hasattr(res, "covers_skill"):
-        try:
-            skill_match = res.covers_skill(wi.required_skill)
-        except Exception:
-            skill_match = None
-
-    overrun = round(overrun_pct * 100)
-
-    if skill_match is False:
-        root_cause = "SKILL_MISMATCH"
-        explanation = (
-            f"Work required '{wi.required_skill}' but was assigned to "
-            f"{_safe(res,'resource_id','unknown')} whose primary skill is "
-            f"'{_safe(res,'primary_skill','unknown')}'. "
-            "Working in an unfamiliar domain inflates actual effort by 30–90%."
-        )
-        prevention = (
-            "Before assigning, verify skill match in the Resource Matrix. "
-            "If no primary-skill owner is available, plan for a 40% effort buffer and pair-program."
-        )
-        severity = "HIGH" if overrun > 50 else "MEDIUM"
-    elif overrun > 50:
-        root_cause = "COMPETENCY_GAP"
-        explanation = (
-            f"Skill was correctly matched but actual effort was {overrun}% above estimate. "
-            "This indicates the team member is still developing depth in this area — "
-            "the task required more advanced knowledge than currently mastered."
-        )
-        prevention = (
-            "Run a competency workshop or pair with a domain expert for this skill area. "
-            "Add a 25% complexity buffer to estimates for this person on similar tasks until "
-            "overrun drops below 15% consistently."
-        )
-        severity = "HIGH" if overrun > 70 else "MEDIUM"
-    elif overrun > 25:
-        root_cause = "ESTIMATION_DRIFT"
-        explanation = (
-            f"Skill matched correctly but estimate was {overrun}% low. "
-            "This is a systematic underestimation pattern for this task category."
-        )
-        prevention = (
-            "Apply a 1.3× multiplier to future estimates for this task type. "
-            "Use historical actuals from completed items as the baseline, not ideal-case estimates."
-        )
-        severity = "MEDIUM"
-    else:
-        root_cause = "MINOR_VARIANCE"
-        explanation = f"Small overrun ({overrun}%) within acceptable estimation noise."
-        prevention = "No action needed. Monitor for trend."
-        severity = "LOW"
-
-    return {
-        "root_cause": root_cause,
-        "explanation": explanation,
-        "prevention": prevention,
-        "skill_match": skill_match,
-        "severity": severity,
-    }
+    if is_spillover:
+        record.update({
+            "from_sprint":    from_sprint,
+            "to_sprint":      to_sprint,
+            "sprints_delayed": sprints_delayed,
+            "spillover_reason_raw": spillover_reason,
+        })
+    return record
 
 
 @router.get("/sprint-health")
 def get_sprint_health(session_id: str = Query(...)):
-    """
-    Full sprint health analysis — competency, spillover, and overbilling
-    with root cause classification and per-person prevention recommendations.
-    """
     session = store.get_session(session_id)
     if session is None:
         raise HTTPException(status_code=404, detail="Session not found")
-
     result = store.get_pipeline_result(session_id)
     if result is None:
-        raise HTTPException(status_code=404, detail="Pipeline result not yet available — load demo first")
-
+        raise HTTPException(status_code=404, detail="Pipeline result not available — load demo first")
     hist = getattr(result, "historical_analysis", None)
     if hist is None:
-        raise HTTPException(status_code=404, detail="Historical analysis not available for this session")
-
+        raise HTTPException(status_code=404, detail="Historical analysis not available")
     state = store.get_project_state(session_id)
     if state is None:
         raise HTTPException(status_code=404, detail="Project state not found")
 
-    # Build lookup maps
-    wi_map = {w.item_id: w for w in state.work_items}
+    wi_map  = {w.item_id: w for w in state.work_items}
     res_map = {r.resource_id: r for r in state.team}
 
-    # ── Per-person sprint load per sprint ─────────────────────────────────────
-    from collections import defaultdict
-    person_sprint_load: Dict[str, Dict[str, float]] = defaultdict(lambda: defaultdict(float))
-    person_sprint_cap: Dict[str, Dict[str, float]] = defaultdict(lambda: defaultdict(float))
-
-    for wi in state.work_items:
-        owner = wi.assigned_resource or ""
-        sprint = wi.assigned_sprint or ""
-        person_sprint_load[owner][sprint] += float(wi.estimated_effort_hrs or 0)
-
-    for r in state.team:
-        daily_cap = float(getattr(r, "daily_capacity_hrs", 8.0) or 8.0)
-        avail = float(getattr(r, "availability_pct", 1.0) or 1.0)
-        sprint_cap = daily_cap * avail * 10  # 10-day sprint
-        for sprint_name in person_sprint_load[r.resource_id]:
-            person_sprint_cap[r.resource_id][sprint_name] = sprint_cap
-
-    # ── Spillover items with root cause ───────────────────────────────────────
+    # ── Spillover items ────────────────────────────────────────────────────────
     spillover_items = []
     for sp in (getattr(hist, "spillover", []) or []):
-        wi = wi_map.get(sp.item_id)
+        wi  = wi_map.get(sp.item_id)
         if not wi:
             continue
         res = res_map.get(wi.assigned_resource)
-        sprint = wi.assigned_sprint or sp.original_sprint or ""
-        s_load = person_sprint_load[wi.assigned_resource][sprint]
-        s_cap = person_sprint_cap.get(wi.assigned_resource, {}).get(sprint, 80.0)
-        est = float(wi.estimated_effort_hrs or 0)
-        actual = float(wi.actual_effort_hrs or 0)
-        overrun_pct = (actual - est) / est if est > 0 and actual > 0 else None
+        rec = _build_item_record(
+            item_id         = sp.item_id,
+            title           = getattr(sp, "item_title", wi.item_id),
+            sprint_id       = getattr(sp, "original_sprint", ""),
+            owner           = wi.assigned_resource,
+            required_skill  = wi.required_skill,
+            primary_skill   = _safe(res, "primary_skill"),
+            secondary_skill = _safe(res, "secondary_skill"),
+            est_hrs         = float(wi.estimated_effort_hrs or 0),
+            actual_hrs      = float(wi.actual_effort_hrs or 0),
+            spillover_reason= sp.reason_category,
+            is_spillover    = True,
+            from_sprint     = sp.original_sprint,
+            to_sprint       = sp.landed_sprint,
+            sprints_delayed = sp.sprints_delayed,
+        )
+        spillover_items.append(rec)
 
-        rc = _classify_spillover_root_cause(wi, res, s_load, s_cap, overrun_pct)
-
-        spillover_items.append({
-            "item_id": sp.item_id,
-            "item_title": getattr(sp, "item_title", wi.item_title if hasattr(wi, "item_title") else sp.item_id),
-            "from_sprint": sp.original_sprint,
-            "to_sprint": sp.landed_sprint,
-            "sprints_delayed": sp.sprints_delayed,
-            "reason_category": sp.reason_category,
-            "owner": wi.assigned_resource,
-            "required_skill": wi.required_skill,
-            "owner_primary_skill": _safe(res, "primary_skill"),
-            "owner_secondary_skill": _safe(res, "secondary_skill"),
-            "estimated_hrs": est,
-            "actual_hrs": actual,
-            "overrun_pct": round(overrun_pct * 100) if overrun_pct is not None else None,
-            "sprint_load_hrs": round(s_load),
-            "sprint_capacity_hrs": round(s_cap),
-            **rc,
-        })
-
-    # ── Overbilling items with root cause ─────────────────────────────────────
+    # ── Overbilling items ──────────────────────────────────────────────────────
     overbilling_items = []
     for o in sorted(getattr(hist, "overbilling", []) or [], key=lambda x: x.overrun_pct, reverse=True):
-        wi = wi_map.get(o.item_id)
+        wi  = wi_map.get(o.item_id)
         if not wi:
             continue
         res = res_map.get(wi.assigned_resource)
-        rc = _classify_overbilling_root_cause(wi, res, o.overrun_pct)
-
-        overbilling_items.append({
-            "item_id": o.item_id,
-            "item_title": getattr(o, "item_title", o.item_id),
-            "sprint_id": o.sprint_id,
-            "owner": wi.assigned_resource,
-            "required_skill": wi.required_skill,
-            "owner_primary_skill": _safe(res, "primary_skill"),
-            "owner_secondary_skill": _safe(res, "secondary_skill"),
-            "estimated_hrs": o.estimated_hrs,
-            "actual_hrs": o.actual_hrs,
-            "overrun_hrs": round(o.actual_hrs - o.estimated_hrs, 1),
-            "overrun_pct": round(o.overrun_pct * 100),
-            **rc,
-        })
-
-    # ── Per-person competency profile ─────────────────────────────────────────
-    person_stats: Dict[str, Any] = {}
-    for r in state.team:
-        rid = r.resource_id
-        ob_items = [o for o in overbilling_items if o["owner"] == rid]
-        sp_items = [s for s in spillover_items if s["owner"] == rid]
-        skill_mismatches = [o for o in ob_items if o["root_cause"] == "SKILL_MISMATCH"]
-        competency_gaps = [o for o in ob_items if o["root_cause"] == "COMPETENCY_GAP"]
-        high_severity = [o for o in ob_items if o.get("severity") == "HIGH"]
-
-        avg_overrun = (
-            sum(o["overrun_pct"] for o in ob_items) / len(ob_items) if ob_items else 0
+        rec = _build_item_record(
+            item_id         = o.item_id,
+            title           = getattr(o, "item_title", o.item_id),
+            sprint_id       = o.sprint_id,
+            owner           = wi.assigned_resource,
+            required_skill  = wi.required_skill,
+            primary_skill   = _safe(res, "primary_skill"),
+            secondary_skill = _safe(res, "secondary_skill"),
+            est_hrs         = float(o.estimated_hrs or 0),
+            actual_hrs      = float(o.actual_hrs or 0),
+            spillover_reason= None,
+            is_spillover    = False,
         )
+        overbilling_items.append(rec)
 
-        # Derive competency health signal
-        if len(competency_gaps) >= 2 or (len(ob_items) > 0 and avg_overrun > 50):
-            health = "NEEDS_IMPROVEMENT"
-            health_label = "Needs improvement"
-            health_color = "rose"
-        elif len(skill_mismatches) > 0 or avg_overrun > 30:
-            health = "WATCH"
-            health_label = "Watch"
-            health_color = "amber"
-        elif len(ob_items) > 0 and avg_overrun <= 20:
-            health = "GOOD"
-            health_label = "Good"
-            health_color = "emerald"
+    # ── Per-person competency profiles ────────────────────────────────────────
+    from collections import defaultdict
+    person_items: Dict[str, List] = defaultdict(list)
+    for item in spillover_items + overbilling_items:
+        person_items[item["owner"]].append(item)
+
+    people = []
+    for r in state.team:
+        rid   = r.resource_id
+        items = person_items.get(rid, [])
+
+        by_rc: Dict[str, int] = defaultdict(int)
+        for it in items:
+            by_rc[it["root_cause"]] += 1
+
+        high_sev   = [i for i in items if i["severity"] == "HIGH"]
+        medium_sev = [i for i in items if i["severity"] == "MEDIUM"]
+        overruns   = [i["overrun_pct"] for i in items if i.get("overrun_pct") is not None]
+        avg_overrun = round(sum(overruns) / len(overruns)) if overruns else 0
+
+        genuines  = by_rc.get("GENUINE_SKILL_MISMATCH", 0)
+        related_gaps = by_rc.get("RELATED_SKILL_COMPETENCY_GAP", 0)
+        comp_high = by_rc.get("COMPETENCY_GAP_HIGH", 0)
+        comp_med  = by_rc.get("COMPETENCY_GAP_MEDIUM", 0)
+        capacity  = by_rc.get("CAPACITY_SQUEEZE_NOT_STARTED", 0) + by_rc.get("CAPACITY_OVERCOMMIT", 0)
+        dep_blocked = by_rc.get("DEPENDENCY_BLOCKED", 0)
+
+        if genuines >= 1 or comp_high >= 2 or avg_overrun > 60:
+            health, health_label, health_color = "NEEDS_IMPROVEMENT", "Needs improvement", "rose"
+        elif related_gaps >= 1 or comp_high >= 1 or comp_med >= 2 or avg_overrun > 35:
+            health, health_label, health_color = "WATCH",            "Watch",             "amber"
+        elif len(items) > 0:
+            health, health_label, health_color = "MINOR_ISSUES",     "Minor issues",      "sky"
         else:
-            health = "GOOD"
-            health_label = "Good"
-            health_color = "emerald"
+            health, health_label, health_color = "GOOD",             "Good",              "emerald"
 
-        # Derive prevention recommendations for this person
-        person_preventions = []
-        if skill_mismatches:
-            person_preventions.append({
-                "type": "SKILL_ASSIGNMENT",
-                "action": f"Always assign '{r.primary_skill}' work to {rid}. "
-                          f"Found {len(skill_mismatches)} item(s) outside their profile causing major overruns.",
-                "priority": "HIGH",
+        # Per-person action plan
+        actions = []
+        if genuines:
+            actions.append({
+                "priority": "CRITICAL",
+                "type": "SKILL_ASSIGNMENT_GATE",
+                "action": (
+                    f"Immediate: audit all remaining sprint backlog items assigned to {rid}. "
+                    f"Found {genuines} item(s) outside their skill domain. "
+                    f"Reassign or pair before next sprint starts."
+                ),
             })
-        if competency_gaps:
-            skills_needing_dev = list({o["required_skill"] for o in competency_gaps})
-            person_preventions.append({
+        if related_gaps:
+            actions.append({
+                "priority": "HIGH",
+                "type": "RELATED_SKILL_UPSKILLING",
+                "action": (
+                    f"Schedule a focused upskilling session for {rid} on the specific sub-skills "
+                    f"where overrun exceeded 35% despite domain affinity. "
+                    f"Apply 1.4× estimate buffer until two consecutive items come in under 20% overrun."
+                ),
+            })
+        if comp_high:
+            actions.append({
+                "priority": "HIGH",
                 "type": "COMPETENCY_DEVELOPMENT",
                 "action": (
-                    f"Recommend targeted upskilling for {rid} in: {', '.join(skills_needing_dev[:2])}. "
-                    f"Average overrun on matched-skill work is {round(avg_overrun)}% — "
-                    "indicates advancing-skill tasks exceed current depth."
+                    f"Run a skill-depth review with {rid}'s tech lead for '{r.primary_skill}'. "
+                    f"Identify whether overruns come from design complexity, toolchain gaps, or "
+                    f"specification ambiguity — each has a different fix. "
+                    f"Add 1.3× buffer on advanced items for the next 2 sprints."
                 ),
-                "priority": "HIGH" if avg_overrun > 50 else "MEDIUM",
             })
-        if sp_items and not skill_mismatches and not competency_gaps:
-            overload_sp = [s for s in sp_items if s["root_cause"] == "OVERBOOKED"]
-            if overload_sp:
-                person_preventions.append({
-                    "type": "CAPACITY_PLANNING",
-                    "action": (
-                        f"Cap {rid}'s sprint load at 85% of their {round(_safe(r,'daily_capacity_hrs',8)*10)}h "
-                        "sprint capacity. Overcommitment caused spillover despite correct skill assignment."
-                    ),
-                    "priority": "MEDIUM",
-                })
+        if capacity:
+            actions.append({
+                "priority": "HIGH",
+                "type": "CAPACITY_PLANNING",
+                "action": (
+                    f"Enforce 80% capacity cap for {rid} in sprint planning. "
+                    f"Found {capacity} item(s) that could not start due to overcommitment. "
+                    f"If the backlog pressure remains, escalate to re-prioritise scope."
+                ),
+            })
+        if dep_blocked:
+            actions.append({
+                "priority": "MEDIUM",
+                "type": "DEPENDENCY_MANAGEMENT",
+                "action": (
+                    f"Before committing {rid}'s items, verify all upstream dependencies are "
+                    f"resolved or have a confirmed completion date within the sprint window. "
+                    f"Set a day-5 check-in to catch blocked items early."
+                ),
+            })
+        if not actions and health == "GOOD":
+            actions.append({
+                "priority": "INFO",
+                "type": "MAINTAIN",
+                "action": f"No issues detected for {rid}. Maintain current assignment and estimation practices.",
+            })
 
-        # Completed items (baseline for productivity)
-        completed = [w for w in state.work_items
-                     if w.assigned_resource == rid
-                     and str(w.status).upper().startswith("COMPLET")]
         total_assigned = [w for w in state.work_items if w.assigned_resource == rid]
+        completed = [w for w in total_assigned if str(w.status).upper().startswith("COMPLET")]
 
-        person_stats[rid] = {
-            "resource_id": rid,
-            "name": getattr(r, "name", rid),
-            "primary_skill": r.primary_skill,
-            "secondary_skill": r.secondary_skill,
-            "total_assigned": len(total_assigned),
-            "completed_count": len(completed),
-            "overbilling_count": len(ob_items),
-            "spillover_count": len(sp_items),
-            "skill_mismatch_count": len(skill_mismatches),
-            "competency_gap_count": len(competency_gaps),
-            "high_severity_count": len(high_severity),
-            "avg_overrun_pct": round(avg_overrun),
-            "health": health,
-            "health_label": health_label,
-            "health_color": health_color,
-            "preventions": person_preventions,
+        people.append({
+            "resource_id":          rid,
+            "name":                 getattr(r, "name", rid),
+            "primary_skill":        r.primary_skill,
+            "secondary_skill":      r.secondary_skill,
+            "total_assigned":       len(total_assigned),
+            "completed_count":      len(completed),
+            "total_issues":         len(items),
+            "spillover_count":      sum(1 for i in items if i["is_spillover"]),
+            "overbilling_count":    sum(1 for i in items if not i["is_spillover"]),
+            "high_severity_count":  len(high_sev),
+            "avg_overrun_pct":      avg_overrun,
+            "root_cause_breakdown": dict(by_rc),
+            "health":               health,
+            "health_label":         health_label,
+            "health_color":         health_color,
+            "action_plan":          actions,
+        })
+
+    # ── Summary ────────────────────────────────────────────────────────────────
+    all_items = spillover_items + overbilling_items
+    rc_dist: Dict[str, int] = defaultdict(int)
+    for it in all_items:
+        rc_dist[it["root_cause"]] += 1
+
+    total_waste = sum(i["overrun_hrs"] for i in all_items if i.get("overrun_hrs"))
+
+    # Team-wide systemic recommendations
+    systemic = []
+    if rc_dist["GENUINE_SKILL_MISMATCH"] > 0:
+        systemic.append({
+            "trigger": "Genuine skill mismatches detected",
+            "finding": f"{rc_dist['GENUINE_SKILL_MISMATCH']} item(s) assigned to owners with no domain connection.",
+            "action":  "Introduce a mandatory skill-match gate in sprint planning. Before finalising assignments, each item's required skill must appear in the owner's primary or validated secondary skill list.",
+            "sprint":  "Next sprint planning",
+            "priority": "CRITICAL",
+        })
+    if rc_dist["RELATED_SKILL_COMPETENCY_GAP"] > 0:
+        systemic.append({
+            "trigger": "Related-skill competency gaps",
+            "finding": f"{rc_dist['RELATED_SKILL_COMPETENCY_GAP']} item(s) assigned within the correct domain family but with >35% effort overrun — the owner is not yet at full depth in the specific sub-skill.",
+            "action":  "Do not treat related skills as equivalent in estimation. Apply 1.4× buffer for related-skill items and schedule domain-specific upskilling (pairing, workshops, or deliberate practice items in the next sprint).",
+            "sprint":  "Next sprint planning",
+            "priority": "HIGH",
+        })
+    if (rc_dist["COMPETENCY_GAP_HIGH"] + rc_dist["COMPETENCY_GAP_MEDIUM"]) > 2:
+        systemic.append({
+            "trigger": "Systemic competency gaps on matched skills",
+            "finding": f"{rc_dist['COMPETENCY_GAP_HIGH'] + rc_dist['COMPETENCY_GAP_MEDIUM']} item(s) with correct skill assignment but consistent effort overruns — suggests the team is taking on tasks at the leading edge of their expertise faster than skill growth can keep up.",
+            "action":  "Build a sprint 'skill investment' budget: dedicate 10% of each sprint to deliberate practice items (lower stakes, high learning value). Review estimation accuracy per skill per person quarterly and update reference estimates from actuals.",
+            "sprint":  "Sprint planning review",
+            "priority": "HIGH",
+        })
+    if (rc_dist["CAPACITY_SQUEEZE_NOT_STARTED"] + rc_dist["CAPACITY_OVERCOMMIT"]) > 1:
+        systemic.append({
+            "trigger": "Recurring capacity overcommitment",
+            "finding": f"{rc_dist['CAPACITY_SQUEEZE_NOT_STARTED'] + rc_dist['CAPACITY_OVERCOMMIT']} capacity-driven events across {getattr(hist,'sprints_analysed',0)} sprints. Sprint velocity is being set by aspiration, not by data.",
+            "action":  "Set sprint commitment to 80% of team capacity at planning. Use the rolling average of actual velocity from the last 3 sprints as the ceiling, not the theoretical capacity. Treat the 20% buffer as non-negotiable, not as slack to fill.",
+            "sprint":  "Immediately — enforce from next sprint",
+            "priority": "HIGH",
+        })
+    if rc_dist["DEPENDENCY_BLOCKED"] > 0:
+        systemic.append({
+            "trigger": "Dependency-driven spillover",
+            "finding": f"{rc_dist['DEPENDENCY_BLOCKED']} item(s) delayed by unresolved upstream dependencies at sprint start.",
+            "action":  "Add a dependency resolution check to the Definition of Ready. No item enters a sprint unless all its upstream dependencies are either done or have a confirmed completion date within the first 3 days of the sprint.",
+            "sprint":  "Implement in DoR template this sprint",
+            "priority": "MEDIUM",
+        })
+
+    historical_prevention = [
+        {
+            "trigger": r.trigger,
+            "action":  r.action,
+            "sprint_to_apply": r.sprint_to_apply,
+            "confidence": r.confidence,
+            "evidence": r.evidence[:3] if r.evidence else [],
         }
-
-    # ── Summary ───────────────────────────────────────────────────────────────
-    skill_mismatch_total = sum(1 for o in overbilling_items if o["root_cause"] == "SKILL_MISMATCH")
-    competency_gap_total = sum(1 for o in overbilling_items if o["root_cause"] == "COMPETENCY_GAP")
-    overbooked_total = sum(1 for s in spillover_items if s["root_cause"] == "OVERBOOKED")
-    total_wasted_hrs = sum(o["overrun_hrs"] for o in overbilling_items)
+        for r in (getattr(hist, "prevention_recommendations", []) or [])
+    ]
 
     summary = {
-        "sprints_analysed": getattr(hist, "sprints_analysed", 0),
-        "total_spillover_items": len(spillover_items),
-        "total_overbilling_items": len(overbilling_items),
-        "total_wasted_hrs": round(total_wasted_hrs, 1),
-        "skill_mismatch_count": skill_mismatch_total,
-        "competency_gap_count": competency_gap_total,
-        "overbooked_count": overbooked_total,
-        "people_needing_improvement": sum(
-            1 for p in person_stats.values() if p["health"] == "NEEDS_IMPROVEMENT"
-        ),
-        "people_to_watch": sum(1 for p in person_stats.values() if p["health"] == "WATCH"),
-        "historical_summary": getattr(hist, "summary", ""),
-        "prevention_recommendations": [
-            {
-                "trigger": r.trigger,
-                "action": r.action,
-                "sprint_to_apply": r.sprint_to_apply,
-                "confidence": r.confidence,
-                "evidence": (r.evidence[:3] if r.evidence else []),
-            }
-            for r in (getattr(hist, "prevention_recommendations", []) or [])
-        ],
+        "sprints_analysed":       getattr(hist, "sprints_analysed", 0),
+        "total_spillover":        len(spillover_items),
+        "total_overbilling":      len(overbilling_items),
+        "total_wasted_hrs":       round(total_waste, 1),
+        "root_cause_distribution": dict(rc_dist),
+        "people_critical":        sum(1 for p in people if p["health"] == "NEEDS_IMPROVEMENT"),
+        "people_watch":           sum(1 for p in people if p["health"] == "WATCH"),
+        "systemic_actions":       systemic,
+        "historical_prevention":  historical_prevention,
+        "overall_summary":        getattr(hist, "summary", ""),
     }
 
     return ApiResponse(
         success=True,
         message="Sprint health analysis retrieved",
         data={
-            "summary": summary,
-            "people": list(person_stats.values()),
+            "summary":         summary,
+            "people":          people,
             "spillover_items": spillover_items,
             "overbilling_items": overbilling_items,
         },

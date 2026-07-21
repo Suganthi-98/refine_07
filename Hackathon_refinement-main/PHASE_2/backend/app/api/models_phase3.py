@@ -195,12 +195,18 @@ class ForecastSteeringBrief(BaseModel):
     scope_growth_percent: float = 0.0
     scope_note: Optional[str] = None
     top_blockers: List[ForecastSteeringBlocker] = Field(default_factory=list)
+    total_open_blockers: int = Field(
+        0, description="Total open blockers, independent of how many are in top_blockers"
+    )
     overloaded_resources: List[ForecastSteeringOverload] = Field(
         default_factory=list,
         description=(
             "Individuals over 100% allocation in an upcoming/in-progress sprint. "
             "A leading risk indicator that team-average spillover prediction can miss."
         ),
+    )
+    total_overloaded_resources: int = Field(
+        0, description="Total resource-sprint overload rows, independent of how many are returned"
     )
     decision_ask: str = Field(..., description="What management is being asked to decide/unblock")
     confidence_level: str = Field(..., description="HIGH | MEDIUM | LOW")

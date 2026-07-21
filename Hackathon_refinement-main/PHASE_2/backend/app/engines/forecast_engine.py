@@ -6,6 +6,8 @@ critical-path sequencing, spillover, and blocker impacts. No Monte Carlo,
 no probabilities.
 """
 from datetime import datetime, timedelta
+import re
+import difflib
 from typing import Optional, List, Dict, Any
 
 from app.domain.models import ProjectState, SprintStatus
@@ -31,6 +33,39 @@ from app.api.models_phase3 import (
 
 from app.engines.project_calibration import ProjectCalibration
 from app.engines import cognition_common as cc
+
+def _normalize_name(name: str) -> str:
+    """Lowercase, strip punctuation/initials-dots, collapse whitespace, so
+    'M. Balasubramanian' and 'Meena Balasubramanian' compare fairly."""
+    if not name:
+        return ""
+    cleaned = re.sub(r"[.\-_]", " ", name.strip().lower())
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned
+
+
+def _names_match(a: str, b: str) -> bool:
+    """Owner names across sheets (Blockers vs Team) are free text and can differ
+    in formatting even when they refer to the same person. Exact string
+    equality silently fails on 'M. Balasubramanian' vs 'Meena Balasubramanian'
+    or a stray trailing space -- this is what caused the blocker-owner /
+    overloaded-resource cross-reference to be fragile. Match on: exact
+    normalized string, one being a token-subset of the other (handles initials
+    and missing middle names), or a high fuzzy-similarity ratio as a fallback."""
+    na, nb = _normalize_name(a), _normalize_name(b)
+    if not na or not nb:
+        return False
+    if na == nb:
+        return True
+    tokens_a, tokens_b = set(na.split()), set(nb.split())
+    # Drop single-letter tokens (initials) from the subset check so "M" vs
+    # "Meena" doesn't force a match on initials alone, but real name tokens do.
+    real_a = {t for t in tokens_a if len(t) > 1}
+    real_b = {t for t in tokens_b if len(t) > 1}
+    if real_a and real_b and (real_a <= tokens_b or real_b <= tokens_a):
+        return True
+    return difflib.SequenceMatcher(None, na, nb).ratio() >= 0.85
+
 
 class ForecastEngine:
     """Deterministic forecast engine.
@@ -242,6 +277,7 @@ class ForecastEngine:
             scope_impact_days=scope_impact_days,
             sprint_days=sprint_days,
             confidence_level=confidence.confidence_level,
+            velocity_std_dev_pct=_cal.velocity_std_dev_pct,
         )
         forecast_drivers = self._build_forecast_drivers(
             scope_impact_days=scope_impact_days,
@@ -356,6 +392,7 @@ class ForecastEngine:
         scope_impact_days: float,
         sprint_days: float,
         confidence_level: str,
+        velocity_std_dev_pct: float = 0.15,
     ) -> ForecastSteeringBrief:
         """Build the manager-facing steering-meeting summary.
 
@@ -400,13 +437,14 @@ class ForecastEngine:
                 )
 
         overloaded_resources: List[ForecastSteeringOverload] = []
+        total_overloaded_resources = 0
         try:
             loads = getattr(self.metrics, "resource_sprint_loads", None) or {}
-            blocker_owners_early = {
-                (getattr(b, "owner", None) or "").strip().lower()
+            blocker_owner_names_early = [
+                getattr(b, "owner", None)
                 for b in cc.open_blockers(self.project_state)
                 if getattr(b, "owner", None)
-            }
+            ]
             sprint_by_id_early = {s.sprint_id: s for s in self.project_state.sprints}
             active_sprint_ids_early = {
                 s.sprint_id for s in self.project_state.sprints
@@ -423,25 +461,35 @@ class ForecastEngine:
                         sprint_id=sprint_id,
                         sprint_name=getattr(sprint, "sprint_name", sprint_id),
                         load_pct=float(round(ratio * 100.0, 0)),
-                        is_blocker_owner=resource_name.strip().lower() in blocker_owners_early,
+                        is_blocker_owner=any(_names_match(resource_name, o) for o in blocker_owner_names_early),
                     ))
             rows_early.sort(key=lambda r: (not r.is_blocker_owner, -r.load_pct))
-            overloaded_resources = rows_early[:5]
+            total_overloaded_resources = len(rows_early)
+            overloaded_resources = rows_early  # keep the full list; UI decides how much to show, with a count to avoid silent truncation
         except Exception:
             overloaded_resources = []
+            total_overloaded_resources = 0
 
         # spillover_days now genuinely factors in per-resource overload (see
         # SpilloverAnalysisEngine._resource_overload_excess_hours), not just
         # team-wide sprint utilization. The caveat below is only for the residual
         # case where overload exists but is too small to move spillover_days at
         # the current item-size granularity.
+        def _name_overloads(resources):
+            # Name everyone, don't silently truncate -- a dropped name in a
+            # steering-meeting caption reads as "not a risk" when it is one.
+            parts = [f"{r.resource_name} ({r.load_pct:.0f}% in {r.sprint_name})" for r in resources]
+            if len(parts) <= 3:
+                return ", ".join(parts)
+            return ", ".join(parts[:3]) + f", +{len(parts) - 3} more"
+
         if spillover_days > 0 and overloaded_resources:
-            names = ", ".join(f"{r.resource_name} ({r.load_pct:.0f}% in {r.sprint_name})" for r in overloaded_resources[:2])
+            names = _name_overloads(overloaded_resources)
             spillover_detail = f"Includes overload from {names}, on top of standard sprint-capacity risk."
         elif spillover_days > 0:
             spillover_detail = "Extra days from items expected to carry over into future sprints."
         elif overloaded_resources:
-            names = ", ".join(f"{r.resource_name} ({r.load_pct:.0f}% in {r.sprint_name})" for r in overloaded_resources[:2])
+            names = _name_overloads(overloaded_resources)
             spillover_detail = (
                 f"{names} " + ("are" if len(overloaded_resources) > 1 else "is")
                 + " over-allocated, but not by enough to move the day estimate yet — worth watching. See Resource overload below."
@@ -480,9 +528,11 @@ class ForecastEngine:
 
         # Named, owned blockers for the room to make a decision on.
         top_blockers: List[ForecastSteeringBlocker] = []
+        total_open_blockers = 0
         try:
             cp_ids = cc.critical_path_ids(self.cp_result)
             open_blockers = cc.open_blockers(self.project_state)
+            total_open_blockers = len(open_blockers)
             ranked = sorted(open_blockers, key=cc.blocker_delay_days, reverse=True)
             for b in ranked[:3]:
                 top_blockers.append(ForecastSteeringBlocker(
@@ -497,12 +547,17 @@ class ForecastEngine:
                 ))
         except Exception:
             top_blockers = []
+            total_open_blockers = 0
 
-        # Status thresholds: within one sprint late = at risk (recoverable in-cycle),
-        # beyond that = late (needs a scope/timeline/resourcing decision).
+        # Status thresholds, calibrated to this project's own velocity noise rather
+        # than a flat "1 sprint" for every project: a project with more natural
+        # sprint-to-sprint variance (higher velocity_std_dev_pct) should tolerate a
+        # bit more slip before calling it LATE, since some of that slip is likely
+        # just normal variance rather than a real trend.
+        at_risk_threshold_days = max(sprint_days * (1.0 + velocity_std_dev_pct), 1.0)
         if expected_delay_days <= 0:
             status = "ON_TRACK"
-        elif expected_delay_days <= max(sprint_days, 1.0):
+        elif expected_delay_days <= at_risk_threshold_days:
             status = "AT_RISK"
         else:
             status = "LATE"
@@ -513,11 +568,25 @@ class ForecastEngine:
             headline = f"On track — projected to finish {finish_str}, {abs(expected_delay_days):.0f} day(s) ahead of the {target_str} target."
         else:
             headline = f"Projected {expected_delay_days:.0f} day(s) late — {finish_str} vs. the {target_str} target."
-        subheadline = f"{completion_pct * 100:.0f}% complete. " + (
-            f"Biggest driver: {max(waterfall, key=lambda d: d.days).label}." if any(d.days > 0 for d in waterfall) else "No active driver is adding delay beyond plan."
-        )
 
-        dominant = max(waterfall, key=lambda d: d.days) if any(d.days > 0 for d in waterfall) else None
+        # "Biggest driver" should acknowledge a near-tie rather than confidently
+        # naming a single winner that's barely ahead of the runner-up — e.g.
+        # blockers +7.0 vs spillover +6.5 shouldn't read as "the" driver is blockers.
+        positive_drivers = sorted([d for d in waterfall if d.days > 0], key=lambda d: d.days, reverse=True)
+        dominant = positive_drivers[0] if positive_drivers else None
+        near_tie = (
+            len(positive_drivers) >= 2
+            and dominant is not None
+            and (dominant.days - positive_drivers[1].days) <= max(0.5, dominant.days * 0.15)
+        )
+        if not positive_drivers:
+            driver_phrase = "No active driver is adding delay beyond plan."
+        elif near_tie:
+            driver_phrase = f"Driven jointly by {positive_drivers[0].label.lower()} and {positive_drivers[1].label.lower()}."
+        else:
+            driver_phrase = f"Biggest driver: {dominant.label}."
+        subheadline = f"{completion_pct * 100:.0f}% complete. {driver_phrase}"
+
         compounding_owner_overload = next((r for r in overloaded_resources if r.is_blocker_owner), None)
         if status == "ON_TRACK":
             decision_ask = "No decision needed this cycle — hold current plan and re-check next steering meeting."
@@ -527,9 +596,15 @@ class ForecastEngine:
                 f"{compounding_owner_overload.load_pct:.0f}% allocated in {compounding_owner_overload.sprint_name} — "
                 "reassign the blocker, add support, or expect the blocker to slip further."
             )
+        elif near_tie:
+            decision_ask = (
+                f"Needs a decision: {positive_drivers[0].label.lower()} and {positive_drivers[1].label.lower()} "
+                "are contributing similar amounts — address both, or the untouched one will still cause the slip."
+            )
         elif dominant and dominant.key == "blockers" and top_blockers:
             names = ", ".join(f"{b.blocker_id} ({b.owner or 'unassigned owner'})" for b in top_blockers[:2])
-            decision_ask = f"Needs a decision: escalate/resource the open blockers ({names}) or accept the schedule slip."
+            more = f", +{total_open_blockers - len(top_blockers)} more open" if total_open_blockers > len(top_blockers) else ""
+            decision_ask = f"Needs a decision: escalate/resource the open blockers ({names}{more}) or accept the schedule slip."
         elif dominant and dominant.key == "spillover":
             decision_ask = "Needs a decision: trim scope from upcoming sprints or accept the spillover-driven delay."
         elif dominant and dominant.key == "pace_scope" and scope_growth_percent and scope_growth_percent > 5:
@@ -555,7 +630,9 @@ class ForecastEngine:
             scope_growth_percent=scope_growth_percent,
             scope_note=scope_note,
             top_blockers=top_blockers,
-            overloaded_resources=overloaded_resources,
+            total_open_blockers=total_open_blockers,
+            overloaded_resources=overloaded_resources[:5],
+            total_overloaded_resources=total_overloaded_resources,
             decision_ask=decision_ask,
             confidence_level=confidence_level,
         )
