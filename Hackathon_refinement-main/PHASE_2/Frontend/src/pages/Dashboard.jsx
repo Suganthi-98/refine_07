@@ -8,10 +8,7 @@ import { ManagementSummary } from './ManagementSummary'
 
 const tabs = [
   { key: 'overview', label: 'Overview' },
-  { key: 'delivery_intelligence', label: '📋 Delivery Intelligence' },
-  { key: 'risk', label: 'Risk' },
-  { key: 'critical-path', label: 'Critical Path' },
-  { key: 'forecast', label: 'Forecast' },
+  { key: 'delivery_intelligence', label: 'Delivery Intelligence' },
   { key: 'recovery-plans', label: 'Recovery Plans' },
   { key: 'actions', label: 'Actions' },
   { key: 'compare', label: '📊 Compare' },
@@ -1638,9 +1635,7 @@ export function Dashboard({session, onReset}){
         <OverviewPage session={session} onNavigate={setActive} />
         <DelayDiagnosis session={session} />
       </>}
-      {active === 'risk' && <RiskPage session={session} />}
-      {active === 'critical-path' && <CriticalPathPage session={session} />}
-      {active === 'forecast' && <ForecastPage session={session} />}
+
       {active === 'recovery-plans' && <RecoveryPlansPage session={session} />}
       {active === 'actions' && <ActionsPage session={session} onSimulated={() => setActive('compare')} />}
       {active === 'compare' && <ReforecastPage session={session} />}
