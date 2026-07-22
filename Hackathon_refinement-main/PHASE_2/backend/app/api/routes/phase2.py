@@ -106,6 +106,19 @@ async def get_dependencies(session_id: str = Query(..., description="Session ID"
 
         # Build detailed critical path payload
         work_items_by_id = {wi.item_id: wi for wi in project_state.work_items}
+        resources_by_id = {r.resource_id: r for r in project_state.resources}
+
+        # Active blocker lookup: which items are currently blocked
+        blocked_item_ids: set = set()
+        blocker_reason_by_item: dict = {}
+        for blocker in project_state.blockers:
+            if not blocker.actual_resolution_date:
+                for iid in blocker.impacted_item_ids:
+                    blocked_item_ids.add(iid)
+                    blocker_reason_by_item.setdefault(iid, []).append(
+                        blocker.blocker_id
+                    )
+
         critical_path_details = []
         for item_id in cp_result.critical_path:
             work_item = work_items_by_id.get(item_id)
@@ -113,12 +126,76 @@ async def get_dependencies(session_id: str = Query(..., description="Session ID"
                 raise ValueError(
                     f"Critical path item '{item_id}' exists in DAG but was not found in project work items."
                 )
+            resource = resources_by_id.get(work_item.assigned_resource or "")
+            slack_h = cp_result.item_slack_map.get(item_id, 0.0)
+            is_blocked = item_id in blocked_item_ids
+            out_deg = dag.out_degree.get(item_id, 0)  # items this one blocks
+            in_deg = dag.in_degree.get(item_id, 0)   # items blocking this one
             critical_path_details.append({
                 "item_id": item_id,
                 "name": work_item.title,
                 "effort_hours": work_item.current_estimate_hrs,
-                "float_hours": cp_result.item_slack_map.get(item_id, 0.0),
+                "remaining_hours": work_item.remaining_effort_hrs,
+                "float_hours": slack_h,
                 "sprint_id": work_item.assigned_sprint,
+                "status": work_item.status.value if hasattr(work_item.status, "value") else str(work_item.status),
+                "assigned_resource": resource.name if resource else work_item.assigned_resource,
+                "is_blocked": is_blocked,
+                "blocking_count": out_deg,   # how many downstream items this node gates
+                "depends_on_count": in_deg,  # how many upstream items must finish first
+                "blocker_ids": blocker_reason_by_item.get(item_id, []),
+                "progress_pct": round(work_item.progress_pct * 100, 1),
+            })
+
+        # Build per-item risk detail for high-risk items
+        high_risk_item_details = []
+        for item_id in risk_scores.high_risk_items:
+            work_item = work_items_by_id.get(item_id)
+            if not work_item:
+                continue
+            resource = resources_by_id.get(work_item.assigned_resource or "")
+            slack_h = cp_result.item_slack_map.get(item_id, 0.0)
+            item_score = risk_scores.item_risk_scores.get(item_id, 0.0)
+            is_on_cp = item_id in set(cp_result.critical_path)
+            out_deg = dag.out_degree.get(item_id, 0)
+            cascade_depth = risk_scores.cascade_depth_map.get(item_id, 0)
+            is_blocked = item_id in blocked_item_ids
+
+            # Derive human-readable risk drivers (ranked by materiality)
+            drivers = []
+            if is_on_cp:
+                drivers.append("On the critical path — delay propagates to delivery date")
+            if is_blocked:
+                bids = blocker_reason_by_item.get(item_id, [])
+                drivers.append(f"Directly blocked ({', '.join(bids) or 'active blocker'})")
+            if out_deg >= 3:
+                drivers.append(f"Gates {out_deg} downstream items — high fan-out risk")
+            elif out_deg > 0:
+                drivers.append(f"Blocks {out_deg} downstream item{'s' if out_deg > 1 else ''}")
+            if cascade_depth >= 2:
+                drivers.append(f"Part of a {cascade_depth}-level dependency cascade")
+            if slack_h == 0:
+                drivers.append("Zero float — no scheduling flexibility")
+            elif slack_h < 8:
+                drivers.append(f"Very low float ({slack_h:.0f} h) — limited scheduling buffer")
+            if not drivers:
+                drivers.append(f"Composite risk score {item_score:.0%}")
+
+            high_risk_item_details.append({
+                "item_id": item_id,
+                "name": work_item.title,
+                "risk_score": round(item_score * 100, 1),
+                "status": work_item.status.value if hasattr(work_item.status, "value") else str(work_item.status),
+                "assigned_resource": resource.name if resource else work_item.assigned_resource,
+                "effort_hours": work_item.current_estimate_hrs,
+                "remaining_hours": work_item.remaining_effort_hrs,
+                "float_hours": slack_h,
+                "sprint_id": work_item.assigned_sprint,
+                "is_on_critical_path": is_on_cp,
+                "is_blocked": is_blocked,
+                "blocking_count": out_deg,
+                "cascade_depth": cascade_depth,
+                "risk_drivers": drivers,
             })
 
         response = DependenciesResponse(
@@ -141,6 +218,7 @@ async def get_dependencies(session_id: str = Query(..., description="Session ID"
             high_risk_items=risk_scores.high_risk_items,
             medium_risk_items=risk_scores.medium_risk_items,
             low_risk_items=risk_scores.low_risk_items,
+            high_risk_item_details=high_risk_item_details,
             active_blockers=[b.blocker_id for b in project_state.blockers if not b.actual_resolution_date],
             items_blocked=list(blocked_items),
             zero_slack_items=cp_result.items_on_critical_path,

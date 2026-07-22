@@ -1,582 +1,641 @@
 import React, { useState, useEffect } from 'react'
-import { AlertTriangle, ArrowRight, CheckCircle2, ChevronDown, ChevronUp } from 'lucide-react'
+import {
+  AlertTriangle, ChevronDown, ChevronRight, Info,
+  Clock, User, GitBranch, Zap, Shield, TrendingUp
+} from 'lucide-react'
 import { api } from '../api/client'
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-const fmt  = (iso, o = { day: 'numeric', month: 'short' }) =>
-  iso ? new Date(iso).toLocaleDateString('en-GB', o) : '—'
-const fmtL = (iso) => fmt(iso, { day: 'numeric', month: 'long', year: 'numeric' })
-const hrsToD = (h) => h != null ? Number((h / 8).toFixed(1)) : null
-
-function riskSig(s) {
-  if (s >= 61) return { color: 'text-rose-400',    bg: 'bg-rose-500/10',    border: 'border-rose-500/40',    bar: 'bg-rose-500',    word: 'High'   }
-  if (s >= 41) return { color: 'text-amber-400',   bg: 'bg-amber-400/10',   border: 'border-amber-400/40',   bar: 'bg-amber-400',   word: 'Medium' }
-  if (s >= 21) return { color: 'text-sky-400',     bg: 'bg-sky-500/10',     border: 'border-sky-500/30',     bar: 'bg-sky-500',     word: 'Low'    }
-  return             { color: 'text-emerald-400',  bg: 'bg-emerald-500/10', border: 'border-emerald-500/30', bar: 'bg-emerald-500', word: 'Low'    }
+function fmtShort(iso) {
+  if (!iso) return '—'
+  try { return new Date(iso).toLocaleDateString('en-GB', { day: 'numeric', month: 'short' }) }
+  catch { return iso }
 }
 
-const Pulse = ({ h = 'h-5', w = 'w-full' }) =>
-  <div className={`${h} ${w} rounded-xl animate-pulse bg-slate-800`} />
+function riskLevel(score) {
+  if (score >= 70) return { label: 'High',   bar: 'bg-rose-500',    text: 'text-rose-400',   border: 'border-rose-500/40' }
+  if (score >= 45) return { label: 'Medium', bar: 'bg-amber-400',   text: 'text-amber-400',  border: 'border-amber-400/40' }
+  return              { label: 'Low',    bar: 'bg-teal-400',    text: 'text-teal-400',   border: 'border-teal-400/40' }
+}
 
-function Card({ children, className = '' }) {
+function StatusPill({ status }) {
+  const s = (status || '').toLowerCase()
+  const cls = s.includes('progress') ? 'bg-blue-500/15 text-blue-300 border-blue-500/30'
+    : s.includes('block') ? 'bg-rose-500/15 text-rose-300 border-rose-500/30'
+    : s.includes('done') || s.includes('complet') ? 'bg-teal-500/15 text-teal-300 border-teal-500/30'
+    : 'bg-slate-700 text-slate-400 border-slate-600'
   return (
-    <div className={`rounded-2xl border border-slate-700 bg-slate-900 ${className}`}>
+    <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide ${cls}`}>
+      {status || 'Unknown'}
+    </span>
+  )
+}
+
+function Tooltip({ children, tip }) {
+  const [show, setShow] = useState(false)
+  return (
+    <span className="relative inline-block"
+      onMouseEnter={() => setShow(true)}
+      onMouseLeave={() => setShow(false)}>
       {children}
-    </div>
+      {show && (
+        <span className="absolute z-50 bottom-full left-1/2 -translate-x-1/2 mb-2 w-64 rounded-xl border border-slate-600 bg-slate-800 p-3 text-[11px] text-slate-300 shadow-2xl pointer-events-none">
+          {tip}
+        </span>
+      )}
+    </span>
   )
 }
 
-function SectionTitle({ eyebrow, title, sub }) {
-  return (
-    <div className="mb-5">
-      <p className="text-[10px] font-bold uppercase tracking-[0.3em] text-amber-400 mb-1">{eyebrow}</p>
-      {title && <h3 className="text-xl font-bold text-white">{title}</h3>}
-      {sub   && <p className="text-sm text-slate-400 mt-1">{sub}</p>}
-    </div>
-  )
-}
+// ── 1. High-Risk Items Panel ──────────────────────────────────────────────────
 
-// ══════════════════════════════════════════════════════════════════════════════
-// SECTION 1 — COMMIT DATE  (was Forecast tab)
-// Unique: concrete P50/P80/P95 dates. Overview shows % probability, not dates.
-// ══════════════════════════════════════════════════════════════════════════════
-
-function CommitDate({ sessionId }) {
-  const [mc,   setMc]   = useState(null)
-  const [loading, setL] = useState(true)
-
-  useEffect(() => {
-    if (!sessionId) return
-    api.monteCarlo(sessionId)
-      .then(r => { setMc(r?.monte_carlo ?? r); setL(false) })
-      .catch(() => setL(false))
-  }, [sessionId])
-
-  const stats  = mc?.statistics || {}
-  const p50    = stats.percentile_50 || mc?.most_likely_finish_date
-  const p80    = stats.percentile_80 || mc?.p80_finish_date
-  const p95    = stats.percentile_95 || mc?.p95_finish_date
-  const p10    = stats.percentile_10 || mc?.best_case_finish_date
-  const target = mc?.target_end_date
-  const delay  = stats.mean_delay_days
-  const count  = mc?.simulation_count
-
-  // position dots on the range bar
-  const allPts = [p10, p50, p80, p95].filter(Boolean).map(d => new Date(d).getTime())
-  const tMin   = Math.min(...allPts)
-  const tMax   = Math.max(...allPts)
-  const pos    = (iso) => tMax === tMin ? 0 : Math.round(((new Date(iso).getTime() - tMin) / (tMax - tMin)) * 100)
+function HighRiskItemsPanel({ deps }) {
+  const [expanded, setExpanded] = useState(null)
+  const items = deps?.high_risk_item_details || []
+  if (!items.length) return null
 
   return (
-    <Card>
-      <div className="p-6">
-        <SectionTitle
-          eyebrow={`Commit date · ${count ? count.toLocaleString() : '1,000'} Monte Carlo scenarios`}
-          title="What date do we commit to?"
-          sub="Overview shows the on-time probability. This answers the follow-up: which calendar date is safe to share with stakeholders?"
-        />
-
-        {loading ? (
-          <div className="space-y-3"><Pulse h="h-14" /><Pulse h="h-5" w="w-2/3" /></div>
-        ) : (
-          <>
-            {/* Hero — P80 is the commit number */}
-            <div className="flex flex-col sm:flex-row sm:items-end gap-6 pb-6 border-b border-slate-800 mb-6">
-              <div className="flex-1">
-                <p className="text-sm text-slate-400 mb-2">
-                  Share this date externally —
-                  <span className="text-white font-semibold"> 8 in 10 scenarios finish by here</span>
-                </p>
-                <p className="text-5xl font-extrabold text-white tracking-tight">{fmtL(p80)}</p>
-                {target && (
-                  <p className="mt-3 text-sm text-slate-500">
-                    Original target: <span className="text-white">{fmtL(target)}</span>
-                    {delay != null && delay > 0
-                      ? <span className="text-rose-400 font-semibold"> · running {Math.round(delay)} days late on average across all scenarios</span>
-                      : delay != null && delay <= 0
-                        ? <span className="text-emerald-400 font-semibold"> · P80 is within target</span>
-                        : null}
-                  </p>
-                )}
-              </div>
-            </div>
-
-            {/* Percentile range bar */}
-            {allPts.length > 1 && (
-              <div className="mb-6">
-                <p className="text-[10px] uppercase tracking-[0.2em] text-slate-500 mb-4">
-                  Completion window — all {count?.toLocaleString() ?? ''} scenarios
-                </p>
-                <div className="relative h-2.5 rounded-full bg-gradient-to-r from-emerald-500 via-amber-400 to-rose-500 mb-5">
-                  {[
-                    { iso: p50, color: 'bg-teal-400',   label: 'P50' },
-                    { iso: p80, color: 'bg-amber-400',  label: 'P80' },
-                    { iso: p95, color: 'bg-rose-500',   label: 'P95' },
-                  ].filter(d => d.iso).map(({ iso, color, label }) => (
-                    <div
-                      key={label}
-                      className={`absolute top-1/2 -translate-y-1/2 -translate-x-1/2 w-4 h-4 rounded-full border-2 border-slate-900 ${color}`}
-                      style={{ left: `${pos(iso)}%` }}
-                    />
-                  ))}
-                </div>
-                <div className="flex justify-between text-[11px] text-slate-500">
-                  <span>Earliest (P10): {fmt(p10)}</span>
-                  <span>Latest (P95): {fmt(p95)}</span>
-                </div>
-              </div>
-            )}
-
-            {/* Three cards */}
-            <div className="grid grid-cols-3 gap-3">
-              {[
-                { label: 'Optimistic (P50)', date: p50, note: 'Half of scenarios finish here — do not commit this date', color: 'text-teal-300', border: 'border-teal-500/20', bg: 'bg-teal-500/5', badge: false },
-                { label: 'Commit this (P80)', date: p80, note: 'Safe for stakeholder commitments', color: 'text-white', border: 'border-amber-400/50', bg: 'bg-amber-400/8', badge: true },
-                { label: 'Ceiling (P95)', date: p95, note: '1 in 20 scenarios runs past this — use for buffer planning', color: 'text-rose-300', border: 'border-rose-500/20', bg: 'bg-rose-500/5', badge: false },
-              ].map(({ label, date, note, color, border, bg, badge }) => (
-                <div key={label} className={`rounded-xl border ${border} ${bg} p-4`}>
-                  <p className={`text-[10px] uppercase tracking-[0.2em] mb-2 ${badge ? 'text-amber-400 font-bold' : 'text-slate-500'}`}>{label}</p>
-                  <p className={`text-2xl font-bold ${color}`}>{fmt(date)}</p>
-                  <p className="text-[10px] text-slate-500 mt-2 leading-relaxed">{note}</p>
-                </div>
-              ))}
-            </div>
-          </>
-        )}
+    <div className="rounded-2xl border border-rose-500/30 bg-slate-900 p-6">
+      <div className="flex items-start justify-between gap-4 mb-4">
+        <div>
+          <p className="text-[10px] uppercase tracking-[0.28em] text-rose-400 mb-1">High-risk items</p>
+          <h3 className="text-lg font-bold text-white">Why these items are flagged</h3>
+          <p className="text-xs text-slate-500 mt-0.5">Each item's risk drivers — click to expand</p>
+        </div>
+        <span className="flex-none rounded-full border border-rose-500/50 bg-rose-500/10 px-3 py-1 text-[11px] font-semibold text-rose-300">
+          {items.length} item{items.length !== 1 ? 's' : ''}
+        </span>
       </div>
-    </Card>
-  )
-}
 
-// ══════════════════════════════════════════════════════════════════════════════
-// SECTION 2 — RISK BREAKDOWN  (was Risk tab)
-// Unique: overall score, category scores with reasons, top drivers, sprint heatmap.
-// Overview shows root cause + chosen action — not the scored breakdown.
-// ══════════════════════════════════════════════════════════════════════════════
+      <div className="space-y-2">
+        {items.map((item) => {
+          const isOpen = expanded === item.item_id
+          const riskPct = Math.min(item.risk_score ?? 0, 100)
+          const rl = riskLevel(riskPct)
+          return (
+            <div key={item.item_id}
+              className={`rounded-xl border ${rl.border} bg-slate-950 overflow-hidden`}>
+              {/* Row header */}
+              <button
+                className="w-full flex items-center gap-3 px-4 py-3 text-left hover:bg-slate-800/40 transition-colors"
+                onClick={() => setExpanded(isOpen ? null : item.item_id)}>
+                <span className={`rounded-full border px-2.5 py-0.5 text-[11px] font-bold ${rl.border} ${rl.text}`}>
+                  {item.item_id}
+                </span>
+                <span className="flex-1 text-sm text-slate-200 font-medium truncate">{item.name}</span>
+                <div className="flex items-center gap-3 flex-none">
+                  {item.is_on_critical_path && (
+                    <span className="text-[10px] font-semibold text-amber-400 bg-amber-400/10 border border-amber-400/30 rounded-full px-2 py-0.5">
+                      Critical path
+                    </span>
+                  )}
+                  {item.is_blocked && (
+                    <span className="text-[10px] font-semibold text-rose-400 bg-rose-500/10 border border-rose-500/30 rounded-full px-2 py-0.5">
+                      Blocked
+                    </span>
+                  )}
+                  <StatusPill status={item.status} />
+                  <span className={`text-xs font-bold ${rl.text}`}>{riskPct.toFixed(0)}</span>
+                  {isOpen ? <ChevronDown className="h-4 w-4 text-slate-500" /> : <ChevronRight className="h-4 w-4 text-slate-500" />}
+                </div>
+              </button>
 
-const CAT_META = {
-  schedule:   { label: 'Schedule',   weight: '40%', q: 'Are we running late?' },
-  dependency: { label: 'Dependency', weight: '25%', q: 'Are blockers cascading?' },
-  resource:   { label: 'Resource',   weight: '20%', q: 'Is the team overloaded?' },
-  scope:      { label: 'Scope',      weight: '15%', q: 'Is scope growing?' },
-}
-
-function RiskBreakdown({ sessionId }) {
-  const [risk,    setRisk]   = useState(null)
-  const [loading, setL]      = useState(true)
-  const [openCat, setOpenCat]= useState(null)   // expanded category
-  const [showAll, setShowAll]= useState(false)  // show all drivers
-
-  useEffect(() => {
-    if (!sessionId) return
-    api.risk(sessionId)
-      .then(r => { setRisk(r?.risk_analysis ?? r); setL(false) })
-      .catch(() => setL(false))
-  }, [sessionId])
-
-  const overall  = Math.round(risk?.overall_risk_score ?? 0)
-  const oSig     = riskSig(overall)
-  const drivers  = risk?.top_risk_drivers ?? []
-  const sprints  = [...(risk?.sprint_risks ?? [])].sort((a, b) => a.sprint_id - b.sprint_id)
-  const conc     = risk?.blocker_risk_concentration ?? 0
-  const concPct  = Math.round(conc * 100)
-
-  const cats = risk ? [
-    { key: 'schedule',   data: risk.schedule_risk },
-    { key: 'dependency', data: risk.dependency_risk },
-    { key: 'resource',   data: risk.resource_risk },
-    { key: 'scope',      data: risk.scope_risk },
-  ] : []
-
-  const visibleDrivers = showAll ? drivers : drivers.slice(0, 3)
-
-  return (
-    <Card>
-      <div className="p-6">
-        <SectionTitle
-          eyebrow="Risk breakdown"
-          title="What is threatening the delivery date?"
-          sub="Overall score, category breakdown, and ranked actions. Root cause and decision already shown on Overview."
-        />
-
-        {loading ? (
-          <div className="space-y-3">{[1,2,3,4].map(i => <Pulse key={i} h="h-12" />)}</div>
-        ) : (
-          <>
-            {/* Overall score */}
-            <div className="flex items-center gap-4 mb-6">
-              <div className={`flex-none flex items-baseline gap-1 rounded-2xl border px-5 py-3 ${oSig.border} ${oSig.bg}`}>
-                <span className={`text-4xl font-extrabold ${oSig.color}`}>{overall}</span>
-                <span className="text-slate-600 text-sm">/100</span>
-              </div>
-              <div>
-                <p className={`text-xl font-bold ${oSig.color}`}>{oSig.word} risk</p>
-                <p className="text-sm text-slate-400 mt-0.5">
-                  {overall >= 61 ? 'Needs management action before next sprint.' :
-                   overall >= 41 ? 'Monitor closely — one escalation away.' :
-                                   'Project is in good shape.'}
-                </p>
-                <p className="text-[11px] text-slate-600 mt-1">
-                  Formula: 40% schedule + 25% dependency + 20% resource + 15% scope
-                </p>
-              </div>
-            </div>
-
-            {/* Blocker concentration callout */}
-            {concPct >= 40 && (
-              <div className={`flex items-start gap-3 rounded-xl border px-4 py-3 mb-5 ${concPct >= 60 ? 'border-rose-500/40 bg-rose-500/5' : 'border-amber-400/30 bg-amber-400/5'}`}>
-                <AlertTriangle className={`h-4 w-4 flex-none mt-0.5 ${concPct >= 60 ? 'text-rose-400' : 'text-amber-400'}`} />
-                <p className={`text-sm ${concPct >= 60 ? 'text-rose-200' : 'text-amber-200'}`}>
-                  <span className="font-bold">{concPct}% of the risk score</span> comes from a single active blocker.
-                  Resolving it drops the overall score from <span className="text-white font-semibold">{overall}</span> to approximately <span className="text-emerald-300 font-semibold">{overall - Math.round(overall * conc)}</span>.
-                  Highest-leverage action available.
-                </p>
-              </div>
-            )}
-
-            {/* Category bars — expandable */}
-            <div className="space-y-2 mb-6">
-              {cats.map(({ key, data }) => {
-                if (!data) return null
-                const s    = Math.round(data.score ?? 0)
-                const sig  = riskSig(s)
-                const meta = CAT_META[key]
-                const open = openCat === key
-                return (
-                  <div key={key} className={`rounded-xl border ${sig.border} overflow-hidden`}>
-                    <button
-                      onClick={() => setOpenCat(open ? null : key)}
-                      className="w-full flex items-center gap-4 px-4 py-3 text-left hover:bg-slate-800/40 transition-colors"
-                    >
-                      <div className="flex-1 min-w-0">
-                        <div className="flex items-center justify-between gap-2 mb-1.5">
-                          <span className="text-sm font-semibold text-white">{meta.label}</span>
-                          <div className="flex items-center gap-2">
-                            <span className={`text-xs font-bold ${sig.color}`}>{s}/100</span>
-                            <span className="text-[10px] text-slate-600">{meta.weight} of score</span>
-                            <span className={`text-[10px] uppercase font-bold px-2 py-0.5 rounded-full ${sig.bg} ${sig.color} border ${sig.border}`}>{sig.word}</span>
-                          </div>
+              {/* Expanded detail */}
+              {isOpen && (
+                <div className="px-4 pb-4 border-t border-slate-800">
+                  {/* Stats row */}
+                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mt-3 mb-4">
+                    {[
+                      { icon: Clock,    label: 'Remaining', value: `${(item.remaining_hours ?? 0).toFixed(0)} h` },
+                      { icon: User,     label: 'Owner',     value: item.assigned_resource || '—' },
+                      { icon: GitBranch,label: 'Blocks',    value: item.blocking_count > 0 ? `${item.blocking_count} item${item.blocking_count !== 1 ? 's' : ''}` : 'None' },
+                      { icon: Zap,      label: 'Float',     value: item.float_hours > 0 ? `${item.float_hours.toFixed(0)} h` : 'Zero' },
+                    ].map(({ icon: Icon, label, value }) => (
+                      <div key={label} className="rounded-lg bg-slate-900 border border-slate-700 px-3 py-2">
+                        <div className="flex items-center gap-1.5 mb-1">
+                          <Icon className="h-3 w-3 text-slate-500" />
+                          <span className="text-[10px] text-slate-500 uppercase tracking-wide">{label}</span>
                         </div>
-                        <div className="h-1.5 rounded-full bg-slate-800">
-                          <div className={`${sig.bar} h-1.5 rounded-full`} style={{ width: `${s}%` }} />
-                        </div>
+                        <p className="text-sm font-semibold text-white">{value}</p>
                       </div>
-                      {open ? <ChevronUp className="h-3.5 w-3.5 text-slate-500 flex-none" /> : <ChevronDown className="h-3.5 w-3.5 text-slate-500 flex-none" />}
-                    </button>
-                    {open && (data.reasons ?? []).length > 0 && (
-                      <div className="border-t border-slate-800 bg-slate-950/60 px-4 py-3">
-                        <p className="text-[10px] uppercase tracking-[0.2em] text-slate-600 mb-2">{meta.q}</p>
-                        <ul className="space-y-1.5">
-                          {data.reasons.map((r, i) => (
-                            <li key={i} className="flex items-start gap-2 text-xs text-slate-300 leading-relaxed">
-                              <span className="mt-1.5 flex-none w-1 h-1 rounded-full bg-slate-600" />
-                              {r}
-                            </li>
-                          ))}
-                        </ul>
-                      </div>
-                    )}
+                    ))}
                   </div>
-                )
-              })}
+
+                  {/* Risk drivers */}
+                  <p className="text-[10px] uppercase tracking-[0.2em] text-slate-500 mb-2">Risk drivers</p>
+                  <ul className="space-y-1.5">
+                    {(item.risk_drivers || []).map((d, i) => (
+                      <li key={i} className="flex items-start gap-2 text-xs text-slate-300">
+                        <span className="mt-0.5 h-1.5 w-1.5 rounded-full bg-rose-400 flex-none" />
+                        {d}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
             </div>
-
-            {/* Top risk drivers */}
-            {drivers.length > 0 && (
-              <div className="mb-6">
-                <div className="flex items-center justify-between mb-3">
-                  <p className="text-[10px] uppercase tracking-[0.25em] text-slate-500 font-semibold">
-                    Risk drivers — ranked by impact
-                  </p>
-                  <span className="text-[11px] text-slate-600">{drivers.length} total</span>
-                </div>
-                <div className="space-y-2">
-                  {visibleDrivers.map((d, i) => (
-                    <div key={i} className="rounded-xl border border-slate-800 bg-slate-950/60 p-4">
-                      <div className="flex items-start justify-between gap-3 mb-2">
-                        <div>
-                          <span className="text-[10px] uppercase tracking-[0.2em] text-slate-600">#{i + 1} · {d.category}</span>
-                          <p className="text-sm font-bold text-white mt-0.5">{d.title}</p>
-                        </div>
-                        <span className={`flex-none rounded-full border px-2.5 py-0.5 text-[10px] font-bold ${riskSig(d.score).border} ${riskSig(d.score).bg} ${riskSig(d.score).color}`}>
-                          {Math.round(d.score)}
-                        </span>
-                      </div>
-                      <p className="text-xs text-slate-400 leading-relaxed mb-2">{d.description}</p>
-                      <div className="flex items-start gap-1.5">
-                        <CheckCircle2 className="h-3.5 w-3.5 flex-none text-teal-400 mt-0.5" />
-                        <p className="text-xs text-teal-300 font-semibold">{d.recommendation_hint}</p>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-                {drivers.length > 3 && (
-                  <button
-                    onClick={() => setShowAll(s => !s)}
-                    className="mt-2 flex items-center gap-1.5 text-xs text-slate-400 hover:text-white transition-colors"
-                  >
-                    {showAll ? <ChevronUp className="h-3.5 w-3.5" /> : <ChevronDown className="h-3.5 w-3.5" />}
-                    {showAll ? 'Show fewer' : `Show ${drivers.length - 3} more driver${drivers.length - 3 > 1 ? 's' : ''}`}
-                  </button>
-                )}
-              </div>
-            )}
-
-            {/* Sprint risk heatmap */}
-            {sprints.length > 0 && (
-              <div>
-                <p className="text-[10px] uppercase tracking-[0.25em] text-slate-500 font-semibold mb-3">
-                  Risk by sprint — where does it peak?
-                </p>
-                <div className="space-y-2">
-                  {sprints.map(s => {
-                    const sc  = Math.round(s.risk_score ?? 0)
-                    const sig = riskSig(sc)
-                    return (
-                      <div key={s.sprint_id} className="flex items-center gap-3">
-                        <span className="flex-none text-xs text-slate-400 w-16">Sprint {s.sprint_id}</span>
-                        <div className="flex-1 h-2 rounded-full bg-slate-800">
-                          <div className={`${sig.bar} h-2 rounded-full`} style={{ width: `${sc}%` }} />
-                        </div>
-                        <span className={`flex-none text-xs font-bold w-8 text-right ${sig.color}`}>{sc}</span>
-                        <span className={`flex-none text-[10px] w-14 ${sig.color}`}>{sig.word}</span>
-                        {s.blocked_items > 0 && (
-                          <span className="flex-none text-[10px] text-rose-400">{s.blocked_items} blocked</span>
-                        )}
-                      </div>
-                    )
-                  })}
-                </div>
-              </div>
-            )}
-          </>
-        )}
+          )
+        })}
       </div>
-    </Card>
+    </div>
   )
 }
 
-// ══════════════════════════════════════════════════════════════════════════════
-// SECTION 3 — CRITICAL PATH DETAIL  (was Critical Path tab)
-// Unique: item names + effort + slack + sprint per item (tab showed only IDs).
-// Also carries: duration, growth, high/medium/low risk item lists.
-// ══════════════════════════════════════════════════════════════════════════════
+// ── 2. Critical Path ──────────────────────────────────────────────────────────
 
-function CriticalPathDetail({ sessionId }) {
-  const [deps,    setDeps] = useState(null)
-  const [loading, setL]   = useState(true)
+function CriticalPath({ sessionId }) {
+  const [deps, setDeps] = useState(null)
+  const [loading, setLoading] = useState(true)
+  const [selected, setSelected] = useState(null)
 
   useEffect(() => {
     if (!sessionId) return
     api.dependencies(sessionId)
-      .then(d => { setDeps(d); setL(false) })
-      .catch(() => setL(false))
+      .then(d => { setDeps(d); setLoading(false) })
+      .catch(() => setLoading(false))
   }, [sessionId])
 
-  const details   = deps?.critical_path_details ?? []
-  const chain     = deps?.critical_path ?? []
-  const highRisk  = deps?.high_risk_items   ?? []
-  const medRisk   = deps?.medium_risk_items ?? []
-  const lowRisk   = deps?.low_risk_items    ?? []
-  const blocked   = deps?.items_blocked     ?? []
-  const activeBl  = deps?.active_blockers   ?? []
-  const duration  = deps?.critical_path_duration_days
-  const origHrs   = deps?.critical_path_duration_hours_original
-  const growth    = deps?.critical_path_growth_percent
+  const chain = deps?.critical_path_details || []
+  const highRisk = Array.isArray(deps?.high_risk_items) ? deps.high_risk_items : []
+  const duration = deps?.critical_path_duration_days
+  const growth = deps?.critical_path_growth_percent
   const itemCount = deps?.critical_path_item_count ?? chain.length
-  const total     = deps?.total_work_items
-
-  const needsAction = details.filter(d => highRisk.includes(d.item_id) || blocked.includes(d.item_id))
-  const clean       = details.filter(d => !highRisk.includes(d.item_id) && !blocked.includes(d.item_id))
+  const selected_item = chain.find(n => n.item_id === selected)
 
   return (
-    <Card>
-      <div className="p-6">
-        <SectionTitle
-          eyebrow="Critical path · CPM"
-          title="Which items control the finish date?"
-          sub={`These ${itemCount} item${itemCount !== 1 ? 's' : ''} have zero slack. A delay on any one moves the delivery date. Everything else can slip without affecting it.`}
-        />
+    <div className="rounded-2xl border border-slate-700 bg-slate-900 p-6">
+      <div className="flex items-start justify-between gap-4 mb-1">
+        <div>
+          <p className="text-[10px] uppercase tracking-[0.28em] text-slate-500 mb-1">Critical path</p>
+          <h3 className="text-lg font-bold text-white">The chain that controls delivery</h3>
+          <p className="text-xs text-slate-500 mt-0.5">Click any node to see why it's on the path</p>
+        </div>
+        {highRisk.length > 0 && (
+          <span className="flex-none rounded-full border border-rose-500/50 bg-rose-500/10 px-3 py-1 text-[11px] font-semibold text-rose-300">
+            {highRisk.length} high-risk item{highRisk.length !== 1 ? 's' : ''}
+          </span>
+        )}
+      </div>
 
-        {loading ? (
-          <div className="space-y-2">{[1,2,3,4].map(i => <Pulse key={i} h="h-14" />)}</div>
-        ) : (
-          <>
-            {deps?.has_cycles && (
-              <div className="flex items-center gap-2 rounded-xl border border-rose-500 bg-rose-950/30 px-4 py-3 mb-5 text-sm font-semibold text-rose-200">
-                <AlertTriangle className="h-4 w-4 flex-none text-rose-400" />
-                Circular dependency — critical path cannot be trusted until resolved
+      {loading ? (
+        <p className="mt-4 text-sm text-slate-400">Loading dependency graph…</p>
+      ) : (
+        <>
+          {/* 3 stat blocks */}
+          <div className="mt-6 grid grid-cols-3 gap-6">
+            {[
+              { value: duration != null ? `${duration.toFixed(1)}d` : '—', sub: 'Path duration' },
+              { value: itemCount,                                           sub: 'Items on path' },
+              { value: growth != null ? `${growth.toFixed(1)}%` : '—',    sub: 'Growth vs baseline', warn: growth > 10 },
+            ].map(({ value, sub, warn }) => (
+              <div key={sub}>
+                <p className={`text-3xl font-bold ${warn ? 'text-amber-300' : 'text-white'}`}>{value}</p>
+                <p className="text-xs text-slate-500 mt-1">{sub}</p>
               </div>
-            )}
+            ))}
+          </div>
 
-            {/* 3 stat pills */}
-            <div className="grid grid-cols-3 gap-3 mb-6">
-              {[
-                {
-                  label: 'Path length',
-                  value: duration != null ? `${Number(duration).toFixed(1)} days` : '—',
-                  sub: origHrs != null ? `was ${(origHrs/8).toFixed(1)}d at baseline` : 'current estimate',
-                  warn: false,
-                },
-                {
-                  label: 'Items on path',
-                  value: itemCount,
-                  sub: total ? `out of ${total} total items` : '',
-                  warn: false,
-                },
-                {
-                  label: 'Scope growth',
-                  value: growth != null ? `+${growth.toFixed(1)}%` : '—',
-                  sub: growth > 15 ? 'Significant — added days to delivery chain'
-                     : growth > 5  ? 'Moderate — monitor for further additions'
-                     :               'Within acceptable range',
-                  warn: growth > 5,
-                },
-              ].map(({ label, value, sub, warn }) => (
-                <div key={label} className={`rounded-xl border p-4 ${warn ? 'border-amber-400/40 bg-amber-400/5' : 'border-slate-700 bg-slate-950/50'}`}>
-                  <p className="text-[10px] uppercase tracking-[0.2em] text-slate-500 mb-1">{label}</p>
-                  <p className={`text-2xl font-bold ${warn ? 'text-amber-300' : 'text-white'}`}>{value}</p>
-                  <p className={`text-[11px] mt-1 leading-relaxed ${warn ? 'text-amber-400' : 'text-slate-500'}`}>{sub}</p>
-                </div>
-              ))}
+          {/* Interactive chain */}
+          {chain.length > 0 && (
+            <div className="mt-6 overflow-x-auto pb-2">
+              <div className="inline-flex items-center gap-1 flex-nowrap min-w-full">
+                {chain.map((node, i) => {
+                  const isHigh = highRisk.includes(node.item_id)
+                  const isSelected = selected === node.item_id
+                  const isBlocked = node.is_blocked
+                  const hasZeroFloat = node.float_hours === 0
+
+                  const nodeCls = isSelected
+                    ? 'border-white bg-white text-slate-900 shadow-lg'
+                    : isBlocked
+                    ? 'border-rose-500 bg-rose-500/15 text-rose-200'
+                    : isHigh
+                    ? 'border-rose-500/60 bg-rose-500/10 text-rose-200'
+                    : 'border-slate-600 bg-slate-800 text-slate-200 hover:border-slate-400'
+
+                  return (
+                    <React.Fragment key={node.item_id + i}>
+                      <button
+                        onClick={() => setSelected(isSelected ? null : node.item_id)}
+                        className={`rounded-full border px-3 py-1.5 text-xs font-semibold whitespace-nowrap transition-all cursor-pointer flex-none ${nodeCls}`}>
+                        <span className="flex items-center gap-1.5">
+                          {node.item_id}
+                          {isBlocked && <span className="h-1.5 w-1.5 rounded-full bg-rose-400 flex-none" />}
+                          {!isBlocked && hasZeroFloat && <span className="h-1.5 w-1.5 rounded-full bg-amber-400 flex-none" />}
+                        </span>
+                      </button>
+                      {i < chain.length - 1 && (
+                        <div className="flex items-center gap-0.5 flex-none px-1">
+                          <div className="h-px w-3 bg-slate-600" />
+                          <div className="w-0 h-0 border-t-4 border-t-transparent border-b-4 border-b-transparent border-l-4 border-l-slate-600" />
+                        </div>
+                      )}
+                    </React.Fragment>
+                  )
+                })}
+              </div>
             </div>
+          )}
 
-            {/* Active blockers on path */}
-            {activeBl.length > 0 && (
-              <div className="flex items-start gap-3 rounded-xl border border-rose-500/40 bg-rose-500/5 px-4 py-3 mb-5">
-                <AlertTriangle className="h-4 w-4 flex-none text-rose-400 mt-0.5" />
+          {/* Node detail panel */}
+          {selected_item && (
+            <div className="mt-4 rounded-xl border border-slate-600 bg-slate-950 p-4">
+              <div className="flex items-start justify-between gap-3 mb-3">
                 <div>
-                  <p className="text-sm font-bold text-rose-200">
-                    {activeBl.length} active blocker{activeBl.length > 1 ? 's' : ''} on the critical path
-                  </p>
-                  <p className="text-xs text-slate-400 mt-0.5">
-                    {activeBl.join(', ')} — resolving {activeBl.length > 1 ? 'these' : 'this'} will pull the finish date forward
-                  </p>
+                  <p className="text-[10px] uppercase tracking-[0.2em] text-slate-500 mb-0.5">{selected_item.item_id}</p>
+                  <p className="text-sm font-semibold text-white">{selected_item.name}</p>
                 </div>
+                <StatusPill status={selected_item.status} />
               </div>
-            )}
 
-            {/* Items needing attention */}
-            {needsAction.length > 0 && (
-              <div className="mb-4">
-                <p className="text-[10px] uppercase tracking-[0.25em] text-rose-400 font-bold mb-2">
-                  ⚠ Needs attention ({needsAction.length})
-                </p>
-                <div className="space-y-2">
-                  {needsAction.map(item => {
-                    const isBlocked = blocked.includes(item.item_id)
-                    const isHigh    = highRisk.includes(item.item_id)
-                    const slack     = hrsToD(item.float_hours)
-                    const noRoom    = slack !== null && slack < 0.1
-                    return (
-                      <div key={item.item_id} className={`rounded-xl border px-4 py-3 ${isBlocked ? 'border-rose-500/40 bg-rose-500/5' : 'border-amber-400/30 bg-amber-400/5'}`}>
-                        <div className="flex items-start justify-between gap-3 mb-1.5">
-                          <div className="min-w-0">
-                            <span className="font-mono text-[11px] text-slate-500 mr-2">{item.item_id}</span>
-                            <span className="text-sm font-bold text-white">{item.name}</span>
-                          </div>
-                          <div className="flex gap-1.5 flex-none">
-                            {isBlocked && <span className="rounded-full border border-rose-500/50 bg-rose-500/10 px-2 py-0.5 text-[10px] font-bold text-rose-300">BLOCKED</span>}
-                            {isHigh    && <span className="rounded-full border border-amber-400/40 bg-amber-400/10 px-2 py-0.5 text-[10px] font-bold text-amber-300">HIGH RISK</span>}
-                          </div>
-                        </div>
-                        <div className="flex flex-wrap gap-4 text-[11px] text-slate-500">
-                          {item.sprint_id != null  && <span>Sprint {item.sprint_id}</span>}
-                          {item.effort_hours != null && <span>{hrsToD(item.effort_hours)}d effort</span>}
-                          <span className={noRoom ? 'text-rose-400 font-semibold' : ''}>
-                            {noRoom ? 'No room to slip — any delay hits the finish date'
-                                    : slack != null ? `${slack}d buffer before it impacts the finish date` : ''}
-                          </span>
-                        </div>
-                      </div>
-                    )
-                  })}
-                </div>
-              </div>
-            )}
-
-            {/* Clean items — condensed table */}
-            {clean.length > 0 && (
-              <div className="mb-5">
-                <p className="text-[10px] uppercase tracking-[0.25em] text-emerald-400 font-bold mb-2">
-                  ✓ On track ({clean.length})
-                </p>
-                <div className="rounded-xl border border-slate-700 bg-slate-950/40 divide-y divide-slate-800">
-                  {clean.map((item, i) => (
-                    <div key={item.item_id} className="flex items-center gap-3 px-4 py-2.5">
-                      <span className="font-mono text-[11px] text-slate-600 flex-none w-16 truncate">{item.item_id}</span>
-                      <span className="text-sm text-slate-300 flex-1 truncate">{item.name}</span>
-                      {item.sprint_id != null    && <span className="text-[11px] text-slate-500 flex-none">Sprint {item.sprint_id}</span>}
-                      {item.effort_hours != null && <span className="text-[11px] text-slate-500 flex-none">{hrsToD(item.effort_hours)}d</span>}
-                      {i < clean.length - 1      && <ArrowRight className="h-3 w-3 text-slate-700 flex-none" />}
-                    </div>
-                  ))}
-                </div>
-              </div>
-            )}
-
-            {/* Risk tier summary (high / medium / low counts) */}
-            {(highRisk.length > 0 || medRisk.length > 0) && (
-              <div className="grid grid-cols-3 gap-2">
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-3">
                 {[
-                  { label: 'High risk',   items: highRisk, color: 'text-rose-400',    border: 'border-rose-500/30',    bg: 'bg-rose-500/5'    },
-                  { label: 'Medium risk', items: medRisk,  color: 'text-amber-400',   border: 'border-amber-400/30',   bg: 'bg-amber-400/5'   },
-                  { label: 'Low risk',    items: lowRisk,  color: 'text-emerald-400', border: 'border-emerald-500/20', bg: 'bg-emerald-500/5' },
-                ].map(({ label, items, color, border, bg }) => (
-                  <div key={label} className={`rounded-xl border ${border} ${bg} px-3 py-2.5 text-center`}>
-                    <p className={`text-xl font-bold ${color}`}>{items.length}</p>
-                    <p className="text-[10px] text-slate-500 mt-0.5">{label}</p>
+                  { label: 'Effort',     value: `${(selected_item.effort_hours || 0).toFixed(0)} h` },
+                  { label: 'Remaining',  value: `${(selected_item.remaining_hours || 0).toFixed(0)} h` },
+                  { label: 'Float',      value: selected_item.float_hours > 0 ? `${selected_item.float_hours.toFixed(0)} h` : 'Zero — critical' },
+                  { label: 'Owner',      value: selected_item.assigned_resource || '—' },
+                ].map(({ label, value }) => (
+                  <div key={label} className="rounded-lg bg-slate-900 border border-slate-700 px-3 py-2">
+                    <p className="text-[10px] text-slate-500 uppercase tracking-wide mb-0.5">{label}</p>
+                    <p className="text-xs font-semibold text-white">{value}</p>
                   </div>
                 ))}
               </div>
-            )}
-          </>
-        )}
-      </div>
-    </Card>
+
+              {/* Why it's on the critical path */}
+              <p className="text-[10px] uppercase tracking-[0.2em] text-slate-500 mb-1.5">Why it controls delivery</p>
+              <ul className="space-y-1">
+                {[
+                  selected_item.float_hours === 0 && 'Zero float — any delay here shifts the finish date by the same amount',
+                  selected_item.blocking_count > 0 && `Gates ${selected_item.blocking_count} downstream item${selected_item.blocking_count !== 1 ? 's' : ''} — nothing after it can start until it finishes`,
+                  selected_item.is_blocked && `Currently blocked (${(selected_item.blocker_ids || []).join(', ') || 'active blocker'}) — resolution needed before work can proceed`,
+                  selected_item.depends_on_count > 0 && `Depends on ${selected_item.depends_on_count} upstream item${selected_item.depends_on_count !== 1 ? 's' : ''} completing first`,
+                  selected_item.progress_pct < 50 && `${selected_item.progress_pct.toFixed(0)}% complete — more than half the work remains`,
+                ].filter(Boolean).map((reason, i) => (
+                  <li key={i} className="flex items-start gap-2 text-xs text-slate-300">
+                    <span className="mt-0.5 h-1.5 w-1.5 rounded-full bg-amber-400 flex-none" />
+                    {reason}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+
+          {/* Legend */}
+          <div className="mt-4 flex flex-wrap gap-4 text-[11px] text-slate-500">
+            <span className="flex items-center gap-1.5"><span className="h-1.5 w-1.5 rounded-full bg-rose-400" /> Blocked</span>
+            <span className="flex items-center gap-1.5"><span className="h-1.5 w-1.5 rounded-full bg-amber-400" /> Zero float</span>
+            <span className="flex items-center gap-1.5 text-slate-600">Click any node for detail</span>
+          </div>
+
+          {deps?.has_cycles && (
+            <div className="mt-3 flex items-center gap-2 rounded-xl border border-rose-500 bg-rose-950/40 px-4 py-3 text-sm font-semibold text-rose-200">
+              <AlertTriangle className="h-4 w-4 flex-none text-rose-400" />
+              Circular dependency detected — requires immediate resolution
+            </div>
+          )}
+        </>
+      )}
+    </div>
   )
 }
 
-// ══════════════════════════════════════════════════════════════════════════════
-// MAIN
-// ══════════════════════════════════════════════════════════════════════════════
+// ── 3. Risk Concentration ─────────────────────────────────────────────────────
+
+function RiskConcentration({ sessionId }) {
+  const [risk, setRisk] = useState(null)
+  const [loading, setLoading] = useState(true)
+  const [expanded, setExpanded] = useState(null)
+
+  useEffect(() => {
+    if (!sessionId) return
+    api.risk(sessionId)
+      .then(r => { setRisk(r?.risk_analysis ?? r?.risk_assessment ?? r); setLoading(false) })
+      .catch(() => setLoading(false))
+  }, [sessionId])
+
+  const overall = Math.round(risk?.overall_risk_score ?? 0)
+
+  const cats = risk ? [
+    {
+      key: 'schedule',   label: 'Schedule',
+      score: risk.schedule_risk?.score,
+      reasons: risk.schedule_risk?.reasons || [],
+      drivers: risk.schedule_risk?.drivers || [],
+    },
+    {
+      key: 'dependency', label: 'Dependency',
+      score: risk.dependency_risk?.score,
+      reasons: risk.dependency_risk?.reasons || [],
+      drivers: risk.dependency_risk?.drivers || [],
+    },
+    {
+      key: 'resource',   label: 'Resource',
+      score: risk.resource_risk?.score,
+      reasons: risk.resource_risk?.reasons || [],
+      drivers: risk.resource_risk?.drivers || [],
+    },
+    {
+      key: 'scope',      label: 'Scope',
+      score: risk.scope_risk?.score,
+      reasons: risk.scope_risk?.reasons || [],
+      drivers: risk.scope_risk?.drivers || [],
+    },
+  ].filter(c => c.score !== undefined) : []
+
+  return (
+    <div className="rounded-2xl border border-slate-700 bg-slate-900 p-6 w-full xl:w-80 flex-none">
+      <div className="flex items-start justify-between gap-2 mb-1">
+        <div>
+          <p className="text-[10px] uppercase tracking-[0.28em] text-slate-500 mb-1">Risk concentration</p>
+          <h3 className="text-lg font-bold text-white">Category breakdown</h3>
+          <p className="text-xs text-slate-500 mt-0.5">Expand any category for drivers</p>
+        </div>
+        {!loading && risk && (
+          <span className="flex-none text-xl font-extrabold text-white whitespace-nowrap">
+            {overall} <span className="text-slate-500 text-sm font-normal">/ 100</span>
+          </span>
+        )}
+      </div>
+
+      {loading ? (
+        <p className="mt-4 text-sm text-slate-400">Analysing…</p>
+      ) : (
+        <div className="mt-5 space-y-2">
+          {cats.map(({ key, label, score, reasons, drivers }) => {
+            const s = Math.round(score ?? 0)
+            const rl = riskLevel(s)
+            const isOpen = expanded === key
+            const allReasons = [
+              ...reasons,
+              ...(drivers || []).map(d => d.description || d.title).filter(Boolean)
+            ].filter((v, i, a) => a.indexOf(v) === i).slice(0, 5)
+
+            return (
+              <div key={key} className={`rounded-xl border ${rl.border} bg-slate-950 overflow-hidden`}>
+                <button
+                  className="w-full rounded-xl px-3 py-3 hover:bg-slate-800/30 transition-colors"
+                  onClick={() => setExpanded(isOpen ? null : key)}>
+                  <div className="flex items-center justify-between mb-2">
+                    <span className="text-sm text-slate-300 font-medium">{label}</span>
+                    <div className="flex items-center gap-2">
+                      <span className={`text-base font-bold ${rl.text}`}>{s}</span>
+                      {isOpen ? <ChevronDown className="h-3.5 w-3.5 text-slate-500" /> : <ChevronRight className="h-3.5 w-3.5 text-slate-500" />}
+                    </div>
+                  </div>
+                  <div className="h-1.5 rounded-full bg-slate-800">
+                    <div className={`${rl.bar} h-1.5 rounded-full transition-all`} style={{ width: `${Math.min(s, 100)}%` }} />
+                  </div>
+                  <div className="flex items-center justify-between mt-1.5">
+                    <span className={`text-[11px] ${rl.text}`}>{rl.label}</span>
+                    {allReasons.length > 0 && (
+                      <span className="text-[11px] text-slate-500">{allReasons.length} signal{allReasons.length !== 1 ? 's' : ''}</span>
+                    )}
+                  </div>
+                </button>
+
+                {isOpen && allReasons.length > 0 && (
+                  <div className="px-3 pb-3 border-t border-slate-800 pt-2.5">
+                    <ul className="space-y-1.5">
+                      {allReasons.map((r, i) => (
+                        <li key={i} className="flex items-start gap-2 text-[11px] text-slate-300">
+                          <span className={`mt-1 h-1.5 w-1.5 rounded-full flex-none ${rl.bar}`} />
+                          {r}
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+                {isOpen && allReasons.length === 0 && (
+                  <div className="px-3 pb-3 border-t border-slate-800 pt-2.5">
+                    <p className="text-[11px] text-slate-500 italic">No specific signals detected for this category.</p>
+                  </div>
+                )}
+              </div>
+            )
+          })}
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ── 4. Finish-Date Window ─────────────────────────────────────────────────────
+
+function FinishDateWindow({ sessionId }) {
+  const [mc, setMc] = useState(null)
+  const [forecast, setForecast] = useState(null)
+  const [loading, setLoading] = useState(true)
+  const [showAssumptions, setShowAssumptions] = useState(false)
+
+  useEffect(() => {
+    if (!sessionId) return
+    Promise.all([
+      api.monteCarlo(sessionId),
+      api.forecast(sessionId).catch(() => null),
+    ]).then(([m, f]) => {
+      setMc(m?.monte_carlo ?? m)
+      setForecast(f?.forecast ?? f)
+      setLoading(false)
+    }).catch(() => setLoading(false))
+  }, [sessionId])
+
+  const stats = mc?.statistics || {}
+  const p10 = stats.percentile_10
+  const p95 = stats.percentile_95
+  const assumptions = forecast?.forecast_assumptions || null
+  const confidence = forecast?.confidence_score != null
+    ? forecast.confidence_score
+    : forecast?.forecast_result?.confidence_score
+
+  const dotPositions = [50, 80, 95].map(p => {
+    const iso = stats[`percentile_${p}`]
+    if (!iso || !p10 || !p95) return { p, iso, left: 50 }
+    const min = new Date(p10).getTime()
+    const max = new Date(p95).getTime()
+    const val = new Date(iso).getTime()
+    const left = max === min ? 0 : Math.round(((val - min) / (max - min)) * 100)
+    return { p, iso, left }
+  })
+
+  const pCards = [
+    {
+      p: 50, label: 'P50 · Most likely', conf: '50% confidence',
+      tip: 'Half of all Monte Carlo runs finish on or before this date. Best for internal planning discussions.',
+      color: 'text-teal-300',
+    },
+    {
+      p: 80, label: 'P80 · Safe target', conf: '80% confidence',
+      tip: '80% of simulation runs complete by this date. Use this as your commitment to management — it leaves meaningful buffer.',
+      color: 'text-amber-300',
+    },
+    {
+      p: 95, label: 'P95 · Worst case', conf: '95% confidence',
+      tip: 'Only 5% of simulations run past this date. Use this for risk planning and external commitments where overrun is costly.',
+      color: 'text-rose-300',
+    },
+  ]
+
+  // Build assumption rows
+  const assumptionRows = assumptions ? [
+    { label: 'Velocity method',    value: assumptions.velocity_calculation_method },
+    { label: 'Blocker modelling',  value: assumptions.blocker_adjustment_method },
+    { label: 'Spillover method',   value: assumptions.spillover_adjustment_method },
+    { label: 'Critical path',      value: assumptions.critical_path_handling },
+    { label: 'Timeline anchoring', value: assumptions.timeline_anchoring },
+    ...(assumptions.capacity_assumptions
+      ? Object.entries(assumptions.capacity_assumptions).map(([k, v]) => ({ label: k, value: String(v) }))
+      : []),
+  ] : []
+
+  return (
+    <div className="rounded-2xl border border-slate-700 bg-slate-900 p-6 flex-1 min-w-0">
+      {/* Header */}
+      <div className="flex items-start justify-between gap-4 mb-1">
+        <div>
+          <p className="text-[10px] uppercase tracking-[0.28em] text-slate-500 mb-1">Finish-date window</p>
+          <h3 className="text-lg font-bold text-white">Plan against a range</h3>
+          {confidence != null && (
+            <p className="text-xs text-teal-400 mt-0.5">
+              Forecast confidence: {Math.round(confidence * 100)}%
+            </p>
+          )}
+        </div>
+        <div className="flex items-center gap-2 flex-none">
+          {assumptionRows.length > 0 && (
+            <button
+              onClick={() => setShowAssumptions(v => !v)}
+              className="flex items-center gap-1.5 rounded-full border border-slate-600 bg-slate-800 px-3 py-1 text-[11px] font-semibold text-slate-300 hover:border-slate-400 transition-colors">
+              <Info className="h-3 w-3" />
+              Assumptions
+            </button>
+          )}
+          <span className="rounded-full border border-slate-600 bg-slate-800 px-3 py-1 text-[11px] font-semibold text-slate-300">
+            P50 to P95
+          </span>
+        </div>
+      </div>
+
+      {/* Assumptions panel */}
+      {showAssumptions && assumptionRows.length > 0 && (
+        <div className="mt-4 rounded-xl border border-slate-700 bg-slate-950 p-4">
+          <p className="text-[10px] uppercase tracking-[0.2em] text-slate-500 mb-3">How these dates were calculated</p>
+          <div className="space-y-2">
+            {assumptionRows.map(({ label, value }) => (
+              <div key={label} className="flex gap-3 text-[11px]">
+                <span className="text-slate-500 flex-none w-36">{label}</span>
+                <span className="text-slate-300">{value}</span>
+              </div>
+            ))}
+          </div>
+          <div className="mt-3 pt-3 border-t border-slate-800 space-y-1 text-[11px] text-slate-500">
+            <p>⚠ Calendar holidays and leave are not modelled — dates may be optimistic.</p>
+            <p>⚠ Parallel execution is not resource-scheduled — assumes serial critical path.</p>
+          </div>
+        </div>
+      )}
+
+      {loading ? (
+        <p className="mt-4 text-sm text-slate-400">Running simulations…</p>
+      ) : (
+        <>
+          {/* Range bar */}
+          <div className="mt-6 mb-5 relative">
+            <div className="h-2 rounded-full bg-gradient-to-r from-teal-500 via-amber-400 to-rose-500" />
+            {dotPositions.map(({ p, left }) => (
+              <div
+                key={p}
+                className="absolute -top-1.5 w-5 h-5 rounded-full border-2 border-slate-900 -translate-x-1/2"
+                style={{
+                  left: `${left}%`,
+                  backgroundColor: p === 50 ? '#14b8a6' : p === 80 ? '#f59e0b' : '#f43f5e'
+                }}
+              />
+            ))}
+            <div className="flex justify-between mt-3 text-[11px] text-slate-500">
+              <span>{fmtShort(p10)}</span>
+              <span>{fmtShort(p95)}</span>
+            </div>
+          </div>
+
+          {/* P cards */}
+          <div className="grid grid-cols-3 gap-3 mt-6">
+            {pCards.map(({ p, label, conf, tip, color }) => {
+              const iso = stats[`percentile_${p}`]
+              return (
+                <div key={p} className="rounded-xl border border-slate-700 bg-slate-950 p-4 relative group">
+                  <p className="text-[10px] uppercase tracking-[0.2em] text-slate-500 mb-2">{label}</p>
+                  <p className={`text-2xl font-bold ${color}`}>{fmtShort(iso)}</p>
+                  <p className="text-[11px] text-slate-500 mt-1">{conf}</p>
+                  <Tooltip tip={tip}>
+                    <Info className="absolute top-3 right-3 h-3.5 w-3.5 text-slate-600 group-hover:text-slate-400 cursor-help transition-colors" />
+                  </Tooltip>
+                </div>
+              )
+            })}
+          </div>
+
+          {/* On-time probability */}
+          {mc?.on_time_probability != null && (
+            <div className="mt-4 flex items-center justify-between rounded-xl border border-slate-700 bg-slate-950 px-4 py-3">
+              <span className="text-xs text-slate-400">On-time delivery probability</span>
+              <span className={`text-sm font-bold ${
+                mc.on_time_probability >= 0.6 ? 'text-teal-300'
+                : mc.on_time_probability >= 0.4 ? 'text-amber-300'
+                : 'text-rose-300'
+              }`}>
+                {Math.round(mc.on_time_probability * 100)}%
+              </span>
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  )
+}
+
+// ── Main ─────────────────────────────────────────────────────────────────────
 
 export function ManagementSummary({ session }) {
   const sessionId = session?.project_summary?.session_id || ''
+  const [deps, setDeps] = useState(null)
+
+  useEffect(() => {
+    if (!sessionId) return
+    api.dependencies(sessionId)
+      .then(d => setDeps(d))
+      .catch(() => {})
+  }, [sessionId])
 
   return (
-    <div className="space-y-4 pb-6">
-
+    <div className="space-y-4">
       {/* Page header */}
       <div className="px-1">
-        <p className="text-[10px] font-bold uppercase tracking-[0.3em] text-amber-400 mb-1">
-          Delivery intelligence
-        </p>
-        <h2 className="text-3xl font-bold text-white">Dates, risk, and dependency math</h2>
-        <p className="text-sm text-slate-400 mt-1 max-w-2xl">
-          Status narrative, root cause, decision, blockers, and resource overload live on Overview.
-          This tab covers the three things a manager needs beyond that:
-          <span className="text-white"> what date to commit to</span>,
-          <span className="text-white"> what's threatening it and by how much</span>, and
-          <span className="text-white"> which specific items must not slip</span>.
+        <p className="text-[10px] uppercase tracking-[0.3em] text-amber-400 mb-1">Delivery intelligence</p>
+        <h2 className="text-3xl font-bold text-white">Dates and dependency math</h2>
+        <p className="mt-1 text-sm text-slate-400">
+          What delivery window are we planning against, and which chain controls it?
         </p>
       </div>
 
-      {/* 1 — Commit date */}
-      <CommitDate sessionId={sessionId} />
-
-      {/* 2 + 3 — Risk breakdown and critical path detail side by side on XL */}
-      <div className="grid gap-4 xl:grid-cols-2">
-        <RiskBreakdown sessionId={sessionId} />
-        <CriticalPathDetail sessionId={sessionId} />
+      {/* Top row — finish-date window + risk concentration */}
+      <div className="flex flex-col xl:flex-row gap-4">
+        <FinishDateWindow sessionId={sessionId} />
+        <RiskConcentration sessionId={sessionId} />
       </div>
 
+      {/* Critical path — full width, interactive */}
+      <CriticalPath sessionId={sessionId} />
+
+      {/* High-risk items — explainable, expandable */}
+      <HighRiskItemsPanel deps={deps} />
+
+      {/* Scope rule footer */}
       <p className="text-[11px] text-slate-600 px-1">
-        <span className="text-amber-500 font-semibold">Scope — </span>
-        People patterns and execution causes: Sprint Health. Recovery options: Recovery Plans.
+        <span className="text-amber-500 font-semibold">Scope rule</span>
+        {'  '}Keep this tab mathematical. Overview owns status and decisions. Sprint Health owns execution causes and people patterns.
       </p>
-
     </div>
   )
 }

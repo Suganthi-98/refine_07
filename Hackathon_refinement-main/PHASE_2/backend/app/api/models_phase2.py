@@ -51,8 +51,16 @@ class CriticalPathItem(BaseModel):
     item_id: str
     name: str
     effort_hours: float
+    remaining_hours: float = 0.0
     float_hours: float
     sprint_id: str
+    status: str = ""
+    assigned_resource: str = ""
+    is_blocked: bool = False
+    blocking_count: int = 0    # downstream items this node gates
+    depends_on_count: int = 0  # upstream items that must finish first
+    blocker_ids: List[str] = []
+    progress_pct: float = 0.0
 
 
 class DependenciesResponse(BaseModel):
@@ -82,6 +90,7 @@ class DependenciesResponse(BaseModel):
     high_risk_items: List[str]
     medium_risk_items: List[str]
     low_risk_items: List[str]
+    high_risk_item_details: List[Dict] = []  # Enriched per-item risk breakdown with drivers
     
     # Blocker impact
     active_blockers: List[str]
