@@ -4,10 +4,11 @@ Critical Path Analysis Engine
 Identifies longest path through dependency DAG and slack times.
 """
 
+from datetime import datetime
 from typing import List, Dict, Tuple, Optional
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
-from app.domain.models import ProjectState, WorkItem
+from app.domain.models import ProjectState, WorkItem, WorkItemStatus
 from app.engines.dependency_engine import DependencyGraphEngine, DependencyDAG
 
 
@@ -32,6 +33,10 @@ class CriticalPathResult(BaseModel):
     high_risk_items: List[str]  # Items on critical path
     num_critical_paths: int  # Multiple paths may exist with same length
 
+    # Calendar-anchoring diagnostics (see _forward_pass real-time-floor note)
+    calendar_shift_hours: float = 0.0  # How much the zero-anchored network was pushed forward by real elapsed time
+    calendar_floored_items: List[str] = Field(default_factory=list)  # Items whose earliest_start was pushed by the real-time floor
+
 
 class CriticalPathEngine:
     """Identifies critical path and slack times in project network."""
@@ -41,6 +46,23 @@ class CriticalPathEngine:
         self.dag = dag
         self.work_items = {wi.item_id: wi for wi in project_state.work_items}
         self.dep_engine = DependencyGraphEngine(project_state)
+
+        # Real-time floor: hours between project start and "today" (or a
+        # pinned as_of_date). Used by _forward_pass so a not-yet-complete
+        # item can never be scheduled as if it could still start back at
+        # project day zero -- if the calendar has already moved past a
+        # sprint's planned start and the item isn't done, the earliest it
+        # could possibly still start is "now", not "day 0". Without this,
+        # a stalled Sprint 6/7/8 item with no predecessors was treated by
+        # the zero-anchored network exactly like a healthy on-time item,
+        # and its lateness never propagated to successors.
+        project_start = project_state.project_info.forecast_anchor_date()
+        as_of = project_state.project_info.effective_as_of_date()
+        self._real_time_floor_hours = max(
+            0.0, (as_of - project_start).total_seconds() / 3600.0
+        )
+        self._sprints_by_name = {s.sprint_name: s for s in project_state.sprints}
+        self.calendar_floored_items: List[str] = []
     
     def analyze(self) -> CriticalPathResult:
         """Perform critical path analysis."""
@@ -96,7 +118,7 @@ class CriticalPathEngine:
         
         # Count parallel critical paths (approximation)
         num_cp = self._count_critical_paths(slack_map)
-        
+
         return CriticalPathResult(
             critical_path=critical_path,
             critical_path_items=critical_path,
@@ -110,6 +132,8 @@ class CriticalPathEngine:
             items_on_critical_path=critical_items,
             high_risk_items=critical_items,  # Critical path items are high risk
             num_critical_paths=num_cp,
+            calendar_shift_hours=self._real_time_floor_hours,
+            calendar_floored_items=sorted(set(self.calendar_floored_items)),
         )
     
     def _forward_pass(self) -> Tuple[Dict[str, float], Dict[str, float]]:
@@ -145,6 +169,28 @@ class CriticalPathEngine:
                     f"but not in ProjectState.work_items. "
                     f"This indicates DAG construction error."
                 )
+
+            # Real-time floor: a not-yet-complete item can never have an
+            # earliest_start earlier than "now" (self._real_time_floor_hours).
+            # This only changes anything when the predecessor-derived start
+            # is ALREADY in the past relative to today -- i.e. the item is
+            # genuinely stalled/late -- so it does not distort items that
+            # are legitimately scheduled for the future by their real
+            # dependency chain. This is what makes a stalled Sprint 6 item
+            # (or a late-starting Sprint 7/8 item) push its own finish time,
+            # and therefore every downstream successor's earliest_start,
+            # forward automatically instead of silently starting the whole
+            # network fresh at project day zero.
+            is_complete = (
+                work_item.status in (WorkItemStatus.COMPLETED, WorkItemStatus.DONE)
+                or (isinstance(work_item.status, str) and work_item.status in (
+                    WorkItemStatus.COMPLETED.value, WorkItemStatus.DONE.value,
+                ))
+            )
+            if not is_complete and earliest_start[node] < self._real_time_floor_hours:
+                earliest_start[node] = self._real_time_floor_hours
+                self.calendar_floored_items.append(node)
+
             duration = work_item.current_estimate_hrs
             earliest_finish[node] = earliest_start[node] + duration
         

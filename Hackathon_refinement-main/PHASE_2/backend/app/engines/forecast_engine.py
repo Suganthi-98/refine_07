@@ -195,26 +195,62 @@ class ForecastEngine:
         diagnostic_total = base_schedule_days + cp_remaining_days + spillover_days_diag + blocker_days_diag
 
         project_start = self.project_state.project_info.forecast_anchor_date()
+        as_of = self.project_state.project_info.effective_as_of_date()
         days_elapsed = self._calculate_schedule_elapsed_days(sprint_days)
+
+        # Diagnostic-only: what the OLD status-label-based method would have
+        # said, and the gap between that and real elapsed time. This is the
+        # "Calendar Variance" KPI -- it's what would have caught the Sprint
+        # 6/7/8 stall immediately instead of relying on the effort/velocity
+        # math to eventually notice.
+        status_derived_elapsed_days = self._status_derived_elapsed_days(sprint_days)
+        calendar_variance_days = float(round(days_elapsed - status_derived_elapsed_days, 2))
 
         # National holidays (Republic Day, Independence Day, Gandhi Jayanti) are
         # irregular and can't already be priced into the velocity average the way
         # recurring weekly weekends are (see working_calendar module docstring),
         # so they're added as explicit extra non-working days on top of the
-        # existing calendar-day math. Fixed-point iterate a few times since
-        # pushing the finish date further out can expose additional holidays
-        # that weren't in range on the first pass.
+        # existing calendar-day math.
+        #
+        # IMPORTANT: pad only the REMAINING window (as_of -> finish), not the
+        # whole project_start -> finish span. days_elapsed is now real elapsed
+        # calendar time (see _calculate_schedule_elapsed_days), so any holidays
+        # that already happened in the past are already correctly included in
+        # that real day count -- re-padding them here would double-count them.
+        # Only *future* holidays, between today and the projected finish, are
+        # genuinely extra non-working time the remaining-effort math doesn't
+        # already know about.
+        #
+        # Saturdays/Sundays are deliberately NOT added here even though the
+        # user-facing ask is "treat weekends as non-working": remaining_days_total
+        # is derived from a velocity computed as (daily_capacity_hrs * sprint.working_days),
+        # then converted back to calendar days via sprint_days -- so the
+        # calendar-day multiplier already spans the weekend days that sit
+        # inside that ratio. Explicitly padding weekends on top of that would
+        # double-count them and make the forecast unrealistically pessimistic
+        # in the opposite direction. Weekend non-working time IS made explicit
+        # and visible below via `non_working_days_in_remaining_window`, so
+        # managers can see it -- it's just not added a second time into the
+        # finish-date arithmetic where it's already priced in.
         holiday_padding_days = 0
-        finish_candidate = project_start + timedelta(days=days_elapsed + remaining_days_total)
+        finish_candidate = as_of + timedelta(days=remaining_days_total)
         for _ in range(5):
-            holidays_in_range = working_calendar.count_holidays_between(project_start, finish_candidate)
-            new_finish = project_start + timedelta(days=days_elapsed + remaining_days_total + holidays_in_range)
+            holidays_in_range = working_calendar.count_holidays_between(as_of, finish_candidate)
+            new_finish = as_of + timedelta(days=remaining_days_total + holidays_in_range)
             if new_finish == finish_candidate:
                 holiday_padding_days = holidays_in_range
                 break
             finish_candidate = new_finish
             holiday_padding_days = holidays_in_range
         expected_finish = finish_candidate
+
+        # Informational only (not added into expected_finish/expected_delay_days,
+        # see note above) -- total non-working calendar days, weekends included,
+        # sitting inside the remaining window. Lets a PM see "of the N remaining
+        # calendar days, M are weekends/holidays" without corrupting the math.
+        non_working_days_in_remaining_window = working_calendar.count_non_working_days_between(
+            as_of, finish_candidate
+        )
 
         target_end_date = self.project_state.project_info.target_end_date
         planned_window_days = float((target_end_date - project_start).days)
@@ -273,6 +309,10 @@ class ForecastEngine:
             diagnostic_total_days=float(round(diagnostic_total, 2)),
             velocity_floor_saturated_by_blockers=velocity_floor_saturated_by_blockers,
             spillover_message=spillover_message,
+            real_elapsed_days=float(round(days_elapsed, 2)),
+            status_derived_elapsed_days=float(round(status_derived_elapsed_days, 2)),
+            calendar_variance_days=calendar_variance_days,
+            non_working_days_in_remaining_window=int(non_working_days_in_remaining_window),
         )
         effort_breakdown = ForecastEffortBreakdown(
             raw_remaining_effort_hours=float(round(remaining_effort, 2)),
@@ -782,7 +822,40 @@ class ForecastEngine:
             return 0.0
 
     def _calculate_schedule_elapsed_days(self, sprint_days: float) -> float:
-        """Estimate elapsed project time using sprint schedule dates only."""
+        """Real elapsed calendar days since project start, anchored to the
+        actual current date (`ProjectInfo.effective_as_of_date()`, real
+        wall-clock time unless a demo/backtest snapshot date is pinned).
+
+        FIX (was `_status_derived_elapsed_days` below): the previous
+        implementation inferred elapsed time purely from sprint status
+        labels -- `completed_sprints * sprint_days` plus the in-progress
+        sprint's window capped at exactly one sprint length. That meant:
+          - an "In Progress" sprint running weeks past its planned end date
+            was still only ever credited with one sprint-length of elapsed
+            time -- the overrun vanished.
+          - a "Not Started" sprint whose planned start date had already
+            passed contributed ZERO elapsed days, no matter how overdue it
+            was, because the function never looked at what today's date
+            actually is.
+        A project stalled mid-sprint (exactly this project's Sprint 6/7/8
+        situation) therefore showed almost no schedule delay, because the
+        model's internal clock only advanced when a sprint's status field
+        changed -- not when actual calendar time passed. Anchoring to the
+        real current date fixes this unconditionally: a stalled sprint or a
+        late-starting one now shows up as delay immediately, with no
+        dependency on anyone updating a status dropdown.
+        """
+        project_start = self.project_state.project_info.forecast_anchor_date()
+        as_of = self.project_state.project_info.effective_as_of_date()
+        real_elapsed_days = max(0.0, (as_of - project_start).total_seconds() / (24 * 3600))
+        return real_elapsed_days
+
+    def _status_derived_elapsed_days(self, sprint_days: float) -> float:
+        """LEGACY method, retained only to compute `calendar_variance_days`
+        (real elapsed vs. what the sprint-status labels alone would imply)
+        as an explicit diagnostic -- see ForecastScheduleDiagnostics. Do NOT
+        use this for the actual forecast; it is the method that caused the
+        structural under-count described above."""
         completed_sprints = sum(
             1
             for sprint in self.project_state.sprints

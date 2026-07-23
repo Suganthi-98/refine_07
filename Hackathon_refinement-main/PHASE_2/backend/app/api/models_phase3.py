@@ -87,6 +87,37 @@ class ForecastScheduleDiagnostics(BaseModel):
         "",
         description="Narrative explanation of spillover impact on the forecast",
     )
+    real_elapsed_days: float = Field(
+        0.0,
+        description="Actual calendar days elapsed since project start, anchored to today's real date (or a pinned as_of_date).",
+    )
+    status_derived_elapsed_days: float = Field(
+        0.0,
+        description=(
+            "What elapsed days the old status-label-only method would report "
+            "(completed sprint count + capped in-progress window). Diagnostic "
+            "only -- no longer used to drive the forecast."
+        ),
+    )
+    calendar_variance_days: float = Field(
+        0.0,
+        description=(
+            "real_elapsed_days minus status_derived_elapsed_days. A large positive "
+            "value means the calendar has moved further than sprint status labels "
+            "suggest -- the signature of a stalled or late-starting sprint that "
+            "hasn't been re-labeled yet."
+        ),
+    )
+    non_working_days_in_remaining_window: int = Field(
+        0,
+        description=(
+            "Weekends + national holidays falling within the remaining forecast "
+            "window, for visibility only. Not added into expected_delay_days -- "
+            "weekly weekends are already implicit in the velocity-to-calendar-day "
+            "conversion (see forecast_engine docstring); adding them again here "
+            "would double-count them."
+        ),
+    )
 
 
 class ForecastEffortBreakdown(BaseModel):
@@ -655,3 +686,70 @@ class ScopeChangeResponse(BaseModel):
     updated_remaining_effort_hours: float = Field(..., ge=0.0, description="Remaining effort after scope change")
     forecast: ForecastResult = Field(..., description="Updated deterministic forecast")
     risk_analysis: RiskResult = Field(..., description="Updated risk analysis")
+
+
+# ---------------------------------------------------------------------------
+# PMO executive KPI suite (see app.engines.pmo_kpi_engine.PMOKpiEngine)
+#
+# These are diagnostic/explanatory KPIs for a PMO dashboard -- deliberately
+# separate from ForecastResult's single-point date forecast. They exist
+# because remaining-effort-over-velocity alone cannot answer "are we behind
+# plan RIGHT NOW" (SPI, sprint/milestone adherence), "is lateness spreading"
+# (critical path drift, dependency pressure), or "can we still recover"
+# (recovery feasibility) -- see the forecasting audit for the full rationale.
+# ---------------------------------------------------------------------------
+
+
+class ForecastConfidenceDecomposition(BaseModel):
+    """Confidence broken into independent components instead of one scalar.
+    A forecast can be effort-confident but calendar-unreliable (status labels
+    disagreeing with real dates) -- collapsing those into a single number
+    hides which lever a PM should actually pull to raise confidence."""
+
+    effort_confidence: float = Field(..., ge=0.0, le=1.0, description="Confidence in remaining-effort sizing (lower when scope growth is high)")
+    velocity_confidence: float = Field(..., ge=0.0, le=1.0, description="Confidence in projected velocity (lower when historical velocity is volatile)")
+    calendar_confidence: float = Field(..., ge=0.0, le=1.0, description="Confidence that sprint status labels reflect real calendar position (lower when calendar_variance_days is large)")
+    weakest_component: str = Field(..., description="Name of the lowest-scoring component -- the thing most worth fixing first")
+    overall_confidence_score: float = Field(..., ge=0.0, le=1.0, description="Existing ForecastConfidence.confidence_score, included for side-by-side comparison")
+
+
+class PMOKpiSuite(BaseModel):
+    """Executive PMO KPI suite. Computed from ProjectMetrics, ForecastResult,
+    and CriticalPathResult -- does not re-derive raw project data."""
+
+    # Schedule Performance Index: actual completion % vs. planned completion %
+    # for time elapsed so far. SPI < 1.0 = behind plan, > 1.0 = ahead.
+    schedule_performance_index: float = Field(..., description="actual_completion_pct / planned_completion_pct as of today")
+    planned_completion_pct: float = Field(..., ge=0.0, le=1.0, description="Fraction of the planned calendar window elapsed as of today")
+    actual_completion_pct: float = Field(..., ge=0.0, le=1.0, description="Fraction of total effort actually completed")
+
+    # Sprint / milestone adherence
+    sprint_adherence_index: float = Field(..., ge=0.0, le=1.0, description="Fraction of sprints already due (end_date <= today) that closed Completed")
+    sprints_due_count: int = Field(..., ge=0, description="Number of sprints whose planned end date has passed")
+    sprints_on_time_count: int = Field(..., ge=0, description="Number of due sprints that closed Completed")
+    milestone_adherence_score: float = Field(..., ge=0.0, le=1.0, description="Partial-credit average across due sprints (1.0 if closed, else avg item progress_pct)")
+
+    # Critical path drift
+    critical_path_drift_days: float = Field(..., description="Calendar days the critical path network was pushed forward by the real-time floor (see CriticalPathResult.calendar_shift_hours)")
+    critical_path_scope_growth_percent: float = Field(..., description="Growth in critical path duration vs. original estimates (passthrough of CriticalPathResult.critical_path_growth_percent)")
+    critical_path_floored_item_count: int = Field(..., ge=0, description="Number of items whose earliest_start was forced forward by the real-time floor -- i.e. currently stalled/late relative to plan")
+
+    # Dependency pressure
+    dependency_pressure_item_count: int = Field(..., ge=0, description="Distinct downstream items whose predecessor is currently stalled/late")
+    dependency_pressure_hours: float = Field(..., ge=0.0, description="Remaining effort hours sitting behind a stalled/late predecessor")
+
+    # Forecast confidence decomposition
+    confidence_decomposition: ForecastConfidenceDecomposition = Field(..., description="Confidence broken into effort / velocity / calendar components")
+
+    # Recovery feasibility
+    recovery_feasible: bool = Field(..., description="True if remaining effort can plausibly still fit inside the remaining planned window at max-observed sustainable velocity")
+    recovery_feasibility_margin_days: float = Field(..., description="Spare days if recoverable (positive) or shortfall days if not (negative), at max sustainable velocity")
+    max_sustainable_velocity: float = Field(..., description="Velocity used for the recovery feasibility test (avg + 1 std dev of historical velocity, i.e. best plausible sustained pace, not a one-off spike)")
+
+    # Calendar variance (passthrough from ForecastScheduleDiagnostics for convenience)
+    calendar_variance_days: float = Field(..., description="real_elapsed_days minus status-label-derived elapsed days -- large values mean sprint statuses are stale relative to the real calendar")
+
+    # Release readiness
+    release_readiness_index: float = Field(..., ge=0.0, le=1.0, description="Fraction of active blockers resolved -- a proxy for how close the project is to a clean release gate, independent of hours remaining")
+    open_blocker_count: int = Field(..., ge=0)
+    resolved_blocker_count: int = Field(..., ge=0)

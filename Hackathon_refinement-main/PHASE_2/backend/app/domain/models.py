@@ -169,6 +169,28 @@ class ProjectInfo(BaseModel):
         """Return the preferred date anchor for forecast calculations."""
         return self.start_date or self.release_date or self.target_end_date or datetime.utcnow()
 
+    as_of_date: Optional[datetime] = Field(
+        None,
+        description=(
+            "Optional override for 'today' used by real-clock schedule calculations "
+            "(e.g. real elapsed calendar days since project start). Leave unset in "
+            "production so the forecast always anchors to the real current date. "
+            "Set this only for a pinned demo/replay snapshot or a backtest, where "
+            "the workbook represents a fixed point in time rather than 'now'."
+        ),
+    )
+
+    def effective_as_of_date(self) -> datetime:
+        """The date the forecast should treat as 'today'. Real wall-clock time
+        unless explicitly pinned via `as_of_date`, rounded down to midnight.
+        Schedules are day-granularity by nature (sprints, working days,
+        holidays) -- snapping to the start of the day means every forecast
+        computed on the same calendar day returns an identical result, e.g.
+        two dashboard refreshes five minutes apart don't silently disagree
+        down to the microsecond."""
+        anchor = self.as_of_date or datetime.utcnow()
+        return datetime(anchor.year, anchor.month, anchor.day)
+
 
 class SkillCoverage(BaseModel):
     """
