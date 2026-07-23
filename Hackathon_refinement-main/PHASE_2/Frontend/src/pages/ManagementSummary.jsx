@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react'
 import {
-  AlertTriangle, ChevronDown, ChevronRight, Info,
-  Clock, User, GitBranch, Zap, Shield, TrendingUp
+  ChevronDown, ChevronRight,
+  Clock, User, GitBranch, Zap, Info, ArrowDown, Construction
 } from 'lucide-react'
 import { api } from '../api/client'
 
@@ -14,41 +14,455 @@ function fmtShort(iso) {
 }
 
 function riskLevel(score) {
-  if (score >= 70) return { label: 'High',   bar: 'bg-rose-500',    text: 'text-rose-400',   border: 'border-rose-500/40' }
-  if (score >= 45) return { label: 'Medium', bar: 'bg-amber-400',   text: 'text-amber-400',  border: 'border-amber-400/40' }
-  return              { label: 'Low',    bar: 'bg-teal-400',    text: 'text-teal-400',   border: 'border-teal-400/40' }
+  if (score >= 70) return { label: 'High',   bar: 'bg-rose-500',  text: 'text-rose-400',  border: 'border-rose-500/40',  bg: 'bg-rose-500/10'  }
+  if (score >= 45) return { label: 'Medium', bar: 'bg-amber-400', text: 'text-amber-400', border: 'border-amber-400/40', bg: 'bg-amber-400/10' }
+  return              { label: 'Low',    bar: 'bg-teal-400',  text: 'text-teal-400',  border: 'border-teal-500/40',  bg: 'bg-teal-500/10'  }
 }
 
 function StatusPill({ status }) {
   const s = (status || '').toLowerCase()
   const cls = s.includes('progress') ? 'bg-blue-500/15 text-blue-300 border-blue-500/30'
-    : s.includes('block') ? 'bg-rose-500/15 text-rose-300 border-rose-500/30'
+    : s.includes('block')            ? 'bg-rose-500/15 text-rose-300 border-rose-500/30'
     : s.includes('done') || s.includes('complet') ? 'bg-teal-500/15 text-teal-300 border-teal-500/30'
-    : 'bg-slate-700 text-slate-400 border-slate-600'
+    : 'bg-slate-700/50 text-slate-400 border-slate-600'
   return (
-    <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide ${cls}`}>
+    <span className={`inline-flex items-center rounded border px-1.5 py-px text-[10px] font-semibold uppercase tracking-wide ${cls}`}>
       {status || 'Unknown'}
     </span>
   )
 }
 
-function Tooltip({ children, tip }) {
-  const [show, setShow] = useState(false)
+// ── Shared section wrapper ────────────────────────────────────────────────────
+
+function Section({ label, accent = 'text-slate-500', border = 'border-slate-700', children }) {
   return (
-    <span className="relative inline-block"
-      onMouseEnter={() => setShow(true)}
-      onMouseLeave={() => setShow(false)}>
-      {children}
-      {show && (
-        <span className="absolute z-50 bottom-full left-1/2 -translate-x-1/2 mb-2 w-64 rounded-xl border border-slate-600 bg-slate-800 p-3 text-[11px] text-slate-300 shadow-2xl pointer-events-none">
-          {tip}
-        </span>
-      )}
-    </span>
+    <div className={`rounded-xl border ${border} bg-slate-900`}>
+      <div className={`px-4 py-2 border-b ${border} flex items-center`}>
+        <span className={`text-[10px] font-semibold uppercase tracking-[0.22em] ${accent}`}>{label}</span>
+      </div>
+      <div className="p-4">{children}</div>
+    </div>
   )
 }
 
-// ── 1. High-Risk Items Panel ──────────────────────────────────────────────────
+// ── 1. Delivery Forecast (Monte Carlo) ───────────────────────────────────────
+
+const DATE_CARDS = [
+  { p: 50, label: 'Most likely',    hint: '50% of simulations',  color: 'text-teal-300',  dot: '#14b8a6' },
+  { p: 80, label: 'Safe to commit', hint: '80% of simulations',  color: 'text-amber-300', dot: '#f59e0b' },
+  { p: 95, label: 'Worst case',     hint: '95% of simulations',  color: 'text-rose-300',  dot: '#f43f5e' },
+]
+
+function barPos(iso, p10, p95) {
+  if (!iso || !p10 || !p95) return 50
+  const min = new Date(p10).getTime(), max = new Date(p95).getTime(), val = new Date(iso).getTime()
+  return max === min ? 0 : Math.min(100, Math.max(0, Math.round(((val - min) / (max - min)) * 100)))
+}
+
+function FinishDateWindow({ sessionId }) {
+  const [mc, setMc]           = useState(null)
+  const [forecast, setForecast] = useState(null)
+  const [loading, setLoading]   = useState(true)
+
+  useEffect(() => {
+    if (!sessionId) return
+    Promise.all([
+      api.monteCarlo(sessionId),
+      api.forecast(sessionId).catch(() => null),
+    ]).then(([m, f]) => { setMc(m?.monte_carlo ?? m); setForecast(f?.forecast ?? f); setLoading(false) })
+      .catch(() => setLoading(false))
+  }, [sessionId])
+
+  const stats      = mc?.statistics || {}
+  const p10        = stats.percentile_10
+  const p95        = stats.percentile_95
+  const onTimePct  = mc?.on_time_probability != null ? Math.round(mc.on_time_probability * 100) : null
+  const confidence = forecast?.confidence_score != null ? forecast.confidence_score : forecast?.forecast_result?.confidence_score
+  const targetDate = mc?.target_end_date ?? null
+
+  const dotMarkers = DATE_CARDS.map(({ p, dot }) => ({
+    p, dot, left: barPos(stats[`percentile_${p}`], p10, p95),
+  }))
+
+  // Interpolate the on-time probability position on the bar
+  let onTimeMarker = null
+  if (onTimePct != null && p10 && p95 && stats.percentile_50) {
+    const knownPts = [
+      { pct: 10, ts: new Date(p10).getTime() },
+      { pct: 50, ts: new Date(stats.percentile_50).getTime() },
+      ...(stats.percentile_80 ? [{ pct: 80, ts: new Date(stats.percentile_80).getTime() }] : []),
+      { pct: 95, ts: new Date(p95).getTime() },
+    ].sort((a, b) => a.pct - b.pct)
+    let ts = null
+    for (let i = 0; i < knownPts.length - 1; i++) {
+      const lo = knownPts[i], hi = knownPts[i + 1]
+      if (onTimePct >= lo.pct && onTimePct <= hi.pct) {
+        ts = lo.ts + ((onTimePct - lo.pct) / (hi.pct - lo.pct)) * (hi.ts - lo.ts)
+        break
+      }
+    }
+    if (ts === null) ts = onTimePct < knownPts[0].pct ? knownPts[0].ts : knownPts[knownPts.length - 1].ts
+    onTimeMarker = { left: barPos(new Date(ts).toISOString(), p10, p95), date: fmtShort(new Date(ts).toISOString()), pct: onTimePct }
+  }
+
+  const onTimeColor = onTimePct == null ? 'text-slate-400' : onTimePct >= 60 ? 'text-teal-300' : onTimePct >= 40 ? 'text-amber-300' : 'text-rose-300'
+
+  return (
+    <Section label="Delivery forecast" border="border-slate-700">
+      {/* Top: on-time % + confidence */}
+      <div className="flex items-center justify-between mb-3">
+        <div>
+          <p className="text-[11px] text-slate-500">
+            When will we finish?
+            {confidence != null && <span className="ml-2 text-teal-400 font-medium">{Math.round(confidence * 100)}% confidence</span>}
+          </p>
+        </div>
+        {onTimePct != null && (
+          <div className="text-right">
+            <span className={`text-2xl font-bold ${onTimeColor}`}>{onTimePct}%</span>
+            <span className="text-[11px] text-slate-500 ml-1.5">on-time</span>
+          </div>
+        )}
+      </div>
+
+      {loading ? <p className="text-sm text-slate-500">Calculating…</p> : (
+        <>
+          {/* Timeline bar */}
+          <div className="relative mt-8 mb-8">
+            {/* On-time marker — above bar */}
+            {onTimeMarker && (
+              <div className="absolute -translate-x-1/2 flex flex-col items-center" style={{ left: `${onTimeMarker.left}%`, bottom: '14px' }}>
+                <div className={`text-[10px] font-bold whitespace-nowrap px-1.5 py-0.5 rounded bg-slate-800 border border-slate-600 ${onTimeColor}`}>
+                  {onTimeMarker.pct}% · {onTimeMarker.date}
+                </div>
+                <div className="w-px h-2 bg-slate-600" />
+              </div>
+            )}
+
+            <div className="h-1.5 rounded-full bg-gradient-to-r from-teal-500 via-amber-400 to-rose-500" />
+
+            {/* Percentile dots */}
+            {dotMarkers.map(({ p, dot, left }) => (
+              <div key={p} className="absolute w-3.5 h-3.5 rounded-full border-2 border-slate-900 -translate-x-1/2 -translate-y-1/2" style={{ left: `${left}%`, top: '50%', backgroundColor: dot }} />
+            ))}
+
+            {/* Deadline marker — below bar */}
+            {targetDate && (() => {
+              const left = barPos(targetDate, p10, p95)
+              return (
+                <div className="absolute -translate-x-1/2 flex flex-col items-center" style={{ left: `${left}%`, top: '14px' }}>
+                  <div className="w-px h-2 bg-violet-400" />
+                  <div className="text-[10px] font-semibold whitespace-nowrap px-1.5 py-0.5 rounded bg-violet-500/15 border border-violet-500/40 text-violet-300">
+                    Deadline · {fmtShort(targetDate)}
+                  </div>
+                </div>
+              )
+            })()}
+
+            <div className="flex justify-between mt-1 text-[10px] text-slate-600">
+              <span>{fmtShort(p10)}</span>
+              <span>{fmtShort(p95)}</span>
+            </div>
+          </div>
+
+          {/* Date cards */}
+          <div className="grid grid-cols-4 gap-2 mt-2">
+            {targetDate && (
+              <div className="rounded-lg border border-violet-500/40 bg-violet-500/5 p-2.5">
+                <p className="text-[10px] text-violet-400 font-medium mb-1">Deadline</p>
+                <p className="text-base font-bold text-violet-300">{fmtShort(targetDate)}</p>
+                <p className="text-[10px] text-slate-500 mt-0.5">Fixed</p>
+              </div>
+            )}
+            {DATE_CARDS.map(({ p, label, hint, color }) => (
+              <div key={p} className="rounded-lg border border-slate-700/60 bg-slate-950 p-2.5">
+                <p className="text-[10px] text-slate-500 mb-1">{label}</p>
+                <p className={`text-base font-bold ${color}`}>{fmtShort(stats[`percentile_${p}`])}</p>
+                <p className="text-[10px] text-slate-600 mt-0.5">{hint}</p>
+              </div>
+            ))}
+          </div>
+        </>
+      )}
+    </Section>
+  )
+}
+
+// ── 2. Risk Snapshot ──────────────────────────────────────────────────────────
+
+const RISK_META = {
+  schedule:   { oneliner: 'Delay vs. deadline',               how: 'Expected delay against the sprint deadline.',              weight: 0.40 },
+  dependency: { oneliner: 'Task chain tangles',               how: 'Count of tasks blocking or blocked by others.',            weight: 0.25 },
+  resource:   { oneliner: 'Team load & single points',        how: 'Individual workload and key-person concentration.',        weight: 0.20 },
+  scope:      { oneliner: 'Work added vs. original plan',     how: 'New work added beyond the baseline scope.',               weight: 0.15 },
+}
+
+function RiskConcentration({ sessionId }) {
+  const [risk, setRisk]         = useState(null)
+  const [loading, setLoading]   = useState(true)
+  const [expanded, setExpanded] = useState(null)
+  const [showFormula, setShowFormula] = useState(false)
+
+  useEffect(() => {
+    if (!sessionId) return
+    api.risk(sessionId)
+      .then(r => { setRisk(r?.risk_analysis ?? r?.risk_assessment ?? r); setLoading(false) })
+      .catch(() => setLoading(false))
+  }, [sessionId])
+
+  const overall = Math.round(risk?.overall_risk_score ?? 0)
+  const overallRl = riskLevel(overall)
+
+  const cats = risk ? [
+    { key: 'schedule',   label: 'Schedule',      score: risk.schedule_risk?.score,   reasons: risk.schedule_risk?.reasons   || [], drivers: risk.schedule_risk?.drivers   || [] },
+    { key: 'dependency', label: 'Dependencies',  score: risk.dependency_risk?.score, reasons: risk.dependency_risk?.reasons || [], drivers: risk.dependency_risk?.drivers || [] },
+    { key: 'resource',   label: 'Team load',     score: risk.resource_risk?.score,   reasons: risk.resource_risk?.reasons   || [], drivers: risk.resource_risk?.drivers   || [] },
+    { key: 'scope',      label: 'Scope',         score: risk.scope_risk?.score,      reasons: risk.scope_risk?.reasons      || [], drivers: risk.scope_risk?.drivers      || [] },
+  ].filter(c => c.score !== undefined) : []
+
+  return (
+    <Section label="Risk snapshot" border="border-slate-700">
+      {loading ? <p className="text-sm text-slate-500">Analysing…</p> : (
+        <>
+          {/* Overall score pill */}
+          <div className="flex items-center justify-between mb-3">
+            <p className="text-[11px] text-slate-500">Where is the pressure?</p>
+            {risk && (
+              <div className="flex items-center gap-1.5">
+                <span className={`text-xl font-bold ${overallRl.text}`}>{overall}</span>
+                <span className="text-slate-600 text-sm">/100</span>
+                <span className={`text-[10px] font-semibold px-2 py-0.5 rounded-full border ${overallRl.border} ${overallRl.bg} ${overallRl.text}`}>{overallRl.label}</span>
+              </div>
+            )}
+          </div>
+
+          {/* Category rows */}
+          <div className="space-y-1">
+            {cats.map(({ key, label, score, reasons, drivers }) => {
+              const s    = Math.round(score ?? 0)
+              const rl   = riskLevel(s)
+              const isOpen = expanded === key
+              const meta = RISK_META[key] || {}
+              const allReasons = [...reasons, ...(drivers || []).map(d => d.description || d.title).filter(Boolean)]
+                .filter((v, i, a) => a.indexOf(v) === i).slice(0, 4)
+
+              return (
+                <div key={key} className={`rounded-lg border ${rl.border} bg-slate-950 overflow-hidden`}>
+                  <button
+                    className="w-full px-3 py-2 hover:bg-slate-800/30 transition-colors text-left"
+                    onClick={() => setExpanded(isOpen ? null : key)}>
+                    <div className="flex items-center gap-2">
+                      {/* Score badge */}
+                      <span className={`w-8 text-center text-sm font-bold flex-none ${rl.text}`}>{s}</span>
+                      <div className="flex-1 min-w-0">
+                        <div className="flex items-center gap-1.5 mb-1">
+                          <span className="text-[11px] font-semibold text-slate-300">{label}</span>
+                          <span className="text-[10px] text-slate-600">{meta.oneliner}</span>
+                        </div>
+                        <div className="h-1 rounded-full bg-slate-800">
+                          <div className={`${rl.bar} h-1 rounded-full`} style={{ width: `${Math.min(s, 100)}%` }} />
+                        </div>
+                      </div>
+                      <div className="flex items-center gap-1.5 flex-none">
+                        <span className={`text-[10px] font-semibold px-1.5 py-px rounded ${rl.bg} ${rl.text}`}>{rl.label}</span>
+                        <span className="text-[10px] text-slate-600">·{Math.round((meta.weight || 0) * 100)}%</span>
+                        {isOpen ? <ChevronDown className="h-3 w-3 text-slate-600" /> : <ChevronRight className="h-3 w-3 text-slate-600" />}
+                      </div>
+                    </div>
+                  </button>
+
+                  {isOpen && (
+                    <div className="px-3 pb-2.5 border-t border-slate-800 pt-2 space-y-1.5">
+                      <p className="text-[11px] text-slate-500">{meta.how} · <span className="text-slate-400">{Math.round(s * (meta.weight || 0))} pts</span> of overall score ({Math.round((meta.weight||0)*100)}% × {s})</p>
+                      {allReasons.length > 0 ? (
+                        <ul className="space-y-1">
+                          {allReasons.map((r, i) => (
+                            <li key={i} className="flex items-start gap-2 text-[11px] text-slate-300">
+                              <span className={`mt-1 h-1.5 w-1.5 rounded-full flex-none ${rl.bar}`} />
+                              {r}
+                            </li>
+                          ))}
+                        </ul>
+                      ) : <p className="text-[11px] text-slate-600">No signals.</p>}
+                    </div>
+                  )}
+                </div>
+              )
+            })}
+          </div>
+
+          {/* Score formula toggle */}
+          {cats.length > 0 && (
+            <div className="mt-2">
+              <button
+                className="flex items-center gap-1.5 text-[10px] text-slate-600 hover:text-slate-400 transition-colors py-1"
+                onClick={() => setShowFormula(f => !f)}>
+                <Info className="h-3 w-3" />
+                How is the overall score calculated?
+                {showFormula ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
+              </button>
+              {showFormula && (
+                <div className="mt-1 rounded-lg bg-slate-950 border border-slate-800 px-3 py-2 space-y-1">
+                  {cats.map(({ key, label, score }) => {
+                    const meta = RISK_META[key] || {}
+                    const s   = Math.round(score ?? 0)
+                    const rl  = riskLevel(s)
+                    return (
+                      <div key={key} className="flex items-center gap-2 text-[11px]">
+                        <span className="text-slate-500 w-20 truncate">{label}</span>
+                        <span className="text-slate-600">{s} × {Math.round((meta.weight||0)*100)}%</span>
+                        <span className="text-slate-600">=</span>
+                        <span className={`font-semibold ${rl.text}`}>{(s*(meta.weight||0)).toFixed(1)} pts</span>
+                      </div>
+                    )
+                  })}
+                  <div className="border-t border-slate-800 pt-1 flex items-center gap-2 text-[11px]">
+                    <span className="text-slate-400 w-20">Total</span>
+                    <span className="text-slate-600">sum =</span>
+                    <span className={`font-bold ${overallRl.text}`}>{overall} / 100</span>
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+        </>
+      )}
+    </Section>
+  )
+}
+
+// ── 3. Critical Path ──────────────────────────────────────────────────────────
+
+function CriticalPathPanel({ deps }) {
+  const [expandedItem, setExpandedItem] = useState(null)
+
+  if (!deps) return null
+
+  const cpItems        = deps?.critical_path_details || []
+  const cpDurationDays = deps?.critical_path_duration_days
+  const cpGrowthPct    = deps?.critical_path_growth_percent
+  const itemCount      = deps?.critical_path_item_count ?? cpItems.length
+  const growth         = cpGrowthPct != null ? Math.round(cpGrowthPct) : null
+
+  if (!cpItems.length && !itemCount) {
+    return (
+      <Section label="Critical path" border="border-slate-700">
+        <p className="text-sm text-slate-500">No dependency chain found — tasks may be running in parallel.</p>
+      </Section>
+    )
+  }
+
+  return (
+    <Section label="Critical path" accent="text-amber-500" border="border-amber-500/20">
+      {/* Summary strip */}
+      <div className="flex items-center gap-6 mb-3 pb-3 border-b border-slate-800">
+        <div>
+          <p className="text-[10px] text-slate-500 mb-0.5">Chain length</p>
+          <p className="text-base font-bold text-amber-300">{cpDurationDays != null ? `${cpDurationDays.toFixed(1)} days` : '—'}</p>
+        </div>
+        <div>
+          <p className="text-[10px] text-slate-500 mb-0.5">Tasks in chain</p>
+          <p className="text-base font-bold text-white">{itemCount}</p>
+        </div>
+        {growth != null && (
+          <div>
+            <p className="text-[10px] text-slate-500 mb-0.5">Scope growth</p>
+            <p className={`text-base font-bold ${growth > 10 ? 'text-rose-400' : growth > 0 ? 'text-amber-400' : 'text-teal-400'}`}>
+              {growth > 0 ? `+${growth}%` : growth === 0 ? 'None' : `${growth}%`}
+            </p>
+          </div>
+        )}
+        <p className="text-[11px] text-slate-500 ml-auto">Any delay in this chain pushes the delivery date.</p>
+      </div>
+
+      {/* Task sequence */}
+      {cpItems.length > 0 && (
+        <div className="space-y-px">
+          {cpItems.map((item, idx) => {
+            const isLast    = idx === cpItems.length - 1
+            const isOpen    = expandedItem === item.item_id
+            const isBlocked = item.is_blocked
+            const borderCls = isBlocked ? 'border-rose-500/40' : 'border-slate-800'
+
+            return (
+              <div key={item.item_id}>
+                <div className={`rounded-lg border ${borderCls} bg-slate-950 overflow-hidden`}>
+                  {/* Collapsed row — name, owner, status, blocked badge, hours */}
+                  <button
+                    className="w-full flex items-center gap-2.5 px-3 py-2 text-left hover:bg-slate-800/30 transition-colors"
+                    onClick={() => setExpandedItem(isOpen ? null : item.item_id)}>
+                    <span className="flex-none w-4 h-4 rounded-full bg-slate-800 border border-slate-700 flex items-center justify-center text-[9px] text-slate-500 font-bold">{idx + 1}</span>
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center gap-1.5">
+                        <span className="text-[11px] font-mono text-slate-600">{item.item_id}</span>
+                        <span className="text-[12px] text-slate-200 font-medium truncate">{item.name}</span>
+                      </div>
+                      <p className="text-[10px] text-slate-500 mt-0.5">{item.assigned_resource || 'Unassigned'}</p>
+                    </div>
+                    <div className="flex items-center gap-1.5 flex-none">
+                      {isBlocked && (
+                        <span className="text-[10px] text-rose-400 bg-rose-500/10 border border-rose-500/30 rounded px-1.5 py-px font-semibold">Blocked</span>
+                      )}
+                      <StatusPill status={item.status} />
+                      <span className="text-[10px] text-slate-400 font-medium">{(item.remaining_hours ?? 0).toFixed(0)}h left</span>
+                      {isOpen ? <ChevronDown className="h-3 w-3 text-slate-600" /> : <ChevronRight className="h-3 w-3 text-slate-600" />}
+                    </div>
+                  </button>
+
+                  {/* Expanded detail */}
+                  {isOpen && (
+                    <div className="px-3 pb-3 pt-2 border-t border-slate-800 space-y-2">
+                      <div className="grid grid-cols-2 gap-2">
+                        {/* Owner */}
+                        <div className="rounded bg-slate-900 border border-slate-800 px-2.5 py-2">
+                          <p className="text-[10px] text-slate-500 mb-0.5 flex items-center gap-1"><User className="h-2.5 w-2.5" /> Owner</p>
+                          <p className="text-[12px] font-semibold text-white">{item.assigned_resource || '—'}</p>
+                        </div>
+                        {/* Sprint */}
+                        <div className="rounded bg-slate-900 border border-slate-800 px-2.5 py-2">
+                          <p className="text-[10px] text-slate-500 mb-0.5 flex items-center gap-1"><Clock className="h-2.5 w-2.5" /> Sprint</p>
+                          <p className="text-[12px] font-semibold text-white">{item.sprint_id || '—'}</p>
+                        </div>
+                        {/* Hours remaining */}
+                        <div className="rounded bg-slate-900 border border-slate-800 px-2.5 py-2">
+                          <p className="text-[10px] text-slate-500 mb-0.5 flex items-center gap-1"><Zap className="h-2.5 w-2.5" /> Hours remaining</p>
+                          <p className="text-[12px] font-semibold text-white">{(item.remaining_hours ?? 0).toFixed(0)} h</p>
+                        </div>
+                        {/* Depends on */}
+                        <div className="rounded bg-slate-900 border border-slate-800 px-2.5 py-2">
+                          <p className="text-[10px] text-slate-500 mb-0.5 flex items-center gap-1"><GitBranch className="h-2.5 w-2.5" /> Depends on</p>
+                          <p className="text-[12px] font-semibold text-white">
+                            {(item.depends_on_count ?? 0) > 0
+                              ? `${item.depends_on_count} task${item.depends_on_count !== 1 ? 's' : ''} must finish first`
+                              : 'No upstream dependencies'}
+                          </p>
+                        </div>
+                      </div>
+
+                      {/* Deadline impact — plain language, always shown */}
+                      <div className={`rounded px-2.5 py-2 text-[11px] font-medium ${
+                        isBlocked
+                          ? 'bg-rose-500/10 border border-rose-500/30 text-rose-300'
+                          : 'bg-amber-500/8 border border-amber-500/20 text-amber-300'
+                      }`}>
+                        {isBlocked
+                          ? `⚠ Blocked — work cannot proceed until the blocker is resolved.`
+                          : `⚠ Any delay here pushes the delivery date by the same amount.`}
+                      </div>
+                    </div>
+                  )}
+                </div>
+                {!isLast && <div className="flex justify-center py-px"><ArrowDown className="h-3 w-3 text-slate-700" /></div>}
+              </div>
+            )
+          })}
+        </div>
+      )}
+    </Section>
+  )
+}
+
+// ── 4. High-Risk Items ────────────────────────────────────────────────────────
 
 function HighRiskItemsPanel({ deps }) {
   const [expanded, setExpanded] = useState(null)
@@ -56,78 +470,49 @@ function HighRiskItemsPanel({ deps }) {
   if (!items.length) return null
 
   return (
-    <div className="rounded-2xl border border-rose-500/30 bg-slate-900 p-6">
-      <div className="flex items-start justify-between gap-4 mb-4">
-        <div>
-          <p className="text-[10px] uppercase tracking-[0.28em] text-rose-400 mb-1">High-risk items</p>
-          <h3 className="text-lg font-bold text-white">Why these items are flagged</h3>
-          <p className="text-xs text-slate-500 mt-0.5">Each item's risk drivers — click to expand</p>
-        </div>
-        <span className="flex-none rounded-full border border-rose-500/50 bg-rose-500/10 px-3 py-1 text-[11px] font-semibold text-rose-300">
-          {items.length} item{items.length !== 1 ? 's' : ''}
-        </span>
-      </div>
-
-      <div className="space-y-2">
+    <Section label={`At-risk items · ${items.length}`} accent="text-rose-400" border="border-rose-500/25">
+      <div className="space-y-1">
         {items.map((item) => {
-          const isOpen = expanded === item.item_id
+          const isOpen  = expanded === item.item_id
           const riskPct = Math.min(item.risk_score ?? 0, 100)
-          const rl = riskLevel(riskPct)
+          const rl      = riskLevel(riskPct)
           return (
-            <div key={item.item_id}
-              className={`rounded-xl border ${rl.border} bg-slate-950 overflow-hidden`}>
-              {/* Row header */}
+            <div key={item.item_id} className={`rounded-lg border ${rl.border} bg-slate-950 overflow-hidden`}>
               <button
-                className="w-full flex items-center gap-3 px-4 py-3 text-left hover:bg-slate-800/40 transition-colors"
+                className="w-full flex items-center gap-2 px-3 py-2 text-left hover:bg-slate-800/30 transition-colors"
                 onClick={() => setExpanded(isOpen ? null : item.item_id)}>
-                <span className={`rounded-full border px-2.5 py-0.5 text-[11px] font-bold ${rl.border} ${rl.text}`}>
-                  {item.item_id}
-                </span>
-                <span className="flex-1 text-sm text-slate-200 font-medium truncate">{item.name}</span>
-                <div className="flex items-center gap-3 flex-none">
-                  {item.is_on_critical_path && (
-                    <span className="text-[10px] font-semibold text-amber-400 bg-amber-400/10 border border-amber-400/30 rounded-full px-2 py-0.5">
-                      Critical path
-                    </span>
-                  )}
-                  {item.is_blocked && (
-                    <span className="text-[10px] font-semibold text-rose-400 bg-rose-500/10 border border-rose-500/30 rounded-full px-2 py-0.5">
-                      Blocked
-                    </span>
-                  )}
+                <span className={`text-[10px] font-bold flex-none ${rl.text}`}>{item.item_id}</span>
+                <span className="flex-1 text-[12px] text-slate-200 font-medium truncate">{item.name}</span>
+                <div className="flex items-center gap-1.5 flex-none">
+                  {item.is_blocked && <span className="text-[10px] text-rose-400 bg-rose-500/10 border border-rose-500/30 rounded px-1.5 py-px font-semibold">Blocked</span>}
                   <StatusPill status={item.status} />
-                  <span className={`text-xs font-bold ${rl.text}`}>{riskPct.toFixed(0)}</span>
-                  {isOpen ? <ChevronDown className="h-4 w-4 text-slate-500" /> : <ChevronRight className="h-4 w-4 text-slate-500" />}
+                  <span className={`text-[10px] font-semibold px-1.5 py-px rounded ${rl.bg} ${rl.text}`}>{rl.label}</span>
+                  {isOpen ? <ChevronDown className="h-3 w-3 text-slate-600" /> : <ChevronRight className="h-3 w-3 text-slate-600" />}
                 </div>
               </button>
 
-              {/* Expanded detail */}
               {isOpen && (
-                <div className="px-4 pb-4 border-t border-slate-800">
-                  {/* Stats row */}
-                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mt-3 mb-4">
+                <div className="px-3 pb-3 border-t border-slate-800 pt-2">
+                  <div className="grid grid-cols-4 gap-2 mb-2">
                     {[
-                      { icon: Clock,    label: 'Remaining', value: `${(item.remaining_hours ?? 0).toFixed(0)} h` },
-                      { icon: User,     label: 'Owner',     value: item.assigned_resource || '—' },
-                      { icon: GitBranch,label: 'Blocks',    value: item.blocking_count > 0 ? `${item.blocking_count} item${item.blocking_count !== 1 ? 's' : ''}` : 'None' },
-                      { icon: Zap,      label: 'Float',     value: item.float_hours > 0 ? `${item.float_hours.toFixed(0)} h` : 'Zero' },
+                      { icon: Clock,     label: 'Remaining', value: `${(item.remaining_hours ?? 0).toFixed(0)} h` },
+                      { icon: User,      label: 'Owner',     value: item.assigned_resource || '—' },
+                      { icon: GitBranch, label: 'Blocks',    value: item.blocking_count > 0 ? `${item.blocking_count}` : 'None' },
+                      { icon: Zap,       label: 'Float',     value: item.float_hours > 0 ? `${item.float_hours.toFixed(0)} h` : 'Zero' },
                     ].map(({ icon: Icon, label, value }) => (
-                      <div key={label} className="rounded-lg bg-slate-900 border border-slate-700 px-3 py-2">
-                        <div className="flex items-center gap-1.5 mb-1">
-                          <Icon className="h-3 w-3 text-slate-500" />
-                          <span className="text-[10px] text-slate-500 uppercase tracking-wide">{label}</span>
+                      <div key={label} className="rounded bg-slate-900 border border-slate-800 px-2 py-1.5">
+                        <div className="flex items-center gap-1 mb-0.5">
+                          <Icon className="h-2.5 w-2.5 text-slate-600" />
+                          <span className="text-[9px] text-slate-600 uppercase tracking-wide">{label}</span>
                         </div>
-                        <p className="text-sm font-semibold text-white">{value}</p>
+                        <p className="text-[11px] font-semibold text-white">{value}</p>
                       </div>
                     ))}
                   </div>
-
-                  {/* Risk drivers */}
-                  <p className="text-[10px] uppercase tracking-[0.2em] text-slate-500 mb-2">Risk drivers</p>
-                  <ul className="space-y-1.5">
+                  <ul className="space-y-1">
                     {(item.risk_drivers || []).map((d, i) => (
-                      <li key={i} className="flex items-start gap-2 text-xs text-slate-300">
-                        <span className="mt-0.5 h-1.5 w-1.5 rounded-full bg-rose-400 flex-none" />
+                      <li key={i} className="flex items-start gap-2 text-[11px] text-slate-300">
+                        <span className="mt-1 h-1.5 w-1.5 rounded-full bg-rose-400 flex-none" />
                         {d}
                       </li>
                     ))}
@@ -138,464 +523,11 @@ function HighRiskItemsPanel({ deps }) {
           )
         })}
       </div>
-    </div>
+    </Section>
   )
 }
 
-// ── 2. Critical Path ──────────────────────────────────────────────────────────
-
-function CriticalPath({ sessionId }) {
-  const [deps, setDeps] = useState(null)
-  const [loading, setLoading] = useState(true)
-  const [selected, setSelected] = useState(null)
-
-  useEffect(() => {
-    if (!sessionId) return
-    api.dependencies(sessionId)
-      .then(d => { setDeps(d); setLoading(false) })
-      .catch(() => setLoading(false))
-  }, [sessionId])
-
-  const chain = deps?.critical_path_details || []
-  const highRisk = Array.isArray(deps?.high_risk_items) ? deps.high_risk_items : []
-  const duration = deps?.critical_path_duration_days
-  const growth = deps?.critical_path_growth_percent
-  const itemCount = deps?.critical_path_item_count ?? chain.length
-  const selected_item = chain.find(n => n.item_id === selected)
-
-  return (
-    <div className="rounded-2xl border border-slate-700 bg-slate-900 p-6">
-      <div className="flex items-start justify-between gap-4 mb-1">
-        <div>
-          <p className="text-[10px] uppercase tracking-[0.28em] text-slate-500 mb-1">Critical path</p>
-          <h3 className="text-lg font-bold text-white">The chain that controls delivery</h3>
-          <p className="text-xs text-slate-500 mt-0.5">Click any node to see why it's on the path</p>
-        </div>
-        {highRisk.length > 0 && (
-          <span className="flex-none rounded-full border border-rose-500/50 bg-rose-500/10 px-3 py-1 text-[11px] font-semibold text-rose-300">
-            {highRisk.length} high-risk item{highRisk.length !== 1 ? 's' : ''}
-          </span>
-        )}
-      </div>
-
-      {loading ? (
-        <p className="mt-4 text-sm text-slate-400">Loading dependency graph…</p>
-      ) : (
-        <>
-          {/* 3 stat blocks */}
-          <div className="mt-6 grid grid-cols-3 gap-6">
-            {[
-              { value: duration != null ? `${duration.toFixed(1)}d` : '—', sub: 'Path duration' },
-              { value: itemCount,                                           sub: 'Items on path' },
-              { value: growth != null ? `${growth.toFixed(1)}%` : '—',    sub: 'Growth vs baseline', warn: growth > 10 },
-            ].map(({ value, sub, warn }) => (
-              <div key={sub}>
-                <p className={`text-3xl font-bold ${warn ? 'text-amber-300' : 'text-white'}`}>{value}</p>
-                <p className="text-xs text-slate-500 mt-1">{sub}</p>
-              </div>
-            ))}
-          </div>
-
-          {/* Interactive chain */}
-          {chain.length > 0 && (
-            <div className="mt-6 overflow-x-auto pb-2">
-              <div className="inline-flex items-center gap-1 flex-nowrap min-w-full">
-                {chain.map((node, i) => {
-                  const isHigh = highRisk.includes(node.item_id)
-                  const isSelected = selected === node.item_id
-                  const isBlocked = node.is_blocked
-                  const hasZeroFloat = node.float_hours === 0
-
-                  const nodeCls = isSelected
-                    ? 'border-white bg-white text-slate-900 shadow-lg'
-                    : isBlocked
-                    ? 'border-rose-500 bg-rose-500/15 text-rose-200'
-                    : isHigh
-                    ? 'border-rose-500/60 bg-rose-500/10 text-rose-200'
-                    : 'border-slate-600 bg-slate-800 text-slate-200 hover:border-slate-400'
-
-                  return (
-                    <React.Fragment key={node.item_id + i}>
-                      <button
-                        onClick={() => setSelected(isSelected ? null : node.item_id)}
-                        className={`rounded-full border px-3 py-1.5 text-xs font-semibold whitespace-nowrap transition-all cursor-pointer flex-none ${nodeCls}`}>
-                        <span className="flex items-center gap-1.5">
-                          {node.item_id}
-                          {isBlocked && <span className="h-1.5 w-1.5 rounded-full bg-rose-400 flex-none" />}
-                          {!isBlocked && hasZeroFloat && <span className="h-1.5 w-1.5 rounded-full bg-amber-400 flex-none" />}
-                        </span>
-                      </button>
-                      {i < chain.length - 1 && (
-                        <div className="flex items-center gap-0.5 flex-none px-1">
-                          <div className="h-px w-3 bg-slate-600" />
-                          <div className="w-0 h-0 border-t-4 border-t-transparent border-b-4 border-b-transparent border-l-4 border-l-slate-600" />
-                        </div>
-                      )}
-                    </React.Fragment>
-                  )
-                })}
-              </div>
-            </div>
-          )}
-
-          {/* Node detail panel */}
-          {selected_item && (
-            <div className="mt-4 rounded-xl border border-slate-600 bg-slate-950 p-4">
-              <div className="flex items-start justify-between gap-3 mb-3">
-                <div>
-                  <p className="text-[10px] uppercase tracking-[0.2em] text-slate-500 mb-0.5">{selected_item.item_id}</p>
-                  <p className="text-sm font-semibold text-white">{selected_item.name}</p>
-                </div>
-                <StatusPill status={selected_item.status} />
-              </div>
-
-              <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-3">
-                {[
-                  { label: 'Effort',     value: `${(selected_item.effort_hours || 0).toFixed(0)} h` },
-                  { label: 'Remaining',  value: `${(selected_item.remaining_hours || 0).toFixed(0)} h` },
-                  { label: 'Float',      value: selected_item.float_hours > 0 ? `${selected_item.float_hours.toFixed(0)} h` : 'Zero — critical' },
-                  { label: 'Owner',      value: selected_item.assigned_resource || '—' },
-                ].map(({ label, value }) => (
-                  <div key={label} className="rounded-lg bg-slate-900 border border-slate-700 px-3 py-2">
-                    <p className="text-[10px] text-slate-500 uppercase tracking-wide mb-0.5">{label}</p>
-                    <p className="text-xs font-semibold text-white">{value}</p>
-                  </div>
-                ))}
-              </div>
-
-              {/* Why it's on the critical path */}
-              <p className="text-[10px] uppercase tracking-[0.2em] text-slate-500 mb-1.5">Why it controls delivery</p>
-              <ul className="space-y-1">
-                {[
-                  selected_item.float_hours === 0 && 'Zero float — any delay here shifts the finish date by the same amount',
-                  selected_item.blocking_count > 0 && `Gates ${selected_item.blocking_count} downstream item${selected_item.blocking_count !== 1 ? 's' : ''} — nothing after it can start until it finishes`,
-                  selected_item.is_blocked && `Currently blocked (${(selected_item.blocker_ids || []).join(', ') || 'active blocker'}) — resolution needed before work can proceed`,
-                  selected_item.depends_on_count > 0 && `Depends on ${selected_item.depends_on_count} upstream item${selected_item.depends_on_count !== 1 ? 's' : ''} completing first`,
-                  selected_item.progress_pct < 50 && `${selected_item.progress_pct.toFixed(0)}% complete — more than half the work remains`,
-                ].filter(Boolean).map((reason, i) => (
-                  <li key={i} className="flex items-start gap-2 text-xs text-slate-300">
-                    <span className="mt-0.5 h-1.5 w-1.5 rounded-full bg-amber-400 flex-none" />
-                    {reason}
-                  </li>
-                ))}
-              </ul>
-            </div>
-          )}
-
-          {/* Legend */}
-          <div className="mt-4 flex flex-wrap gap-4 text-[11px] text-slate-500">
-            <span className="flex items-center gap-1.5"><span className="h-1.5 w-1.5 rounded-full bg-rose-400" /> Blocked</span>
-            <span className="flex items-center gap-1.5"><span className="h-1.5 w-1.5 rounded-full bg-amber-400" /> Zero float</span>
-            <span className="flex items-center gap-1.5 text-slate-600">Click any node for detail</span>
-          </div>
-
-          {deps?.has_cycles && (
-            <div className="mt-3 flex items-center gap-2 rounded-xl border border-rose-500 bg-rose-950/40 px-4 py-3 text-sm font-semibold text-rose-200">
-              <AlertTriangle className="h-4 w-4 flex-none text-rose-400" />
-              Circular dependency detected — requires immediate resolution
-            </div>
-          )}
-        </>
-      )}
-    </div>
-  )
-}
-
-// ── 3. Risk Concentration ─────────────────────────────────────────────────────
-
-function RiskConcentration({ sessionId }) {
-  const [risk, setRisk] = useState(null)
-  const [loading, setLoading] = useState(true)
-  const [expanded, setExpanded] = useState(null)
-
-  useEffect(() => {
-    if (!sessionId) return
-    api.risk(sessionId)
-      .then(r => { setRisk(r?.risk_analysis ?? r?.risk_assessment ?? r); setLoading(false) })
-      .catch(() => setLoading(false))
-  }, [sessionId])
-
-  const overall = Math.round(risk?.overall_risk_score ?? 0)
-
-  const cats = risk ? [
-    {
-      key: 'schedule',   label: 'Schedule',
-      score: risk.schedule_risk?.score,
-      reasons: risk.schedule_risk?.reasons || [],
-      drivers: risk.schedule_risk?.drivers || [],
-    },
-    {
-      key: 'dependency', label: 'Dependency',
-      score: risk.dependency_risk?.score,
-      reasons: risk.dependency_risk?.reasons || [],
-      drivers: risk.dependency_risk?.drivers || [],
-    },
-    {
-      key: 'resource',   label: 'Resource',
-      score: risk.resource_risk?.score,
-      reasons: risk.resource_risk?.reasons || [],
-      drivers: risk.resource_risk?.drivers || [],
-    },
-    {
-      key: 'scope',      label: 'Scope',
-      score: risk.scope_risk?.score,
-      reasons: risk.scope_risk?.reasons || [],
-      drivers: risk.scope_risk?.drivers || [],
-    },
-  ].filter(c => c.score !== undefined) : []
-
-  return (
-    <div className="rounded-2xl border border-slate-700 bg-slate-900 p-6 w-full xl:w-80 flex-none">
-      <div className="flex items-start justify-between gap-2 mb-1">
-        <div>
-          <p className="text-[10px] uppercase tracking-[0.28em] text-slate-500 mb-1">Risk concentration</p>
-          <h3 className="text-lg font-bold text-white">Category breakdown</h3>
-          <p className="text-xs text-slate-500 mt-0.5">Expand any category for drivers</p>
-        </div>
-        {!loading && risk && (
-          <span className="flex-none text-xl font-extrabold text-white whitespace-nowrap">
-            {overall} <span className="text-slate-500 text-sm font-normal">/ 100</span>
-          </span>
-        )}
-      </div>
-
-      {loading ? (
-        <p className="mt-4 text-sm text-slate-400">Analysing…</p>
-      ) : (
-        <div className="mt-5 space-y-2">
-          {cats.map(({ key, label, score, reasons, drivers }) => {
-            const s = Math.round(score ?? 0)
-            const rl = riskLevel(s)
-            const isOpen = expanded === key
-            const allReasons = [
-              ...reasons,
-              ...(drivers || []).map(d => d.description || d.title).filter(Boolean)
-            ].filter((v, i, a) => a.indexOf(v) === i).slice(0, 5)
-
-            return (
-              <div key={key} className={`rounded-xl border ${rl.border} bg-slate-950 overflow-hidden`}>
-                <button
-                  className="w-full rounded-xl px-3 py-3 hover:bg-slate-800/30 transition-colors"
-                  onClick={() => setExpanded(isOpen ? null : key)}>
-                  <div className="flex items-center justify-between mb-2">
-                    <span className="text-sm text-slate-300 font-medium">{label}</span>
-                    <div className="flex items-center gap-2">
-                      <span className={`text-base font-bold ${rl.text}`}>{s}</span>
-                      {isOpen ? <ChevronDown className="h-3.5 w-3.5 text-slate-500" /> : <ChevronRight className="h-3.5 w-3.5 text-slate-500" />}
-                    </div>
-                  </div>
-                  <div className="h-1.5 rounded-full bg-slate-800">
-                    <div className={`${rl.bar} h-1.5 rounded-full transition-all`} style={{ width: `${Math.min(s, 100)}%` }} />
-                  </div>
-                  <div className="flex items-center justify-between mt-1.5">
-                    <span className={`text-[11px] ${rl.text}`}>{rl.label}</span>
-                    {allReasons.length > 0 && (
-                      <span className="text-[11px] text-slate-500">{allReasons.length} signal{allReasons.length !== 1 ? 's' : ''}</span>
-                    )}
-                  </div>
-                </button>
-
-                {isOpen && allReasons.length > 0 && (
-                  <div className="px-3 pb-3 border-t border-slate-800 pt-2.5">
-                    <ul className="space-y-1.5">
-                      {allReasons.map((r, i) => (
-                        <li key={i} className="flex items-start gap-2 text-[11px] text-slate-300">
-                          <span className={`mt-1 h-1.5 w-1.5 rounded-full flex-none ${rl.bar}`} />
-                          {r}
-                        </li>
-                      ))}
-                    </ul>
-                  </div>
-                )}
-                {isOpen && allReasons.length === 0 && (
-                  <div className="px-3 pb-3 border-t border-slate-800 pt-2.5">
-                    <p className="text-[11px] text-slate-500 italic">No specific signals detected for this category.</p>
-                  </div>
-                )}
-              </div>
-            )
-          })}
-        </div>
-      )}
-    </div>
-  )
-}
-
-// ── 4. Finish-Date Window ─────────────────────────────────────────────────────
-
-function FinishDateWindow({ sessionId }) {
-  const [mc, setMc] = useState(null)
-  const [forecast, setForecast] = useState(null)
-  const [loading, setLoading] = useState(true)
-  const [showAssumptions, setShowAssumptions] = useState(false)
-
-  useEffect(() => {
-    if (!sessionId) return
-    Promise.all([
-      api.monteCarlo(sessionId),
-      api.forecast(sessionId).catch(() => null),
-    ]).then(([m, f]) => {
-      setMc(m?.monte_carlo ?? m)
-      setForecast(f?.forecast ?? f)
-      setLoading(false)
-    }).catch(() => setLoading(false))
-  }, [sessionId])
-
-  const stats = mc?.statistics || {}
-  const p10 = stats.percentile_10
-  const p95 = stats.percentile_95
-  const assumptions = forecast?.forecast_assumptions || null
-  const confidence = forecast?.confidence_score != null
-    ? forecast.confidence_score
-    : forecast?.forecast_result?.confidence_score
-
-  const dotPositions = [50, 80, 95].map(p => {
-    const iso = stats[`percentile_${p}`]
-    if (!iso || !p10 || !p95) return { p, iso, left: 50 }
-    const min = new Date(p10).getTime()
-    const max = new Date(p95).getTime()
-    const val = new Date(iso).getTime()
-    const left = max === min ? 0 : Math.round(((val - min) / (max - min)) * 100)
-    return { p, iso, left }
-  })
-
-  const pCards = [
-    {
-      p: 50, label: 'P50 · Most likely', conf: '50% confidence',
-      tip: 'Half of all Monte Carlo runs finish on or before this date. Best for internal planning discussions.',
-      color: 'text-teal-300',
-    },
-    {
-      p: 80, label: 'P80 · Safe target', conf: '80% confidence',
-      tip: '80% of simulation runs complete by this date. Use this as your commitment to management — it leaves meaningful buffer.',
-      color: 'text-amber-300',
-    },
-    {
-      p: 95, label: 'P95 · Worst case', conf: '95% confidence',
-      tip: 'Only 5% of simulations run past this date. Use this for risk planning and external commitments where overrun is costly.',
-      color: 'text-rose-300',
-    },
-  ]
-
-  // Build assumption rows
-  const assumptionRows = assumptions ? [
-    { label: 'Velocity method',    value: assumptions.velocity_calculation_method },
-    { label: 'Blocker modelling',  value: assumptions.blocker_adjustment_method },
-    { label: 'Spillover method',   value: assumptions.spillover_adjustment_method },
-    { label: 'Critical path',      value: assumptions.critical_path_handling },
-    { label: 'Timeline anchoring', value: assumptions.timeline_anchoring },
-    ...(assumptions.capacity_assumptions
-      ? Object.entries(assumptions.capacity_assumptions).map(([k, v]) => ({ label: k, value: String(v) }))
-      : []),
-  ] : []
-
-  return (
-    <div className="rounded-2xl border border-slate-700 bg-slate-900 p-6 flex-1 min-w-0">
-      {/* Header */}
-      <div className="flex items-start justify-between gap-4 mb-1">
-        <div>
-          <p className="text-[10px] uppercase tracking-[0.28em] text-slate-500 mb-1">Finish-date window</p>
-          <h3 className="text-lg font-bold text-white">Plan against a range</h3>
-          {confidence != null && (
-            <p className="text-xs text-teal-400 mt-0.5">
-              Forecast confidence: {Math.round(confidence * 100)}%
-            </p>
-          )}
-        </div>
-        <div className="flex items-center gap-2 flex-none">
-          {assumptionRows.length > 0 && (
-            <button
-              onClick={() => setShowAssumptions(v => !v)}
-              className="flex items-center gap-1.5 rounded-full border border-slate-600 bg-slate-800 px-3 py-1 text-[11px] font-semibold text-slate-300 hover:border-slate-400 transition-colors">
-              <Info className="h-3 w-3" />
-              Assumptions
-            </button>
-          )}
-          <span className="rounded-full border border-slate-600 bg-slate-800 px-3 py-1 text-[11px] font-semibold text-slate-300">
-            P50 to P95
-          </span>
-        </div>
-      </div>
-
-      {/* Assumptions panel */}
-      {showAssumptions && assumptionRows.length > 0 && (
-        <div className="mt-4 rounded-xl border border-slate-700 bg-slate-950 p-4">
-          <p className="text-[10px] uppercase tracking-[0.2em] text-slate-500 mb-3">How these dates were calculated</p>
-          <div className="space-y-2">
-            {assumptionRows.map(({ label, value }) => (
-              <div key={label} className="flex gap-3 text-[11px]">
-                <span className="text-slate-500 flex-none w-36">{label}</span>
-                <span className="text-slate-300">{value}</span>
-              </div>
-            ))}
-          </div>
-          <div className="mt-3 pt-3 border-t border-slate-800 space-y-1 text-[11px] text-slate-500">
-            <p>⚠ Calendar holidays and leave are not modelled — dates may be optimistic.</p>
-            <p>⚠ Parallel execution is not resource-scheduled — assumes serial critical path.</p>
-          </div>
-        </div>
-      )}
-
-      {loading ? (
-        <p className="mt-4 text-sm text-slate-400">Running simulations…</p>
-      ) : (
-        <>
-          {/* Range bar */}
-          <div className="mt-6 mb-5 relative">
-            <div className="h-2 rounded-full bg-gradient-to-r from-teal-500 via-amber-400 to-rose-500" />
-            {dotPositions.map(({ p, left }) => (
-              <div
-                key={p}
-                className="absolute -top-1.5 w-5 h-5 rounded-full border-2 border-slate-900 -translate-x-1/2"
-                style={{
-                  left: `${left}%`,
-                  backgroundColor: p === 50 ? '#14b8a6' : p === 80 ? '#f59e0b' : '#f43f5e'
-                }}
-              />
-            ))}
-            <div className="flex justify-between mt-3 text-[11px] text-slate-500">
-              <span>{fmtShort(p10)}</span>
-              <span>{fmtShort(p95)}</span>
-            </div>
-          </div>
-
-          {/* P cards */}
-          <div className="grid grid-cols-3 gap-3 mt-6">
-            {pCards.map(({ p, label, conf, tip, color }) => {
-              const iso = stats[`percentile_${p}`]
-              return (
-                <div key={p} className="rounded-xl border border-slate-700 bg-slate-950 p-4 relative group">
-                  <p className="text-[10px] uppercase tracking-[0.2em] text-slate-500 mb-2">{label}</p>
-                  <p className={`text-2xl font-bold ${color}`}>{fmtShort(iso)}</p>
-                  <p className="text-[11px] text-slate-500 mt-1">{conf}</p>
-                  <Tooltip tip={tip}>
-                    <Info className="absolute top-3 right-3 h-3.5 w-3.5 text-slate-600 group-hover:text-slate-400 cursor-help transition-colors" />
-                  </Tooltip>
-                </div>
-              )
-            })}
-          </div>
-
-          {/* On-time probability */}
-          {mc?.on_time_probability != null && (
-            <div className="mt-4 flex items-center justify-between rounded-xl border border-slate-700 bg-slate-950 px-4 py-3">
-              <span className="text-xs text-slate-400">On-time delivery probability</span>
-              <span className={`text-sm font-bold ${
-                mc.on_time_probability >= 0.6 ? 'text-teal-300'
-                : mc.on_time_probability >= 0.4 ? 'text-amber-300'
-                : 'text-rose-300'
-              }`}>
-                {Math.round(mc.on_time_probability * 100)}%
-              </span>
-            </div>
-          )}
-        </>
-      )}
-    </div>
-  )
-}
-
-// ── Main ─────────────────────────────────────────────────────────────────────
+// ── Main ──────────────────────────────────────────────────────────────────────
 
 export function ManagementSummary({ session }) {
   const sessionId = session?.project_summary?.session_id || ''
@@ -603,39 +535,30 @@ export function ManagementSummary({ session }) {
 
   useEffect(() => {
     if (!sessionId) return
-    api.dependencies(sessionId)
-      .then(d => setDeps(d))
-      .catch(() => {})
+    api.dependencies(sessionId).then(d => setDeps(d)).catch(() => {})
   }, [sessionId])
 
   return (
-    <div className="space-y-4">
-      {/* Page header */}
-      <div className="px-1">
-        <p className="text-[10px] uppercase tracking-[0.3em] text-amber-400 mb-1">Delivery intelligence</p>
-        <h2 className="text-3xl font-bold text-white">Dates and dependency math</h2>
-        <p className="mt-1 text-sm text-slate-400">
-          What delivery window are we planning against, and which chain controls it?
-        </p>
+    <div className="space-y-3">
+      {/* Page header — compact */}
+      <div className="flex items-baseline justify-between px-0.5">
+        <div>
+          <p className="text-[10px] uppercase tracking-[0.28em] text-amber-400 mb-0.5">Delivery intelligence</p>
+          <h2 className="text-2xl font-bold text-white">Delivery outlook</h2>
+        </div>
       </div>
 
-      {/* Top row — finish-date window + risk concentration */}
-      <div className="flex flex-col xl:flex-row gap-4">
-        <FinishDateWindow sessionId={sessionId} />
-        <RiskConcentration sessionId={sessionId} />
+      {/* Row 1: Forecast + Risk side by side */}
+      <div className="grid grid-cols-1 xl:grid-cols-5 gap-3">
+        <div className="xl:col-span-3"><FinishDateWindow sessionId={sessionId} /></div>
+        <div className="xl:col-span-2"><RiskConcentration sessionId={sessionId} /></div>
       </div>
 
-      {/* Critical path — full width, interactive */}
-      <CriticalPath sessionId={sessionId} />
+      {/* Row 2: Critical path */}
+      <CriticalPathPanel deps={deps} />
 
-      {/* High-risk items — explainable, expandable */}
+      {/* Row 3: High-risk items */}
       <HighRiskItemsPanel deps={deps} />
-
-      {/* Scope rule footer */}
-      <p className="text-[11px] text-slate-600 px-1">
-        <span className="text-amber-500 font-semibold">Scope rule</span>
-        {'  '}Keep this tab mathematical. Overview owns status and decisions. Sprint Health owns execution causes and people patterns.
-      </p>
     </div>
   )
 }
