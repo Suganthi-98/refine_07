@@ -1089,10 +1089,15 @@ class MetricsEngine:
         Weighting formula per blocker:
             base_weight  = severity-tier weight (unchanged)
             age_days     = (as_of - raised_date).days, floored at 0
-            age_factor   = 1 + log2(1 + age_days / 7)
-                           ↑ doubles the weight at 7 days open,
-                             triples at 21 days, quadruples at 49 days.
-                             log2 prevents unbounded growth for very old blockers.
+            age_factor   = 1 + log2(1 + age_days / 21)
+                           ↑ doubles the weight at 21 days open,
+                             triples at ~63 days, quadruples at ~147 days.
+                             Divisor raised from 7→21 so a blocker that has
+                             been open for ~5 weeks (a realistic escalation
+                             window) doesn't already sit near the 0.80 cap.
+                             The curve still age-penalises meaningfully — it
+                             just doesn't treat a 5-week-old HIGH blocker the
+                             same as one that has been ignored for a year.
             effective_wt = min(base_weight * age_factor, 0.80)
                            ↑ hard cap per blocker so one ancient LOW blocker
                              can't dominate the entire impact score.
@@ -1137,7 +1142,7 @@ class MetricsEngine:
             # age_factor: 1.0 at day 0, ~2.0 at 7 days, ~3.0 at 21 days,
             # ~4.0 at 49 days.  Logarithmic so very old blockers don't
             # dominate everything — they matter more, but within reason.
-            age_factor = 1.0 + math.log2(1.0 + age_days / 7.0)
+            age_factor = 1.0 + math.log2(1.0 + age_days / 21.0)  # /21: doubles at 21 d, not 7 d — avoids over-penalising realistic escalation timelines
             effective_w = min(base_w * age_factor, 0.80)
 
             survival *= (1.0 - effective_w)

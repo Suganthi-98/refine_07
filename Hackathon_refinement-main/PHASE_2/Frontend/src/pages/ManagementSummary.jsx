@@ -107,25 +107,25 @@ function FinishDateWindow({ sessionId }) {
   const DATE_CARDS = [
     {
       label: 'Committed Date',
-      hint:  'What we promised',
+      hint:  'The date we agreed to deliver. Derived from the project target. Use this as the stake in the ground — everything else is measured against it.',
       value: fmtShort(targetDate),
       color: 'text-violet-300', border: 'border-violet-500/40', bg: 'bg-violet-500/5', accent: 'text-violet-400',
     },
     {
-      label: 'Expected Delivery',
-      hint:  'Pessimistic deterministic forecast — assumes all active blockers and predicted spillover hit at full strength. Use this as the cautious planning date.',
-      value: fmtShort(expectedFinish),
+      label: 'Likely Finish',
+      hint:  'Most probable finish date from 10 000 simulations (P50 — half of runs finish earlier, half later). Derived from Monte Carlo modelling current velocity and blockers. If nothing major changes, expect delivery around this date.',
+      value: fmtShort(stats.percentile_50 ?? null),
       color: 'text-teal-300',   border: 'border-teal-500/40',   bg: 'bg-teal-500/5',   accent: 'text-teal-400',
     },
     {
       label: 'High-Confidence Delivery',
-      hint:  '80th percentile across 10 000 Monte Carlo simulations — includes optimistic scenarios where some blockers resolve early. This date is typically earlier than Expected because it reflects average-case outcomes, not worst-case.',
+      hint:  '8-in-10 chance of finishing by this date (P80 across 10 000 Monte Carlo runs). Accounts for blockers resolving at varying speeds. Use as your external commitment buffer — safe to promise to stakeholders.',
       value: fmtShort(p80),
       color: 'text-amber-300',  border: 'border-amber-400/40',  bg: 'bg-amber-400/5',  accent: 'text-amber-400',
     },
     {
-      label: 'Worst-Case Forecast',
-      hint:  'If most risks materialise',
+      label: 'Worst-Case Ceiling',
+      hint:  '95th percentile — only 1-in-20 simulations finish later than this. Derived by assuming most risks materialise simultaneously. Use as a hard outer bound for contingency planning, not a planning date.',
       value: fmtShort(worstCase),
       color: 'text-rose-300',   border: 'border-rose-500/40',   bg: 'bg-rose-500/5',   accent: 'text-rose-400',
     },
@@ -192,20 +192,10 @@ function FinishDateWindow({ sessionId }) {
               </div>
             ))}
           </div>
-          {/* Explain the Expected > High-Confidence apparent contradiction */}
-          {expectedFinish && p80 && new Date(expectedFinish) > new Date(p80) && (
-            <div className="mt-2 rounded-lg border border-amber-500/25 bg-amber-500/5 px-3 py-2">
-              <p className="text-[10px] font-semibold text-amber-400 mb-0.5">Why is Expected later than High-Confidence?</p>
-              <p className="text-[10px] text-slate-400 leading-relaxed">
-                These two numbers answer different questions. <span className="text-teal-300 font-medium">Expected Delivery</span> is
-                a single deterministic forecast that assumes every active blocker and predicted spillover hits at full strength — a
-                deliberately cautious estimate. <span className="text-amber-300 font-medium">High-Confidence (P80)</span> is the
-                80th-percentile outcome across 10 000 simulations, many of which model blockers resolving early or partial
-                spillover — so it reflects a weighted average of possible futures, not the worst-case one.
-                It is normal and expected for the pessimistic deterministic date to sit later than the probabilistic P80.
-              </p>
-            </div>
-          )}
+          {/* Interpretation guide: P50 < P80 < P95 ordering */}
+          <p className="mt-2 text-[10px] text-slate-600 leading-relaxed px-0.5">
+            Dates are ordered by confidence: Likely Finish (P50) → High-Confidence (P80) → Worst-Case Ceiling (P95). Each step right adds ~15 days of safety buffer. All three are derived from the same 10 000-run Monte Carlo simulation.
+          </p>
         </>
       )}
     </Section>

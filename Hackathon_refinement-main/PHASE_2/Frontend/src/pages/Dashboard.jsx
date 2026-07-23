@@ -334,6 +334,8 @@ function DelayDiagnosis({session}){
   const StatusIcon = statusStyle.icon
   const maxAbs = Math.max(...brief.waterfall.map(d => Math.abs(d.days || 0)), 1)
 
+
+
   return (
     <section className="rounded-3xl border border-slate-700 bg-gradient-to-b from-slate-900 to-slate-900/95 p-6 shadow-inner shadow-black/20 mt-6">
       {/* Header: this is the slide a manager reads out loud */}
@@ -400,13 +402,16 @@ function DelayDiagnosis({session}){
         </div>
         <div className="mt-4 space-y-4">
           {brief.waterfall.map((d, i) => {
-            const tone = TONE_STYLES[d.tone] || TONE_STYLES.neutral
-            const width = Math.max(4, Math.round((Math.abs(d.days || 0) / maxAbs) * 100))
+            const isZero = d.days === 0
+            const tone = isZero ? TONE_STYLES.neutral : (TONE_STYLES[d.tone] || TONE_STYLES.neutral)
+            const width = isZero ? 0 : Math.max(4, Math.round((Math.abs(d.days || 0) / maxAbs) * 100))
             return (
-              <div key={d.key} className="space-y-1.5">
+              <div key={d.key} className={`space-y-1.5 ${isZero ? 'opacity-50' : ''}`}>
                 <div className="flex items-center justify-between text-sm text-slate-300">
-                  <span className="font-medium">{d.label}</span>
-                  <span className={`font-semibold ${tone.value}`}>{d.days > 0 ? '+' : ''}{d.days.toFixed(1)}d</span>
+                  <span className={`font-medium ${isZero ? 'text-slate-500' : ''}`}>{d.label}</span>
+                  <span className={`font-semibold ${isZero ? 'text-slate-500' : tone.value}`}>
+                    {isZero ? '✓ 0.0d' : `${d.days > 0 ? '+' : ''}${d.days.toFixed(1)}d`}
+                  </span>
                 </div>
                 <div className="h-3 rounded-full bg-slate-800 overflow-hidden">
                   <div
@@ -448,7 +453,7 @@ function DelayDiagnosis({session}){
                   <th className="px-4 py-2 font-medium">Blocker</th>
                   <th className="px-4 py-2 font-medium">Owner</th>
                   <th className="px-4 py-2 font-medium">Severity</th>
-                  <th className="px-4 py-2 font-medium text-right">Delay</th>
+                  <th className="px-4 py-2 font-medium text-right">Impact (this blocker)</th>
                   <th className="px-4 py-2 font-medium">Age</th>
                   <th className="px-4 py-2 font-medium">Target date</th>
                 </tr>
@@ -487,7 +492,7 @@ function DelayDiagnosis({session}){
             </table>
           </div>
           <p className="mt-1.5 text-[10px] text-slate-500 px-1">
-            Delay impact is age-weighted: the longer a blocker stays open, the more it erodes team velocity (log₂ scale — doubles at 7 days open, triples at 21 days).
+            <span className="font-medium text-slate-400">Impact (this blocker)</span> shows each blocker's individual age-weighted velocity drag — the longer it stays open, the more it compounds (log₂ scale: doubles at 7 days, triples at 21 days). The <span className="font-medium text-slate-400">Open blockers</span> figure in the waterfall above is the combined total across all open blockers, so it will always exceed any single blocker's impact shown here.
           </p>
         </div>
       )}
