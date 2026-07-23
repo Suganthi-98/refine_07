@@ -156,6 +156,70 @@ class ForecastEngine:
                     base_velocity = max(base_velocity, avg_remaining_planned_velocity)
         except Exception:
             pass
+
+        # ── Gap 2 fix: stall-penalty on base_velocity ──────────────────────
+        # The historical `actual_avg_velocity` is computed from COMPLETED sprints
+        # only (MetricsEngine._trimmed_mean_velocity uses SprintActual records,
+        # which only exist for sprints that have closed). An in-progress sprint
+        # that is running at zero or near-zero throughput therefore has no
+        # SprintActual entry yet, so the stall is completely invisible to the
+        # velocity average and the resulting forecast is systematically optimistic.
+        #
+        # Fix: detect a stalled or low-velocity in-progress sprint by comparing
+        # its actual_effort_hrs (from the workbook) against what it *should* have
+        # delivered by now given how far through the sprint window we are.
+        # If the current pace in the in-progress sprint is materially worse than
+        # the historical average, blend it into base_velocity proportionally so
+        # the forecast immediately reflects the current execution reality.
+        #
+        # Blend weight = 0.5: the in-progress sprint carries half the weight of
+        # the full historical average rather than replacing it entirely, because
+        # (a) a single sprint's data is noisier than the multi-sprint average,
+        # and (b) teams sometimes have a slow start then recover.  This is a
+        # deliberate conservative choice: enough to surface the stall, not enough
+        # to over-panic on a project that is one bad week into an otherwise
+        # healthy trajectory.
+        try:
+            as_of_stall = self.project_state.project_info.effective_as_of_date()
+            in_progress_sprints = [
+                s for s in self.project_state.sprints
+                if s.status in (SprintStatus.IN_PROGRESS,)
+            ]
+            if in_progress_sprints and base_velocity > 0:
+                ip_sprint = in_progress_sprints[0]
+                sprint_start = ip_sprint.start_date
+                sprint_end = ip_sprint.end_date
+                sprint_window = max(1.0, (sprint_end - sprint_start).total_seconds() / 86400.0)
+                elapsed_in_sprint = max(0.0, (as_of_stall - sprint_start).total_seconds() / 86400.0)
+                fraction_elapsed = min(1.0, elapsed_in_sprint / sprint_window)
+
+                # Only apply stall correction when we're meaningfully into the sprint
+                # (>= 30% elapsed) so we don't penalise a sprint that just started.
+                if fraction_elapsed >= 0.30:
+                    # Look up the SprintActual for this sprint if it exists.
+                    actuals_by_id = {a.sprint_id: a for a in self.project_state.actuals}
+                    actual_rec = actuals_by_id.get(ip_sprint.sprint_id)
+                    actual_so_far = float(actual_rec.actual_effort_hrs) if actual_rec else 0.0
+
+                    # Annualise: how much would the team deliver in a full sprint
+                    # at their current in-sprint pace?
+                    projected_full_sprint_velocity = (
+                        actual_so_far / fraction_elapsed if fraction_elapsed > 0 else 0.0
+                    )
+
+                    # Only reduce base_velocity — never inflate it from a fast in-progress
+                    # sprint, since that could hide structural risk.
+                    if projected_full_sprint_velocity < base_velocity:
+                        stall_blended_velocity = (
+                            0.5 * projected_full_sprint_velocity + 0.5 * base_velocity
+                        )
+                        # Floor at the configured velocity floor so stall penalty can't
+                        # drop below what the risk engine already models as the minimum.
+                        stall_blended_velocity = max(stall_blended_velocity, base_velocity * _cal.velocity_floor_pct)
+                        base_velocity = stall_blended_velocity
+        except Exception:
+            pass  # stall detection is advisory — never crash the core forecast
+
         # Compute velocity_without_spillover AFTER the substitution above settles base_velocity --
         # otherwise this and base_schedule_days below are derived from two different base_velocity
         # values, and their difference gets mislabeled as blocker-caused delay when it is really

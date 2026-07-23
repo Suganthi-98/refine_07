@@ -372,7 +372,8 @@ class MetricsEngine:
         # Blocker metrics
         blocker_counts = self._count_blockers_by_severity(blockers)
         active_blockers = sum(1 for b in blockers if not b.actual_resolution_date)
-        blocker_velocity_impact = self._estimate_blocker_velocity_impact(blockers)
+        _as_of = self.project_state.project_info.effective_as_of_date()
+        blocker_velocity_impact = self._estimate_blocker_velocity_impact(blockers, as_of_date=_as_of)
 
         # Schedule metrics
         completed_sprints = sum(1 for s in sprints if s.status == SprintStatus.COMPLETED)
@@ -866,7 +867,8 @@ class MetricsEngine:
         """Build deterministic blocker analytics from blocker records."""
         blocker_counts = self._count_blockers_by_severity(blockers)
         active_blockers = [b for b in blockers if not b.actual_resolution_date]
-        blocker_velocity_impact = self._estimate_blocker_velocity_impact(blockers)
+        _as_of = self.project_state.project_info.effective_as_of_date()
+        blocker_velocity_impact = self._estimate_blocker_velocity_impact(blockers, as_of_date=_as_of)
         recurring_categories: Dict[str, int] = {}
         for blocker in blockers:
             recurring_categories[blocker.category.value] = recurring_categories.get(blocker.category.value, 0) + 1
@@ -1075,9 +1077,33 @@ class MetricsEngine:
         return counts
 
     @staticmethod
-    def _estimate_blocker_velocity_impact(blockers) -> float:
-        """Estimate velocity impact from active blockers (0.0-1.0)."""
-        impact_map = {
+    @staticmethod
+    def _estimate_blocker_velocity_impact(blockers, as_of_date=None) -> float:
+        """Estimate velocity impact from active blockers (0.0-1.0).
+
+        Age-weighted: a blocker that has been open for many days causes more
+        disruption than one raised yesterday, because chronic blockers erode
+        team focus, accumulate workarounds, and signal systemic dysfunction —
+        not just a point-in-time impediment.
+
+        Weighting formula per blocker:
+            base_weight  = severity-tier weight (unchanged)
+            age_days     = (as_of - raised_date).days, floored at 0
+            age_factor   = 1 + log2(1 + age_days / 7)
+                           ↑ doubles the weight at 7 days open,
+                             triples at 21 days, quadruples at 49 days.
+                             log2 prevents unbounded growth for very old blockers.
+            effective_wt = min(base_weight * age_factor, 0.80)
+                           ↑ hard cap per blocker so one ancient LOW blocker
+                             can't dominate the entire impact score.
+
+        The survival-product aggregation is unchanged: independent blockers
+        compound multiplicatively, not additively, which avoids the
+        mathematically-incorrect scenario where 10 LOW blockers sum to >1.0.
+        """
+        import math
+
+        base_weight_map = {
             BlockerSeverity.CRITICAL: 0.40,
             BlockerSeverity.HIGH: 0.20,
             BlockerSeverity.MEDIUM: 0.10,
@@ -1088,10 +1114,33 @@ class MetricsEngine:
         if not active_blockers:
             return 0.0
 
+        if as_of_date is None:
+            from datetime import datetime
+            as_of_date = datetime.utcnow()
+
         survival = 1.0
         for blocker in active_blockers:
-            weight = impact_map.get(blocker.severity, 0.0)
-            survival *= (1.0 - weight)
+            base_w = base_weight_map.get(blocker.severity, 0.05)
+
+            raised = getattr(blocker, "raised_date", None)
+            if raised is not None:
+                try:
+                    # Normalize both sides to offset-naive UTC for comparison.
+                    r = raised.replace(tzinfo=None) if raised.tzinfo else raised
+                    a = as_of_date.replace(tzinfo=None) if getattr(as_of_date, "tzinfo", None) else as_of_date
+                    age_days = max(0.0, (a - r).total_seconds() / 86400.0)
+                except Exception:
+                    age_days = 0.0
+            else:
+                age_days = 0.0
+
+            # age_factor: 1.0 at day 0, ~2.0 at 7 days, ~3.0 at 21 days,
+            # ~4.0 at 49 days.  Logarithmic so very old blockers don't
+            # dominate everything — they matter more, but within reason.
+            age_factor = 1.0 + math.log2(1.0 + age_days / 7.0)
+            effective_w = min(base_w * age_factor, 0.80)
+
+            survival *= (1.0 - effective_w)
 
         impact = 1.0 - survival
         return round(min(impact, 0.95), 4)

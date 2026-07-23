@@ -6,12 +6,16 @@ single call, so the Dashboard Overview tab doesn't need 4-5 separate requests.
 
 GET /api/session-snapshot?session_id=<id>
 """
+import logging
 from dataclasses import asdict
 from fastapi import APIRouter, HTTPException, Query
 from typing import Any, Dict, Optional
 
 from app.api.models import ApiResponse
 from app.storage.session_store import store
+from app.engines.pmo_kpi_engine import PMOKpiEngine
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api", tags=["Session Snapshot"])
 
@@ -229,6 +233,29 @@ def get_session_snapshot(session_id: str = Query(...)):
             "diagnosis_accuracy": _safe_val(lr, "diagnosis_accuracy"),
         }
 
+    # ── PMO KPI suite ─────────────────────────────────────────────────────────
+    # Computed from ProjectAnalysis (the shared cached engine outputs), not from
+    # PipelineResult, so it's always consistent with /forecast. Isolated
+    # try/except: failure must never suppress the rest of the snapshot.
+    pmo_kpi_data: Dict = {}
+    try:
+        analysis = store.get_analysis(session_id)
+        if analysis:
+            pmo_suite = PMOKpiEngine(
+                project_state=analysis.project_state,
+                metrics=analysis.metrics,
+                forecast_result=analysis.forecast,
+                cp_result=analysis.cp_result,
+            ).calculate()
+            pmo_kpi_data = pmo_suite.model_dump()
+    except Exception as _pmo_exc:
+        logger.warning(
+            "PMOKpiEngine failed in session_snapshot for %s: %s",
+            session_id,
+            _pmo_exc,
+            exc_info=True,
+        )
+
     return ApiResponse(
         success=True,
         message="Session snapshot retrieved",
@@ -240,5 +267,6 @@ def get_session_snapshot(session_id: str = Query(...)):
             "baseline_snapshot": baseline,
             "historical": hist_data,
             "learning": learning_data,
+            "pmo_kpi": pmo_kpi_data,
         },
     )

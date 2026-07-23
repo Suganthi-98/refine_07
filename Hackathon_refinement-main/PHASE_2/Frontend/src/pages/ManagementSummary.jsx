@@ -670,6 +670,196 @@ function HighRiskItemsPanel({ deps }) {
   )
 }
 
+// ── PMO KPI Suite ─────────────────────────────────────────────────────────────
+
+function spiColor(spi) {
+  if (spi == null) return 'text-slate-400'
+  if (spi >= 0.95) return 'text-teal-300'
+  if (spi >= 0.80) return 'text-amber-300'
+  return 'text-rose-300'
+}
+
+function spiLabel(spi) {
+  if (spi == null) return '—'
+  if (spi >= 0.95) return 'On pace'
+  if (spi >= 0.80) return 'Slightly behind'
+  return 'Behind plan'
+}
+
+function pct(v, decimals = 0) {
+  if (v == null) return '—'
+  return `${(v * 100).toFixed(decimals)}%`
+}
+
+function confBar(score, label, color) {
+  const w = Math.round((score ?? 0) * 100)
+  return (
+    <div className="flex items-center gap-2">
+      <span className="w-20 text-[10px] text-slate-400 shrink-0">{label}</span>
+      <div className="flex-1 h-1.5 rounded-full bg-slate-700">
+        <div className={`h-1.5 rounded-full ${color}`} style={{ width: `${w}%` }} />
+      </div>
+      <span className="w-8 text-right text-[10px] font-semibold text-slate-300">{w}%</span>
+    </div>
+  )
+}
+
+function PMOKpiPanel({ sessionId }) {
+  const [kpi, setKpi]       = useState(null)
+  const [loading, setLoading] = useState(true)
+  const [error, setError]   = useState(null)
+
+  useEffect(() => {
+    if (!sessionId) { setLoading(false); return }
+    api.forecast(sessionId)
+      .then(f => {
+        // pmo_kpi is nested inside the forecast response
+        const suite = f?.pmo_kpi ?? null
+        setKpi(suite)
+        setLoading(false)
+      })
+      .catch(err => { setError(err); setLoading(false) })
+  }, [sessionId])
+
+  if (loading) return (
+    <Section label="PMO health indicators" accent="text-indigo-400" border="border-indigo-500/20">
+      <p className="text-sm text-slate-500">Computing PMO KPIs…</p>
+    </Section>
+  )
+
+  if (error || !kpi) return (
+    <Section label="PMO health indicators" accent="text-indigo-400" border="border-indigo-500/20">
+      <p className="text-sm text-slate-500">{error?.message || 'PMO KPIs unavailable for this session.'}</p>
+    </Section>
+  )
+
+  const spi = kpi.schedule_performance_index
+  const cd  = kpi.confidence_decomposition || {}
+
+  return (
+    <Section label="PMO health indicators" accent="text-indigo-400" border="border-indigo-500/20">
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-4">
+
+        {/* SPI */}
+        <div className="rounded-lg border border-slate-700 bg-slate-800/60 px-3 py-2.5">
+          <p className="text-[9px] font-semibold uppercase tracking-[0.22em] text-slate-500 mb-1">Schedule Perf. Index</p>
+          <p className={`text-2xl font-bold ${spiColor(spi)}`}>{spi != null ? spi.toFixed(2) : '—'}</p>
+          <p className={`text-[10px] mt-0.5 ${spiColor(spi)}`}>{spiLabel(spi)}</p>
+          <p className="text-[9px] text-slate-500 mt-1">
+            {pct(kpi.actual_completion_pct)} done · {pct(kpi.planned_completion_pct)} planned
+          </p>
+        </div>
+
+        {/* Sprint adherence */}
+        <div className="rounded-lg border border-slate-700 bg-slate-800/60 px-3 py-2.5">
+          <p className="text-[9px] font-semibold uppercase tracking-[0.22em] text-slate-500 mb-1">Sprint Adherence</p>
+          <p className={`text-2xl font-bold ${kpi.sprint_adherence_index >= 0.8 ? 'text-teal-300' : kpi.sprint_adherence_index >= 0.6 ? 'text-amber-300' : 'text-rose-300'}`}>
+            {pct(kpi.sprint_adherence_index)}
+          </p>
+          <p className="text-[9px] text-slate-500 mt-1.5">
+            {kpi.sprints_on_time_count}/{kpi.sprints_due_count} sprints closed on time
+          </p>
+          <p className="text-[9px] text-slate-500">
+            Milestone score: {pct(kpi.milestone_adherence_score)}
+          </p>
+        </div>
+
+        {/* Release readiness */}
+        <div className="rounded-lg border border-slate-700 bg-slate-800/60 px-3 py-2.5">
+          <p className="text-[9px] font-semibold uppercase tracking-[0.22em] text-slate-500 mb-1">Release Readiness</p>
+          <p className={`text-2xl font-bold ${kpi.release_readiness_index >= 0.8 ? 'text-teal-300' : kpi.release_readiness_index >= 0.5 ? 'text-amber-300' : 'text-rose-300'}`}>
+            {pct(kpi.release_readiness_index)}
+          </p>
+          <p className="text-[9px] text-slate-500 mt-1.5">
+            {kpi.resolved_blocker_count} resolved · {kpi.open_blocker_count} open blockers
+          </p>
+        </div>
+
+        {/* Recovery feasibility */}
+        <div className={`rounded-lg border bg-slate-800/60 px-3 py-2.5 ${kpi.recovery_feasible ? 'border-teal-500/30' : 'border-rose-500/40'}`}>
+          <p className="text-[9px] font-semibold uppercase tracking-[0.22em] text-slate-500 mb-1">Recovery Feasible</p>
+          <p className={`text-2xl font-bold ${kpi.recovery_feasible ? 'text-teal-300' : 'text-rose-300'}`}>
+            {kpi.recovery_feasible ? 'Yes' : 'No'}
+          </p>
+          <p className={`text-[10px] mt-0.5 ${kpi.recovery_feasible ? 'text-teal-400' : 'text-rose-400'}`}>
+            {kpi.recovery_feasibility_margin_days >= 0
+              ? `${kpi.recovery_feasibility_margin_days.toFixed(1)}d spare at max pace`
+              : `${Math.abs(kpi.recovery_feasibility_margin_days).toFixed(1)}d shortfall even at max pace`}
+          </p>
+        </div>
+      </div>
+
+      {/* Critical path drift + dependency pressure */}
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-4">
+        <div className="rounded-lg border border-slate-700 bg-slate-800/40 px-3 py-2.5">
+          <p className="text-[9px] font-semibold uppercase tracking-[0.22em] text-slate-500 mb-2">Critical Path Drift</p>
+          <div className="flex gap-4">
+            <div>
+              <p className={`text-lg font-bold ${kpi.critical_path_drift_days > 0 ? 'text-rose-300' : 'text-teal-300'}`}>
+                {kpi.critical_path_drift_days > 0 ? `+${kpi.critical_path_drift_days.toFixed(1)}d` : `${kpi.critical_path_drift_days.toFixed(1)}d`}
+              </p>
+              <p className="text-[9px] text-slate-500">calendar shift</p>
+            </div>
+            <div>
+              <p className={`text-lg font-bold ${kpi.critical_path_scope_growth_percent > 0 ? 'text-amber-300' : 'text-teal-300'}`}>
+                {kpi.critical_path_scope_growth_percent > 0 ? `+${kpi.critical_path_scope_growth_percent.toFixed(1)}%` : `${kpi.critical_path_scope_growth_percent.toFixed(1)}%`}
+              </p>
+              <p className="text-[9px] text-slate-500">scope growth</p>
+            </div>
+            <div>
+              <p className={`text-lg font-bold ${kpi.critical_path_floored_item_count > 0 ? 'text-amber-300' : 'text-teal-300'}`}>
+                {kpi.critical_path_floored_item_count}
+              </p>
+              <p className="text-[9px] text-slate-500">stalled items</p>
+            </div>
+          </div>
+          {kpi.dependency_pressure_item_count > 0 && (
+            <p className="mt-2 text-[10px] text-rose-300">
+              ⚠ {kpi.dependency_pressure_item_count} downstream item{kpi.dependency_pressure_item_count !== 1 ? 's' : ''} blocked behind a stalled predecessor
+              ({kpi.dependency_pressure_hours.toFixed(0)}h at risk)
+            </p>
+          )}
+        </div>
+
+        {/* Calendar variance */}
+        <div className="rounded-lg border border-slate-700 bg-slate-800/40 px-3 py-2.5">
+          <p className="text-[9px] font-semibold uppercase tracking-[0.22em] text-slate-500 mb-2">Calendar Variance</p>
+          <p className={`text-lg font-bold ${Math.abs(kpi.calendar_variance_days) > 7 ? 'text-rose-300' : Math.abs(kpi.calendar_variance_days) > 2 ? 'text-amber-300' : 'text-teal-300'}`}>
+            {kpi.calendar_variance_days > 0 ? `+${kpi.calendar_variance_days.toFixed(1)}d` : `${kpi.calendar_variance_days.toFixed(1)}d`}
+          </p>
+          <p className="text-[9px] text-slate-500 mt-0.5 leading-relaxed">
+            Gap between real elapsed time and what sprint status labels imply.
+            {Math.abs(kpi.calendar_variance_days) > 7
+              ? ' Large gap — sprint statuses are stale vs. the real calendar.'
+              : Math.abs(kpi.calendar_variance_days) > 2
+                ? ' Moderate gap — check in-progress sprint dates.'
+                : ' Sprint statuses are tracking the real calendar closely.'}
+          </p>
+        </div>
+      </div>
+
+      {/* Forecast confidence decomposition */}
+      {cd && (
+        <div className="rounded-lg border border-slate-700 bg-slate-800/40 px-3 py-2.5">
+          <div className="flex items-center justify-between mb-2">
+            <p className="text-[9px] font-semibold uppercase tracking-[0.22em] text-slate-500">Forecast Confidence Breakdown</p>
+            {cd.weakest_component && (
+              <span className="text-[9px] bg-amber-500/15 text-amber-300 border border-amber-500/30 rounded px-1.5 py-px">
+                Weakest: {cd.weakest_component.replace('_confidence', '')}
+              </span>
+            )}
+          </div>
+          <div className="space-y-1.5">
+            {confBar(cd.effort_confidence,   'Effort',   'bg-indigo-400')}
+            {confBar(cd.velocity_confidence, 'Velocity', 'bg-blue-400')}
+            {confBar(cd.calendar_confidence, 'Calendar', 'bg-violet-400')}
+          </div>
+        </div>
+      )}
+    </Section>
+  )
+}
+
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 export function ManagementSummary({ session }) {
@@ -725,6 +915,8 @@ export function ManagementSummary({ session }) {
       )}
 
       {!depsLoading && !depsError && <HighRiskItemsPanel deps={deps} />}
+
+      <PMOKpiPanel sessionId={sessionId} />
     </div>
   )
 }

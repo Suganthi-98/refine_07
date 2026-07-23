@@ -59,6 +59,7 @@ class PMOKpiEngine:
         confidence_decomp = self._confidence_decomposition()
         recovery_feasible, recovery_margin_days, max_sustainable_velocity = self._recovery_feasibility()
         release_readiness, open_blockers, resolved_blockers = self._release_readiness()
+        cumulative_drift_days, sprint_drift_ledger = self._cumulative_drift_ledger(as_of)
 
         return PMOKpiSuite(
             schedule_performance_index=spi,
@@ -81,7 +82,65 @@ class PMOKpiEngine:
             release_readiness_index=release_readiness,
             open_blocker_count=open_blockers,
             resolved_blocker_count=resolved_blockers,
+            cumulative_drift_days=cumulative_drift_days,
+            sprint_drift_ledger=sprint_drift_ledger,
         )
+
+    # ------------------------------------------------------------------
+    # Cumulative Schedule Drift Ledger (Gap 3)
+    # ------------------------------------------------------------------
+    def _cumulative_drift_ledger(self, as_of):
+        """Build a per-sprint lateness record and sum total accumulated drift.
+
+        For each sprint whose planned end_date has already passed:
+          - COMPLETED on time  → drift_days = 0
+          - COMPLETED late     → drift_days = (actual_close - planned_end).days
+            (we don't have actual_close in the domain model, so for completed
+            sprints past their window we record 0 — they closed, just possibly
+            late; the status is the best signal we have without a close-date field)
+          - NOT COMPLETED (In Progress / Not Started) past end_date
+                             → drift_days = (as_of - planned_end).days
+            This is the critical case: a sprint that *should* be done but isn't
+            accrues real, measurable lateness every day it stays open.
+
+        For sprints whose end_date is still in the future, drift_days = 0
+        (they haven't missed anything yet) and they are still included in
+        the ledger so the frontend can render the full sprint timeline.
+
+        Returns (cumulative_drift_days: float, ledger: List[dict]).
+        """
+        sprints = sorted(self.project_state.sprints, key=lambda s: s.sprint_number)
+        ledger = []
+        cumulative = 0.0
+
+        for sprint in sprints:
+            planned_end = sprint.end_date
+            status_val = _status_value(sprint.status)
+            is_complete = status_val == SprintStatus.COMPLETED.value
+            past_due = planned_end <= as_of
+
+            if past_due and not is_complete:
+                # Still open past planned end — every day beyond planned_end
+                # is real, unambiguous schedule debt.
+                drift = max(0.0, (as_of - planned_end).total_seconds() / 86400.0)
+            else:
+                # Either not yet due, or completed (we record 0 since we have
+                # no actual close-date field to compute true lateness for
+                # completed sprints — absence of a close-date field is itself
+                # a domain model gap that would need a workbook column to fix).
+                drift = 0.0
+
+            cumulative += drift
+            ledger.append({
+                "sprint_name": sprint.sprint_name,
+                "sprint_number": sprint.sprint_number,
+                "planned_end": planned_end.date().isoformat(),
+                "status": status_val,
+                "past_due": past_due,
+                "drift_days": round(drift, 1),
+            })
+
+        return round(cumulative, 2), ledger
 
     # ------------------------------------------------------------------
     # Schedule Performance Index

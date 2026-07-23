@@ -313,6 +313,15 @@ class ForecastResponse(BaseModel):
     session_id: str
     project_name: str
     forecast: ForecastResult
+    pmo_kpi: Optional["PMOKpiSuite"] = Field(
+        default=None,
+        description=(
+            "Executive PMO KPI suite — SPI, sprint adherence, milestone adherence, "
+            "critical path drift, dependency pressure, forecast confidence decomposition, "
+            "recovery feasibility, calendar variance, and release readiness. "
+            "None only if computation fails (engine is always attempted)."
+        ),
+    )
 
 
 class OnTimeRisk(str, Enum):
@@ -753,3 +762,27 @@ class PMOKpiSuite(BaseModel):
     release_readiness_index: float = Field(..., ge=0.0, le=1.0, description="Fraction of active blockers resolved -- a proxy for how close the project is to a clean release gate, independent of hours remaining")
     open_blocker_count: int = Field(..., ge=0)
     resolved_blocker_count: int = Field(..., ge=0)
+
+    # Cumulative schedule drift ledger (Gap 3)
+    # Per-sprint record of actual vs. planned close date so the *history* of drift
+    # is visible, not just the current snapshot. A single cross-sectional KPI like
+    # SPI or calendar_variance_days cannot show whether drift is accelerating,
+    # stable, or recovering — this ledger can.
+    cumulative_drift_days: float = Field(
+        ...,
+        description=(
+            "Sum of per-sprint lateness across all sprints that have already passed "
+            "their planned end date. Zero if all due sprints closed on time. "
+            "Grows each time a sprint misses its window; represents total accumulated "
+            "schedule debt as of today."
+        ),
+    )
+    sprint_drift_ledger: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        description=(
+            "Per-sprint breakdown of planned end date vs. actual outcome. "
+            "Each entry: {sprint_name, planned_end, status, drift_days}. "
+            "drift_days > 0 means the sprint is late or still open past its window; "
+            "0 means on-time. Ordered by sprint_number ascending."
+        ),
+    )
