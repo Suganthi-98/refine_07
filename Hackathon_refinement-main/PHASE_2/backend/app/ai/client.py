@@ -125,10 +125,18 @@ class BoschClient:
         # One shared connection pool for the application lifetime.
         self._http = httpx.AsyncClient(**client_kwargs)
 
-    async def generate(self, user_message: str) -> Dict[str, Any]:
+    async def generate(self, user_message: str, system_prompt: str | None = None) -> Dict[str, Any]:
         """
         Send a chat completion request to the Bosch LLM Farm and return
         the parsed AdvisorOutput dict.
+
+        Parameters
+        ----------
+        user_message   : The user turn content.
+        system_prompt  : Optional system prompt override.  When omitted, the
+                         default BOSCH_SYSTEM_PROMPT is used.  Pass the
+                         EMIOS_SYSTEM_PROMPT from emios_advisor.py to get the
+                         reasoning co-pilot persona instead of the narrative advisor.
 
         Raises
         ------
@@ -141,7 +149,7 @@ class BoschClient:
 
         for attempt in range(1, MAX_RETRIES + 1):
             try:
-                return await self._create_message(user_message)
+                return await self._create_message(user_message, system_prompt=system_prompt)
 
             except httpx.TimeoutException as exc:
                 logger.warning(
@@ -187,11 +195,11 @@ class BoschClient:
             f"Bosch LLM Farm call failed after {MAX_RETRIES} attempts"
         ) from last_exc
 
-    async def _create_message(self, user_message: str) -> Dict[str, Any]:
+    async def _create_message(self, user_message: str, system_prompt: str | None = None) -> Dict[str, Any]:
         """Single attempt — no retry logic here."""
         payload = {
             "messages": [
-                {"role": "system", "content": BOSCH_SYSTEM_PROMPT},
+                {"role": "system", "content": system_prompt or BOSCH_SYSTEM_PROMPT},
                 {"role": "user", "content": user_message},
             ],
             "temperature": self._settings.ai_temperature,

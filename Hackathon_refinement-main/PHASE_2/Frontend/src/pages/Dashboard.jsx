@@ -10,8 +10,6 @@ const tabs = [
   { key: 'overview', label: 'Overview' },
   { key: 'delivery_intelligence', label: 'Delivery Intelligence' },
   { key: 'recovery-plans', label: 'Recovery Plans' },
-  { key: 'actions', label: 'Actions' },
-  { key: 'compare', label: '📊 Compare' },
   { key: 'sprint-health', label: '🏥 Sprint Health' },
   { key: 'reasoning-trace', label: '🧠 Reasoning Trace' },
 ]
@@ -137,7 +135,7 @@ function HeroBanner({ session, onNavigate }) {
         </div>
         <div className="flex flex-col gap-3">
           <button
-            onClick={() => onNavigate && onNavigate('actions')}
+            onClick={() => onNavigate && onNavigate('recovery-plans')}
             className="rounded-2xl border border-amber-500 bg-amber-500/15 px-6 py-3 text-sm font-bold text-amber-200 hover:bg-amber-500/25 transition text-center"
           >
             What should I do? →
@@ -1637,8 +1635,6 @@ export function Dashboard({session, onReset}){
       </>}
 
       {active === 'recovery-plans' && <RecoveryPlansPage session={session} />}
-      {active === 'actions' && <ActionsPage session={session} onSimulated={() => setActive('compare')} />}
-      {active === 'compare' && <ReforecastPage session={session} />}
       {active === 'sprint-health' && <SprintHealth session={session} />}
       {active === 'reasoning-trace' && <ReasoningTrace session={session} />}
     </div>

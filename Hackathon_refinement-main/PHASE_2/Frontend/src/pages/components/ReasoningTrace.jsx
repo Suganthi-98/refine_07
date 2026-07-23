@@ -19,9 +19,24 @@ function Badge({ children, color = 'slate' }) {
   )
 }
 
+function formatSignal(s) {
+  if (!s || typeof s !== 'object') return String(s)
+  const metric = (s.metric_ref || '').replace(/_/g, ' ')
+  const dir = s.direction === 'up' ? '↑' : s.direction === 'down' ? '↓' : ''
+  const dev = typeof s.deviation_pct === 'number' ? `${s.deviation_pct > 0 ? '+' : ''}${s.deviation_pct.toFixed(1)}%` : null
+  const parts = []
+  if (metric) parts.push(metric)
+  if (s.current_value !== undefined && s.baseline_value !== undefined) {
+    parts.push(`${s.current_value} vs baseline ${s.baseline_value}`)
+  }
+  if (dev) parts.push(`(${dir} ${dev})`)
+  if (s.entity_id) parts.push(`— ${s.entity_id}`)
+  return parts.join(' ')
+}
+
 function FieldRow({ label, value, mono = false }) {
   if (value === undefined || value === null || value === '') return null
-  const display = typeof value === 'object' ? JSON.stringify(value, null, 2) : String(value)
+  const display = typeof value === 'object' ? formatSignal(value) : String(value)
   return (
     <div className="grid grid-cols-[10rem_1fr] gap-3 py-2 border-b border-slate-800/60 last:border-0">
       <div className="text-xs uppercase tracking-[0.15em] text-slate-500 pt-0.5 leading-5">{label}</div>
@@ -103,16 +118,22 @@ function ObservationPanel({ data }) {
         <div className="space-y-1 mt-3">
           <FieldRow label="Primary signal" value={cluster.primary_signal} />
           <FieldRow label="Cluster severity" value={cluster.cluster_severity} />
-          <FieldRow label="Observation count" value={cluster.observation_count} />
+          <FieldRow label="Observation count" value={Array.isArray(cluster.observations) ? cluster.observations.length : cluster.observation_count} />
+          {cluster.summary && (
+            <FieldRow label="Summary" value={cluster.summary} />
+          )}
           {cluster.primary_signal?.cause !== undefined && (
             <FieldRow label="Cause" value={cluster.primary_signal.cause} />
           )}
-          {cluster.signals && (
+          {(cluster.observations || cluster.signals) && (
             <div className="mt-3">
               <div className="text-xs uppercase tracking-[0.15em] text-slate-500 mb-2">Signals</div>
               <div className="space-y-1">
-                {(Array.isArray(cluster.signals) ? cluster.signals : []).map((s, i) => (
-                  <div key={i} className="rounded-2xl bg-slate-800/60 px-3 py-2 text-xs text-slate-300">{typeof s === 'string' ? s : JSON.stringify(s)}</div>
+                {(Array.isArray(cluster.observations) ? cluster.observations : Array.isArray(cluster.signals) ? cluster.signals : []).map((s, i) => (
+                  <div key={i} className="flex items-center justify-between gap-3 rounded-2xl bg-slate-800/60 px-3 py-2 text-xs text-slate-300">
+                    <span className="capitalize">{typeof s === 'string' ? s : formatSignal(s)}</span>
+                    {typeof s === 'object' && s?.significance && <Pill label={s.significance} severity={s.significance} />}
+                  </div>
                 ))}
               </div>
             </div>
@@ -211,11 +232,10 @@ function DiagnosisPanel({ data }) {
 // ---------------------------------------------------------------------------
 function ImpactPanel({ data }) {
   const matrix = data?.impact_matrix
-  const missing = !matrix
+  const estimates = matrix?.estimates
+  const missing = !matrix || !estimates
 
-  const dimensions = matrix
-    ? Object.entries(matrix).filter(([k]) => k !== 'dominant_dimension')
-    : []
+  const dimensions = estimates ? Object.entries(estimates) : []
 
   const dominant = matrix?.dominant_dimension
 
@@ -226,23 +246,24 @@ function ImpactPanel({ data }) {
       badgeColor="amber"
       missing={missing}
     >
-      {matrix && (
+      {estimates && (
         <div className="mt-3 space-y-3">
           {dimensions.map(([dim, val]) => {
             const mag = typeof val === 'object' ? val?.magnitude : typeof val === 'number' ? val : null
-            const pct = mag !== null ? Math.min(100, (mag / 10) * 100) : 0
+            const magNum = typeof mag === 'number' && !Number.isNaN(mag) ? mag : null
+            const pct = magNum !== null ? Math.min(100, (magNum / 10) * 100) : 0
             const color = pct >= 70 ? 'bg-rose-500' : pct >= 40 ? 'bg-amber-500' : 'bg-emerald-500'
             return (
               <div key={dim} className="space-y-1">
                 <div className="flex items-center justify-between text-sm">
                   <span className="text-slate-300 capitalize">{dim.replace(/_/g, ' ')}</span>
-                  <span className="font-semibold text-white">{mag !== null ? mag.toFixed(1) : '—'}<span className="text-slate-500 text-xs">/10</span></span>
+                  <span className="font-semibold text-white">{magNum !== null ? magNum.toFixed(1) : '—'}<span className="text-slate-500 text-xs">/10</span></span>
                 </div>
                 <div className="h-2 rounded-full bg-slate-800">
                   <div className={`${color} h-2 rounded-full transition-all`} style={{ width: `${pct}%` }} />
                 </div>
-                {typeof val === 'object' && val?.sacrifice_statement && (
-                  <div className="text-xs text-slate-500 italic">{val.sacrifice_statement}</div>
+                {typeof val === 'object' && (val?.sacrifice_statement || val?.explanation) && (
+                  <div className="text-xs text-slate-500 italic">{val.sacrifice_statement || val.explanation}</div>
                 )}
               </div>
             )
