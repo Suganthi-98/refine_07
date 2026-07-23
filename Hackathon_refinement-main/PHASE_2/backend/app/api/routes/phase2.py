@@ -22,13 +22,26 @@ def _get_analysis(session_id: str):
     if not analysis:
         raise HTTPException(
             status_code=404,
-            detail=ApiResponse(
-                success=False,
-                error_code=ErrorCodes.SESSION_NOT_FOUND,
-                message=f"Session {session_id} not found",
-            ).model_dump(),
+            detail={
+                "success": False,
+                "error_code": ErrorCodes.SESSION_NOT_FOUND,
+                "message": f"Session {session_id} not found",
+            },
         )
     return analysis
+
+
+def _error_detail(error_code: str, message: str) -> dict:
+    """
+    Build a plain dict for HTTPException detail — avoids passing a Pydantic
+    model whose datetime fields cannot be JSON-serialised by Starlette's
+    default json.dumps encoder.
+    """
+    return {
+        "success": False,
+        "error_code": error_code,
+        "message": message,
+    }
 
 
 @router.get("/metrics")
@@ -76,11 +89,7 @@ async def get_metrics(session_id: str = Query(..., description="Session ID")):
     except Exception as e:
         raise HTTPException(
             status_code=500,
-            detail=ApiResponse(
-                success=False,
-                error_code=ErrorCodes.PROCESSING_ERROR,
-                message=f"Error calculating metrics: {str(e)}",
-            ).model_dump(),
+            detail=_error_detail(ErrorCodes.PROCESSING_ERROR, f"Error calculating metrics: {str(e)}"),
         )
 
 
@@ -106,7 +115,8 @@ async def get_dependencies(session_id: str = Query(..., description="Session ID"
 
         # Build detailed critical path payload
         work_items_by_id = {wi.item_id: wi for wi in project_state.work_items}
-        resources_by_id = {r.resource_id: r for r in project_state.resources}
+        # FIX: ProjectState uses .team, not .resources
+        resources_by_id = {r.resource_id: r for r in project_state.team}
 
         # Active blocker lookup: which items are currently blocked
         blocked_item_ids: set = set()
@@ -231,11 +241,7 @@ async def get_dependencies(session_id: str = Query(..., description="Session ID"
     except Exception as e:
         raise HTTPException(
             status_code=500,
-            detail=ApiResponse(
-                success=False,
-                error_code=ErrorCodes.PROCESSING_ERROR,
-                message=f"Error analyzing dependencies: {str(e)}",
-            ).model_dump(),
+            detail=_error_detail(ErrorCodes.PROCESSING_ERROR, f"Error analyzing dependencies: {str(e)}"),
         )
 
 
@@ -292,9 +298,5 @@ async def get_spillover(session_id: str = Query(..., description="Session ID")):
     except Exception as e:
         raise HTTPException(
             status_code=500,
-            detail=ApiResponse(
-                success=False,
-                error_code=ErrorCodes.PROCESSING_ERROR,
-                message=f"Error analyzing spillover: {str(e)}",
-            ).model_dump(),
+            detail=_error_detail(ErrorCodes.PROCESSING_ERROR, f"Error analyzing spillover: {str(e)}"),
         )
