@@ -449,25 +449,46 @@ function DelayDiagnosis({session}){
                   <th className="px-4 py-2 font-medium">Owner</th>
                   <th className="px-4 py-2 font-medium">Severity</th>
                   <th className="px-4 py-2 font-medium text-right">Delay</th>
+                  <th className="px-4 py-2 font-medium">Age</th>
                   <th className="px-4 py-2 font-medium">Target date</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-800">
-                {brief.top_blockers.map(b => (
-                  <tr key={b.blocker_id} className="bg-slate-900/40 hover:bg-slate-800/50 transition-colors">
-                    <td className="px-4 py-3 align-top">
-                      <div className="font-semibold text-white">{b.blocker_id} {b.on_critical_path && <span className="ml-1 rounded-full border border-sky-500/40 bg-sky-500/10 px-1.5 py-0.5 text-[10px] text-sky-300 align-middle">Critical path</span>}</div>
-                      <div className="text-xs text-slate-400 mt-0.5">{b.description}</div>
-                    </td>
-                    <td className="px-4 py-3 align-top text-slate-300">{b.owner || <span className="text-rose-400">Unassigned</span>}</td>
-                    <td className="px-4 py-3 align-top"><SeverityBadge severity={b.severity} /></td>
-                    <td className="px-4 py-3 align-top text-right font-semibold text-rose-300">{b.delay_days.toFixed(1)}d</td>
-                    <td className="px-4 py-3 align-top text-slate-400">{b.target_resolution_date ? formatDate(b.target_resolution_date) : '—'}</td>
-                  </tr>
-                ))}
+                {brief.top_blockers.map(b => {
+                  const ageDays = b.raised_date
+                    ? Math.max(0, Math.round((Date.now() - new Date(b.raised_date).getTime()) / 86400000))
+                    : null
+                  const ageColor = ageDays == null ? 'text-slate-500'
+                    : ageDays >= 14 ? 'text-rose-400 font-semibold'
+                    : ageDays >= 7  ? 'text-amber-400'
+                    : 'text-slate-400'
+                  return (
+                    <tr key={b.blocker_id} className="bg-slate-900/40 hover:bg-slate-800/50 transition-colors">
+                      <td className="px-4 py-3 align-top">
+                        <div className="font-semibold text-white">{b.blocker_id} {b.on_critical_path && <span className="ml-1 rounded-full border border-sky-500/40 bg-sky-500/10 px-1.5 py-0.5 text-[10px] text-sky-300 align-middle">Critical path</span>}</div>
+                        <div className="text-xs text-slate-400 mt-0.5">{b.description}</div>
+                      </td>
+                      <td className="px-4 py-3 align-top text-slate-300">{b.owner || <span className="text-rose-400">Unassigned</span>}</td>
+                      <td className="px-4 py-3 align-top"><SeverityBadge severity={b.severity} /></td>
+                      <td className="px-4 py-3 align-top text-right">
+                        <span className="font-semibold text-rose-300">{b.delay_days.toFixed(1)}d</span>
+                        {ageDays != null && ageDays >= 7 && (
+                          <div className="text-[10px] text-slate-500 mt-0.5">age-amplified</div>
+                        )}
+                      </td>
+                      <td className={`px-4 py-3 align-top ${ageColor}`}>
+                        {ageDays != null ? `${ageDays}d open` : '—'}
+                      </td>
+                      <td className="px-4 py-3 align-top text-slate-400">{b.target_resolution_date ? formatDate(b.target_resolution_date) : '—'}</td>
+                    </tr>
+                  )
+                })}
               </tbody>
             </table>
           </div>
+          <p className="mt-1.5 text-[10px] text-slate-500 px-1">
+            Delay impact is age-weighted: the longer a blocker stays open, the more it erodes team velocity (log₂ scale — doubles at 7 days open, triples at 21 days).
+          </p>
         </div>
       )}
 

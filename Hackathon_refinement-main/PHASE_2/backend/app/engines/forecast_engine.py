@@ -681,6 +681,7 @@ class ForecastEngine:
                     delay_days=float(round(cc.blocker_delay_days(b), 1)),
                     on_critical_path=cc.blocker_hits_critical_path(b, cp_ids),
                     target_resolution_date=getattr(b, "target_resolution_date", None),
+                    raised_date=getattr(b, "raised_date", None),
                 ))
         except Exception:
             top_blockers = []

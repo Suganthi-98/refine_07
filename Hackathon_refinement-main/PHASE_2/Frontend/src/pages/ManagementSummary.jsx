@@ -113,13 +113,13 @@ function FinishDateWindow({ sessionId }) {
     },
     {
       label: 'Expected Delivery',
-      hint:  'Where we currently expect to finish',
+      hint:  'Pessimistic deterministic forecast — assumes all active blockers and predicted spillover hit at full strength. Use this as the cautious planning date.',
       value: fmtShort(expectedFinish),
       color: 'text-teal-300',   border: 'border-teal-500/40',   bg: 'bg-teal-500/5',   accent: 'text-teal-400',
     },
     {
       label: 'High-Confidence Delivery',
-      hint:  '80% of simulations finish by this date',
+      hint:  '80th percentile across 10 000 Monte Carlo simulations — includes optimistic scenarios where some blockers resolve early. This date is typically earlier than Expected because it reflects average-case outcomes, not worst-case.',
       value: fmtShort(p80),
       color: 'text-amber-300',  border: 'border-amber-400/40',  bg: 'bg-amber-400/5',  accent: 'text-amber-400',
     },
@@ -192,6 +192,20 @@ function FinishDateWindow({ sessionId }) {
               </div>
             ))}
           </div>
+          {/* Explain the Expected > High-Confidence apparent contradiction */}
+          {expectedFinish && p80 && new Date(expectedFinish) > new Date(p80) && (
+            <div className="mt-2 rounded-lg border border-amber-500/25 bg-amber-500/5 px-3 py-2">
+              <p className="text-[10px] font-semibold text-amber-400 mb-0.5">Why is Expected later than High-Confidence?</p>
+              <p className="text-[10px] text-slate-400 leading-relaxed">
+                These two numbers answer different questions. <span className="text-teal-300 font-medium">Expected Delivery</span> is
+                a single deterministic forecast that assumes every active blocker and predicted spillover hits at full strength — a
+                deliberately cautious estimate. <span className="text-amber-300 font-medium">High-Confidence (P80)</span> is the
+                80th-percentile outcome across 10 000 simulations, many of which model blockers resolving early or partial
+                spillover — so it reflects a weighted average of possible futures, not the worst-case one.
+                It is normal and expected for the pessimistic deterministic date to sit later than the probabilistic P80.
+              </p>
+            </div>
+          )}
         </>
       )}
     </Section>
@@ -358,6 +372,7 @@ function CriticalPathPanel({ deps }) {
 
   // Only show upstream/downstream relative to the selected node
   const getNodeState = (item, idx) => {
+    if (isDone(item)) return selectedId && item.item_id === selectedId ? 'selected' : 'completed'
     if (!selectedId) return item.is_blocked ? 'blocked' : 'default'
     if (item.item_id === selectedId) return 'selected'
     if (idx < selectedIdx) return 'upstream'
@@ -371,6 +386,12 @@ function CriticalPathPanel({ deps }) {
     upstream:   'border-teal-500/60 bg-teal-500/8 text-teal-200 hover:border-teal-400',
     downstream: 'border-sky-500/60 bg-sky-500/8 text-sky-200 hover:border-sky-400',
     blocked:    'border-rose-500/50 bg-rose-500/8 text-rose-200 hover:border-rose-400',
+    completed:  'border-emerald-600/50 bg-emerald-900/20 text-slate-400 opacity-70 hover:opacity-90',
+  }
+
+  const isDone = (item) => {
+    const s = (item.status || '').toUpperCase()
+    return s === 'COMPLETED' || s === 'DONE'
   }
 
   const arrowColor = (fromIdx) => {
@@ -418,13 +439,16 @@ function CriticalPathPanel({ deps }) {
       </div>
 
       {/* Legend — only shown when something is selected */}
-      {selectedId && (
-        <div className="flex items-center gap-3 mb-3 text-[10px] text-slate-400">
-          <span className="flex items-center gap-1.5"><span className="w-2 h-2 rounded-sm border border-teal-500/60 bg-teal-500/20 inline-block" /> Upstream</span>
-          <span className="flex items-center gap-1.5"><span className="w-2 h-2 rounded-sm border border-amber-400 bg-amber-400/20 inline-block" /> Selected</span>
-          <span className="flex items-center gap-1.5"><span className="w-2 h-2 rounded-sm border border-sky-500/60 bg-sky-500/20 inline-block" /> Downstream</span>
-        </div>
-      )}
+      <div className="flex items-center gap-3 mb-3 text-[10px] text-slate-400 flex-wrap">
+        <span className="flex items-center gap-1.5"><span className="w-2 h-2 rounded-sm border border-emerald-600/50 bg-emerald-900/30 inline-block" /> Completed</span>
+        {selectedId && (
+          <>
+            <span className="flex items-center gap-1.5"><span className="w-2 h-2 rounded-sm border border-teal-500/60 bg-teal-500/20 inline-block" /> Upstream</span>
+            <span className="flex items-center gap-1.5"><span className="w-2 h-2 rounded-sm border border-amber-400 bg-amber-400/20 inline-block" /> Selected</span>
+            <span className="flex items-center gap-1.5"><span className="w-2 h-2 rounded-sm border border-sky-500/60 bg-sky-500/20 inline-block" /> Downstream</span>
+          </>
+        )}
+      </div>
 
       {/* Horizontal flow */}
       <div className="overflow-x-auto pb-2">
@@ -439,13 +463,22 @@ function CriticalPathPanel({ deps }) {
                 <button
                   onClick={() => setSelectedId(isSelected ? null : item.item_id)}
                   className={`relative rounded-lg border px-3 py-2.5 text-left transition-all cursor-pointer min-w-[100px] max-w-[140px] ${nodeStyles[nodeState]}`}>
-                  <p className="text-[10px] font-mono text-slate-500 mb-0.5">{item.item_id}</p>
-                  <p className="text-[11px] font-semibold leading-tight line-clamp-2">{item.name}</p>
+                  {isDone(item) && (
+                    <span className="absolute top-1.5 right-1.5 text-emerald-400 text-[10px]" title="Completed">✓</span>
+                  )}
+                  <p className={`text-[10px] font-mono mb-0.5 ${isDone(item) ? 'text-emerald-600' : 'text-slate-500'}`}>{item.item_id}</p>
+                  <p className={`text-[11px] font-semibold leading-tight line-clamp-2 ${isDone(item) ? 'line-through text-slate-500' : ''}`}>{item.name}</p>
                   <div className="flex items-center gap-1 mt-1.5">
-                    {item.is_blocked && (
-                      <span className="text-[9px] bg-rose-500/20 text-rose-300 border border-rose-500/40 rounded px-1 py-px font-bold">BLK</span>
+                    {isDone(item) ? (
+                      <span className="text-[9px] bg-emerald-500/15 text-emerald-400 border border-emerald-500/30 rounded px-1 py-px font-bold">DONE</span>
+                    ) : (
+                      <>
+                        {item.is_blocked && (
+                          <span className="text-[9px] bg-rose-500/20 text-rose-300 border border-rose-500/40 rounded px-1 py-px font-bold">BLK</span>
+                        )}
+                        <span className="text-[10px] text-slate-500">{(item.remaining_hours ?? 0).toFixed(0)}h</span>
+                      </>
                     )}
-                    <span className="text-[10px] text-slate-500">{(item.remaining_hours ?? 0).toFixed(0)}h</span>
                   </div>
                 </button>
 
@@ -738,6 +771,12 @@ function PMOKpiPanel({ sessionId }) {
 
   return (
     <Section label="PMO health indicators" accent="text-indigo-400" border="border-indigo-500/20">
+      {/* Legend / definition row */}
+      <div className="mb-3 rounded-lg border border-indigo-500/15 bg-indigo-500/5 px-3 py-2 text-[10px] text-slate-400 leading-relaxed">
+        <span className="font-semibold text-indigo-300">How to read these:</span>
+        {' '}SPI ≥ 1.0 = on/ahead of plan; Sprint Adherence = % of past-due sprints closed on time (≥80% healthy);
+        Release Readiness = % of blockers resolved (100% = nothing blocking release); Recovery = can we still hit the target date even at maximum sustainable team pace?
+      </div>
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 mb-4">
 
         {/* SPI */}
@@ -747,6 +786,9 @@ function PMOKpiPanel({ sessionId }) {
           <p className={`text-[10px] mt-0.5 ${spiColor(spi)}`}>{spiLabel(spi)}</p>
           <p className="text-[9px] text-slate-500 mt-1">
             {pct(kpi.actual_completion_pct)} done · {pct(kpi.planned_completion_pct)} planned
+          </p>
+          <p className="text-[9px] text-slate-600 mt-1 leading-tight">
+            actual % complete ÷ planned % complete. 1.0 = exactly on pace.
           </p>
         </div>
 
@@ -762,6 +804,9 @@ function PMOKpiPanel({ sessionId }) {
           <p className="text-[9px] text-slate-500">
             Milestone score: {pct(kpi.milestone_adherence_score)}
           </p>
+          <p className="text-[9px] text-slate-600 mt-1 leading-tight">
+            Milestone = weighted avg item progress in each sprint window.
+          </p>
         </div>
 
         {/* Release readiness */}
@@ -772,6 +817,9 @@ function PMOKpiPanel({ sessionId }) {
           </p>
           <p className="text-[9px] text-slate-500 mt-1.5">
             {kpi.resolved_blocker_count} resolved · {kpi.open_blocker_count} open blockers
+          </p>
+          <p className="text-[9px] text-slate-600 mt-1 leading-tight">
+            resolved ÷ total blockers. 100% = all blockers cleared; release is gated on the rest.
           </p>
         </div>
 
@@ -785,6 +833,14 @@ function PMOKpiPanel({ sessionId }) {
             {kpi.recovery_feasibility_margin_days >= 0
               ? `${kpi.recovery_feasibility_margin_days.toFixed(1)}d spare at max pace`
               : `${Math.abs(kpi.recovery_feasibility_margin_days).toFixed(1)}d shortfall even at max pace`}
+          </p>
+          {kpi.max_sustainable_velocity != null && (
+            <p className="text-[9px] text-slate-500 mt-1">
+              Max sustainable: {kpi.max_sustainable_velocity.toFixed(0)}h/sprint
+            </p>
+          )}
+          <p className="text-[9px] text-slate-600 mt-1 leading-tight">
+            Can remaining effort fit inside the window at avg+1σ pace? "No" means scope or pace adjustment is required regardless of blockers resolving.
           </p>
         </div>
       </div>
@@ -819,6 +875,10 @@ function PMOKpiPanel({ sessionId }) {
               ({kpi.dependency_pressure_hours.toFixed(0)}h at risk)
             </p>
           )}
+          <p className="text-[9px] text-slate-600 mt-2 leading-tight">
+            Calendar shift = how many days the entire dependency network was pushed forward because stalled items can't be scheduled in the past.
+            Stalled items = work items whose earliest possible start was forced to "today" by the real-time floor.
+          </p>
         </div>
 
         {/* Calendar variance */}
@@ -835,13 +895,91 @@ function PMOKpiPanel({ sessionId }) {
                 ? ' Moderate gap — check in-progress sprint dates.'
                 : ' Sprint statuses are tracking the real calendar closely.'}
           </p>
+          <p className="text-[9px] text-slate-600 mt-1 leading-tight">
+            Positive = real calendar has advanced further than sprint labels suggest (e.g. an "In Progress" sprint is running past its planned end date without being marked complete).
+            This is what caused stall detection to fail before the real-time floor fix.
+          </p>
         </div>
       </div>
+
+      {/* Sprint Drift Ledger — Gap 3 */}
+      {Array.isArray(kpi.sprint_drift_ledger) && kpi.sprint_drift_ledger.length > 0 && (() => {
+        const ledger = kpi.sprint_drift_ledger
+        const hasAnyDrift = ledger.some(r => r.drift_days > 0)
+        const totalDrift = kpi.cumulative_drift_days ?? 0
+        return (
+          <div className="rounded-lg border border-slate-700 bg-slate-800/40 px-3 py-3 mb-4">
+            <div className="flex items-center justify-between mb-2">
+              <p className="text-[9px] font-semibold uppercase tracking-[0.22em] text-slate-500">Sprint Schedule Drift Ledger</p>
+              {totalDrift > 0 ? (
+                <span className="text-[10px] font-semibold text-rose-300 bg-rose-500/10 border border-rose-500/25 rounded px-2 py-0.5">
+                  {totalDrift.toFixed(1)}d total accumulated drift
+                </span>
+              ) : (
+                <span className="text-[10px] font-semibold text-teal-300 bg-teal-500/10 border border-teal-500/25 rounded px-2 py-0.5">
+                  No accumulated drift
+                </span>
+              )}
+            </div>
+            <p className="text-[9px] text-slate-600 mb-3 leading-relaxed">
+              Each row shows whether a sprint closed on time. Drift accrues when a sprint remains open past its planned end date —
+              every calendar day beyond that date is real schedule debt. Completed sprints before the real-time floor fix may show 0d
+              even if they actually closed late (no close-date field in the workbook).
+            </p>
+            <div className="overflow-x-auto">
+              <table className="w-full text-[10px] border-collapse">
+                <thead>
+                  <tr className="text-slate-500 border-b border-slate-700">
+                    <th className="text-left py-1.5 pr-3 font-semibold uppercase tracking-wide">Sprint</th>
+                    <th className="text-left py-1.5 pr-3 font-semibold uppercase tracking-wide">Planned End</th>
+                    <th className="text-left py-1.5 pr-3 font-semibold uppercase tracking-wide">Status</th>
+                    <th className="text-right py-1.5 font-semibold uppercase tracking-wide">Drift</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {ledger.map((row, i) => {
+                    const drift = row.drift_days ?? 0
+                    const isPastDue = row.past_due
+                    const isCompleted = (row.status || '').toUpperCase() === 'COMPLETED'
+                    const rowClass = drift > 0
+                      ? 'border-b border-rose-500/10 bg-rose-500/5'
+                      : isCompleted && isPastDue
+                        ? 'border-b border-teal-500/10 bg-teal-500/5'
+                        : 'border-b border-slate-800'
+                    const driftColor = drift > 5 ? 'text-rose-300 font-bold' : drift > 0 ? 'text-amber-300 font-semibold' : 'text-teal-400'
+                    const statusColor = isCompleted ? 'text-teal-400' : isPastDue ? 'text-rose-400' : 'text-slate-400'
+                    return (
+                      <tr key={i} className={rowClass}>
+                        <td className="py-1.5 pr-3 text-slate-200 font-medium">{row.sprint_name}</td>
+                        <td className="py-1.5 pr-3 text-slate-400 font-mono">{row.planned_end}</td>
+                        <td className={`py-1.5 pr-3 ${statusColor}`}>
+                          {isCompleted ? '✓ Closed' : isPastDue ? '⚠ Still open' : '◌ Future'}
+                        </td>
+                        <td className={`py-1.5 text-right ${driftColor}`}>
+                          {drift > 0 ? `+${drift.toFixed(1)}d` : drift === 0 && isCompleted && isPastDue ? '0d ✓' : drift === 0 ? '—' : `${drift.toFixed(1)}d`}
+                        </td>
+                      </tr>
+                    )
+                  })}
+                </tbody>
+                {totalDrift > 0 && (
+                  <tfoot>
+                    <tr className="border-t-2 border-slate-600">
+                      <td colSpan={3} className="py-1.5 pr-3 text-slate-400 font-semibold">Accumulated schedule debt</td>
+                      <td className="py-1.5 text-right text-rose-300 font-bold">+{totalDrift.toFixed(1)}d</td>
+                    </tr>
+                  </tfoot>
+                )}
+              </table>
+            </div>
+          </div>
+        )
+      })()}
 
       {/* Forecast confidence decomposition */}
       {cd && (
         <div className="rounded-lg border border-slate-700 bg-slate-800/40 px-3 py-2.5">
-          <div className="flex items-center justify-between mb-2">
+          <div className="flex items-center justify-between mb-1">
             <p className="text-[9px] font-semibold uppercase tracking-[0.22em] text-slate-500">Forecast Confidence Breakdown</p>
             {cd.weakest_component && (
               <span className="text-[9px] bg-amber-500/15 text-amber-300 border border-amber-500/30 rounded px-1.5 py-px">
@@ -849,10 +987,22 @@ function PMOKpiPanel({ sessionId }) {
               </span>
             )}
           </div>
+          <p className="text-[9px] text-slate-600 mb-2 leading-relaxed">
+            Three independent signals that degrade forecast reliability. Low bar = that signal is adding uncertainty.
+          </p>
           <div className="space-y-1.5">
-            {confBar(cd.effort_confidence,   'Effort',   'bg-indigo-400')}
-            {confBar(cd.velocity_confidence, 'Velocity', 'bg-blue-400')}
-            {confBar(cd.calendar_confidence, 'Calendar', 'bg-violet-400')}
+            <div>
+              {confBar(cd.effort_confidence, 'Effort', 'bg-indigo-400')}
+              <p className="text-[9px] text-slate-600 pl-0.5 mt-0.5">Penalised by scope growth: the more estimates have already moved, the less trustworthy remaining estimates are.</p>
+            </div>
+            <div>
+              {confBar(cd.velocity_confidence, 'Velocity', 'bg-blue-400')}
+              <p className="text-[9px] text-slate-600 pl-0.5 mt-0.5">Penalised by sprint-to-sprint velocity variance: an inconsistent team is harder to forecast than a steady one.</p>
+            </div>
+            <div>
+              {confBar(cd.calendar_confidence, 'Calendar', 'bg-violet-400')}
+              <p className="text-[9px] text-slate-600 pl-0.5 mt-0.5">Penalised by calendar variance: a large gap between real elapsed time and sprint status labels means the schedule model's clock is unreliable.</p>
+            </div>
           </div>
         </div>
       )}

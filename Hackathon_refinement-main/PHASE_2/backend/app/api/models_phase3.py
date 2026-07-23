@@ -201,6 +201,7 @@ class ForecastSteeringBlocker(BaseModel):
     delay_days: float
     on_critical_path: bool
     target_resolution_date: Optional[datetime] = None
+    raised_date: Optional[datetime] = None  # When the blocker was opened; used to compute age in UI
 
 
 class ForecastSteeringOverload(BaseModel):
