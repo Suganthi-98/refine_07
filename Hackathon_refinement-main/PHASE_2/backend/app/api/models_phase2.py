@@ -61,6 +61,10 @@ class CriticalPathItem(BaseModel):
     depends_on_count: int = 0  # upstream items that must finish first
     blocker_ids: List[str] = []
     progress_pct: float = 0.0
+    # FIX bug-1 / bug-2: predecessor and successor label lists so the UI can
+    # show "WI-045 HSM Key Management…" instead of "1 task must finish first".
+    depends_on_labels: List[str] = []   # ["WI-045 HSM Key Management & Certificate Provisioning", …]
+    blocking_labels: List[str] = []     # ["WI-057 Manifest Validation & Signature Verification", …]
 
 
 class DependenciesResponse(BaseModel):

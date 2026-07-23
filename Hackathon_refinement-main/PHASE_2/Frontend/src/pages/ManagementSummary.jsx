@@ -83,24 +83,18 @@ function FinishDateWindow({ sessionId }) {
     p, dot, left: barPos(stats[`percentile_${p}`], p10, p95),
   }))
 
+  // FIX: pin the marker to the deadline date and label it with the on-time
+  // probability.  The previous code interpolated a date from the probability
+  // percentage (asking "what date is P39?"), producing a date before the
+  // deadline that looked like good news — the opposite of the truth.
+  // Correct read: "X% of simulations finish by the deadline."
   let onTimeMarker = null
-  if (onTimePct != null && p10 && p95 && stats.percentile_50) {
-    const knownPts = [
-      { pct: 10, ts: new Date(p10).getTime() },
-      { pct: 50, ts: new Date(stats.percentile_50).getTime() },
-      ...(stats.percentile_80 ? [{ pct: 80, ts: new Date(stats.percentile_80).getTime() }] : []),
-      { pct: 95, ts: new Date(p95).getTime() },
-    ].sort((a, b) => a.pct - b.pct)
-    let ts = null
-    for (let i = 0; i < knownPts.length - 1; i++) {
-      const lo = knownPts[i], hi = knownPts[i + 1]
-      if (onTimePct >= lo.pct && onTimePct <= hi.pct) {
-        ts = lo.ts + ((onTimePct - lo.pct) / (hi.pct - lo.pct)) * (hi.ts - lo.ts)
-        break
-      }
+  if (onTimePct != null && targetDate && p10 && p95) {
+    onTimeMarker = {
+      left: barPos(targetDate, p10, p95),
+      date: fmtShort(targetDate),
+      pct:  onTimePct,
     }
-    if (ts === null) ts = onTimePct < knownPts[0].pct ? knownPts[0].ts : knownPts[knownPts.length - 1].ts
-    onTimeMarker = { left: barPos(new Date(ts).toISOString(), p10, p95), date: fmtShort(new Date(ts).toISOString()), pct: onTimePct }
   }
 
   const onTimeColor = onTimePct == null ? 'text-slate-400' : onTimePct >= 60 ? 'text-teal-300' : onTimePct >= 40 ? 'text-amber-300' : 'text-rose-300'
@@ -130,7 +124,7 @@ function FinishDateWindow({ sessionId }) {
             {onTimeMarker && (
               <div className="absolute -translate-x-1/2 flex flex-col items-center" style={{ left: `${onTimeMarker.left}%`, bottom: '14px' }}>
                 <div className={`text-[10px] font-bold whitespace-nowrap px-1.5 py-0.5 rounded bg-slate-800 border border-slate-600 ${onTimeColor}`}>
-                  {onTimeMarker.pct}% · {onTimeMarker.date}
+                  {onTimeMarker.pct}% on-time by {onTimeMarker.date}
                 </div>
                 <div className="w-px h-2 bg-slate-600" />
               </div>
@@ -192,10 +186,10 @@ function FinishDateWindow({ sessionId }) {
 // ── 2. Risk Snapshot ──────────────────────────────────────────────────────────
 
 const RISK_META = {
-  schedule:   { oneliner: 'Delay vs. deadline',               how: 'Expected delay against the sprint deadline.',              weight: 0.40 },
-  dependency: { oneliner: 'Task chain tangles',               how: 'Count of tasks blocking or blocked by others.',            weight: 0.25 },
-  resource:   { oneliner: 'Team load & single points',        how: 'Individual workload and key-person concentration.',        weight: 0.20 },
-  scope:      { oneliner: 'Work added vs. original plan',     how: 'New work added beyond the baseline scope.',               weight: 0.15 },
+  schedule:   { oneliner: 'Delay vs. deadline',          weight: 0.40 },
+  dependency: { oneliner: 'Task chain tangles',          weight: 0.25 },
+  resource:   { oneliner: 'Team load & single points',   weight: 0.20 },
+  scope:      { oneliner: 'Work added vs. original plan',weight: 0.15 },
 }
 
 function RiskConcentration({ sessionId }) {
@@ -211,20 +205,21 @@ function RiskConcentration({ sessionId }) {
       .catch(() => setLoading(false))
   }, [sessionId])
 
-  const overall = Math.round(risk?.overall_risk_score ?? 0)
+  const overall   = Math.round(risk?.overall_risk_score ?? 0)
   const overallRl = riskLevel(overall)
 
   const cats = risk ? [
-    { key: 'schedule',   label: 'Schedule',      score: risk.schedule_risk?.score,   reasons: risk.schedule_risk?.reasons   || [], drivers: risk.schedule_risk?.drivers   || [] },
-    { key: 'dependency', label: 'Dependencies',  score: risk.dependency_risk?.score, reasons: risk.dependency_risk?.reasons || [], drivers: risk.dependency_risk?.drivers || [] },
-    { key: 'resource',   label: 'Team load',     score: risk.resource_risk?.score,   reasons: risk.resource_risk?.reasons   || [], drivers: risk.resource_risk?.drivers   || [] },
-    { key: 'scope',      label: 'Scope',         score: risk.scope_risk?.score,      reasons: risk.scope_risk?.reasons      || [], drivers: risk.scope_risk?.drivers      || [] },
+    { key: 'schedule',   label: 'Schedule',     score: risk.schedule_risk?.score,   drivers: risk.schedule_risk?.drivers   || [] },
+    { key: 'dependency', label: 'Dependencies', score: risk.dependency_risk?.score, drivers: risk.dependency_risk?.drivers || [] },
+    { key: 'resource',   label: 'Team load',    score: risk.resource_risk?.score,   drivers: risk.resource_risk?.drivers   || [] },
+    { key: 'scope',      label: 'Scope',        score: risk.scope_risk?.score,      drivers: risk.scope_risk?.drivers      || [] },
   ].filter(c => c.score !== undefined) : []
 
   return (
     <Section label="Risk snapshot" border="border-slate-700">
       {loading ? <p className="text-sm text-slate-500">Analysing…</p> : (
         <>
+          {/* Header: overall score */}
           <div className="flex items-center justify-between mb-3">
             <p className="text-[11px] text-slate-500">Where is the pressure?</p>
             {risk && (
@@ -236,14 +231,18 @@ function RiskConcentration({ sessionId }) {
             )}
           </div>
 
+          {/* Category rows */}
           <div className="space-y-1">
-            {cats.map(({ key, label, score, reasons, drivers }) => {
-              const s    = Math.round(score ?? 0)
-              const rl   = riskLevel(s)
+            {cats.map(({ key, label, score, drivers }) => {
+              const s      = Math.round(score ?? 0)
+              const rl     = riskLevel(s)
               const isOpen = expanded === key
-              const meta = RISK_META[key] || {}
-              const allReasons = [...reasons, ...(drivers || []).map(d => d.description || d.title).filter(Boolean)]
-                .filter((v, i, a) => a.indexOf(v) === i).slice(0, 4)
+              const meta   = RISK_META[key] || {}
+
+              // Deduplicated driver titles only — no description text
+              const driverTitles = [...new Set(
+                (drivers || []).map(d => d.title).filter(Boolean)
+              )].slice(0, 4)
 
               return (
                 <div key={key} className={`rounded-lg border ${rl.border} bg-slate-950 overflow-hidden`}>
@@ -269,19 +268,21 @@ function RiskConcentration({ sessionId }) {
                     </div>
                   </button>
 
+                  {/* Expanded: driver titles only, no formula, no description prose */}
                   {isOpen && (
-                    <div className="px-3 pb-2.5 border-t border-slate-800 pt-2 space-y-1.5">
-                      <p className="text-[11px] text-slate-500">{meta.how} · <span className="text-slate-400">{Math.round(s * (meta.weight || 0))} pts</span> of overall score ({Math.round((meta.weight||0)*100)}% × {s})</p>
-                      {allReasons.length > 0 ? (
+                    <div className="px-3 pb-2.5 border-t border-slate-800 pt-2">
+                      {driverTitles.length > 0 ? (
                         <ul className="space-y-1">
-                          {allReasons.map((r, i) => (
-                            <li key={i} className="flex items-start gap-2 text-[11px] text-slate-300">
-                              <span className={`mt-1 h-1.5 w-1.5 rounded-full flex-none ${rl.bar}`} />
-                              {r}
+                          {driverTitles.map((title, i) => (
+                            <li key={i} className="flex items-center gap-2 text-[11px] text-slate-300">
+                              <span className={`h-1.5 w-1.5 rounded-full flex-none ${rl.bar}`} />
+                              {title}
                             </li>
                           ))}
                         </ul>
-                      ) : <p className="text-[11px] text-slate-600">No signals.</p>}
+                      ) : (
+                        <p className="text-[11px] text-slate-600">No signals.</p>
+                      )}
                     </div>
                   )}
                 </div>
@@ -289,37 +290,27 @@ function RiskConcentration({ sessionId }) {
             })}
           </div>
 
+          {/* Cumulative breakdown — always visible, no toggle */}
           {cats.length > 0 && (
-            <div className="mt-2">
-              <button
-                className="flex items-center gap-1.5 text-[10px] text-slate-600 hover:text-slate-400 transition-colors py-1"
-                onClick={() => setShowFormula(f => !f)}>
-                <Info className="h-3 w-3" />
-                How is the overall score calculated?
-                {showFormula ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
-              </button>
-              {showFormula && (
-                <div className="mt-1 rounded-lg bg-slate-950 border border-slate-800 px-3 py-2 space-y-1">
-                  {cats.map(({ key, label, score }) => {
-                    const meta = RISK_META[key] || {}
-                    const s   = Math.round(score ?? 0)
-                    const rl  = riskLevel(s)
-                    return (
-                      <div key={key} className="flex items-center gap-2 text-[11px]">
-                        <span className="text-slate-500 w-20 truncate">{label}</span>
-                        <span className="text-slate-600">{s} × {Math.round((meta.weight||0)*100)}%</span>
-                        <span className="text-slate-600">=</span>
-                        <span className={`font-semibold ${rl.text}`}>{(s*(meta.weight||0)).toFixed(1)} pts</span>
-                      </div>
-                    )
-                  })}
-                  <div className="border-t border-slate-800 pt-1 flex items-center gap-2 text-[11px]">
-                    <span className="text-slate-400 w-20">Total</span>
-                    <span className="text-slate-600">sum =</span>
-                    <span className={`font-bold ${overallRl.text}`}>{overall} / 100</span>
+            <div className="mt-3 rounded-lg bg-slate-950 border border-slate-800 px-3 py-2 space-y-1">
+              {cats.map(({ key, label, score }) => {
+                const meta = RISK_META[key] || {}
+                const s    = Math.round(score ?? 0)
+                const rl   = riskLevel(s)
+                return (
+                  <div key={key} className="flex items-center gap-2 text-[11px]">
+                    <span className="text-slate-500 w-20 truncate">{label}</span>
+                    <span className="text-slate-600">{s} × {Math.round((meta.weight || 0) * 100)}%</span>
+                    <span className="text-slate-600">=</span>
+                    <span className={`font-semibold ${rl.text}`}>{(s * (meta.weight || 0)).toFixed(1)} pts</span>
                   </div>
-                </div>
-              )}
+                )
+              })}
+              <div className="border-t border-slate-800 pt-1 flex items-center gap-2 text-[11px]">
+                <span className="text-slate-400 w-20">Total</span>
+                <span className="text-slate-600">sum =</span>
+                <span className={`font-bold ${overallRl.text}`}>{overall} / 100</span>
+              </div>
             </div>
           )}
         </>

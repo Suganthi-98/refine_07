@@ -30,6 +30,16 @@ class RiskScores(BaseModel):
     sprint_risk_by_blocker: Dict[str, Dict[int, float]]  # blocker_id -> {sprint_num -> impact}
 
 
+# FIX bug-3 / bug-4: statuses that mean "this item is finished and cannot be at risk"
+_DONE_STATUSES = {"COMPLETED", "DONE"}
+
+
+def _is_done(work_item) -> bool:
+    """Return True if the work item's status is a completed/done state."""
+    raw = work_item.status.value if hasattr(work_item.status, "value") else str(work_item.status)
+    return raw.upper() in _DONE_STATUSES
+
+
 class ImpactScoringEngine:
     """Scores risk and impact from dependencies and blockers."""
     
@@ -52,18 +62,26 @@ class ImpactScoringEngine:
     def score(self) -> RiskScores:
         """Compute risk scores for all work items."""
         
-        # Initialize scores
-        item_risk_scores = {item_id: 0.0 for item_id in self.work_items}
+        # FIX bug-3: exclude completed/done items — they cannot be at risk.
+        # Scoring them produces false positives when a finished item has high
+        # out-degree (many things depended on it) or was previously blocked.
+        item_risk_scores = {
+            item_id: 0.0
+            for item_id, wi in self.work_items.items()
+            if not _is_done(wi)
+        }
         
         # Score based on blockers
         blocker_impacts = self._score_blocker_impacts()
         for item_id, blocker_risk in blocker_impacts.items():
-            item_risk_scores[item_id] = max(item_risk_scores[item_id], blocker_risk)
+            if item_id in item_risk_scores:   # guard: skip completed items
+                item_risk_scores[item_id] = max(item_risk_scores[item_id], blocker_risk)
         
         # Score based on dependency depth (items with many dependencies are riskier)
         dependency_depth_scores = self._score_dependency_depth()
         for item_id, depth_risk in dependency_depth_scores.items():
-            item_risk_scores[item_id] = max(item_risk_scores[item_id], depth_risk * 0.3)
+            if item_id in item_risk_scores:   # guard: skip completed items
+                item_risk_scores[item_id] = max(item_risk_scores[item_id], depth_risk * 0.3)
         
         # Categorize by risk level
         high_risk = [item_id for item_id, score in item_risk_scores.items() if score >= 0.7]
@@ -141,6 +159,16 @@ class ImpactScoringEngine:
         blocker_cascade = {}
         
         for blocker in self.blockers:
+            # FIX bug-4: the original code ran BFS for *all* blockers including
+            # resolved ones.  A blocker with actual_resolution_date=None on a
+            # COMPLETED item (stale data) therefore populated cascade_depth_map
+            # for that item, causing it to appear in the AT-RISK panel with a
+            # "Directly blocked (BLK-xxx)" driver even though it was done.
+            # Guard matches _score_blocker_impacts so cascade data is consistent
+            # with which blockers are considered active.
+            if blocker.actual_resolution_date:
+                continue
+
             all_impacted = set(blocker.impacted_item_ids)
             
             # BFS to find all transitive impacts

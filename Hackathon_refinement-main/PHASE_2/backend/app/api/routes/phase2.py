@@ -129,6 +129,15 @@ async def get_dependencies(session_id: str = Query(..., description="Session ID"
                         blocker.blocker_id
                     )
 
+        # FIX bug-1 / bug-2: pre-index dependencies by successor and predecessor
+        # so we can look up predecessor/successor labels in O(1) per item instead
+        # of scanning the full list for every critical-path node.
+        preds_by_item: dict = {}   # item_id -> [predecessor_item_id, …]
+        succs_by_item: dict = {}   # item_id -> [successor_item_id, …]
+        for dep in project_state.dependencies:
+            succs_by_item.setdefault(dep.predecessor_item_id, []).append(dep.successor_item_id)
+            preds_by_item.setdefault(dep.successor_item_id, []).append(dep.predecessor_item_id)
+
         critical_path_details = []
         for item_id in cp_result.critical_path:
             work_item = work_items_by_id.get(item_id)
@@ -141,6 +150,21 @@ async def get_dependencies(session_id: str = Query(..., description="Session ID"
             is_blocked = item_id in blocked_item_ids
             out_deg = dag.out_degree.get(item_id, 0)  # items this one blocks
             in_deg = dag.in_degree.get(item_id, 0)   # items blocking this one
+
+            # FIX bug-1: build predecessor labels ("WI-045 HSM Key Management…")
+            depends_on_labels = [
+                f"{pid} {work_items_by_id[pid].title}"
+                for pid in preds_by_item.get(item_id, [])
+                if pid in work_items_by_id
+            ]
+
+            # FIX bug-2: build successor labels ("WI-057 Manifest Validation…")
+            blocking_labels = [
+                f"{sid} {work_items_by_id[sid].title}"
+                for sid in succs_by_item.get(item_id, [])
+                if sid in work_items_by_id
+            ]
+
             critical_path_details.append({
                 "item_id": item_id,
                 "name": work_item.title,
@@ -151,11 +175,18 @@ async def get_dependencies(session_id: str = Query(..., description="Session ID"
                 "status": work_item.status.value if hasattr(work_item.status, "value") else str(work_item.status),
                 "assigned_resource": resource.name if resource else work_item.assigned_resource,
                 "is_blocked": is_blocked,
-                "blocking_count": out_deg,   # how many downstream items this node gates
-                "depends_on_count": in_deg,  # how many upstream items must finish first
+                "blocking_count": out_deg,      # how many downstream items this node gates
+                "depends_on_count": in_deg,     # how many upstream items must finish first
+                "depends_on_labels": depends_on_labels,   # FIX bug-1
+                "blocking_labels": blocking_labels,        # FIX bug-2
                 "blocker_ids": blocker_reason_by_item.get(item_id, []),
                 "progress_pct": round(work_item.progress_pct * 100, 1),
             })
+
+        # FIX bug-3: completed items cannot be at risk — exclude them before
+        # building the detail list.  The engine scores all items; this is the
+        # last gate before the payload leaves the backend.
+        _DONE_STATUSES = {"COMPLETED", "DONE"}
 
         # Build per-item risk detail for high-risk items
         high_risk_item_details = []
@@ -163,6 +194,16 @@ async def get_dependencies(session_id: str = Query(..., description="Session ID"
             work_item = work_items_by_id.get(item_id)
             if not work_item:
                 continue
+
+            # FIX bug-3: skip completed/done items
+            status_val = (
+                work_item.status.value
+                if hasattr(work_item.status, "value")
+                else str(work_item.status)
+            ).upper()
+            if status_val in _DONE_STATUSES:
+                continue
+
             resource = resources_by_id.get(work_item.assigned_resource or "")
             slack_h = cp_result.item_slack_map.get(item_id, 0.0)
             item_score = risk_scores.item_risk_scores.get(item_id, 0.0)
