@@ -742,7 +742,9 @@ class PMOKpiSuite(BaseModel):
     # Critical path drift
     critical_path_drift_days: float = Field(..., description="Calendar days the critical path network was pushed forward by the real-time floor (see CriticalPathResult.calendar_shift_hours)")
     critical_path_scope_growth_percent: float = Field(..., description="Growth in critical path duration vs. original estimates (passthrough of CriticalPathResult.critical_path_growth_percent)")
-    critical_path_floored_item_count: int = Field(..., ge=0, description="Number of items whose earliest_start was forced forward by the real-time floor -- i.e. currently stalled/late relative to plan")
+    critical_path_floored_item_count: int = Field(..., ge=0, description="Items ON the critical path whose earliest start was forced to today — these directly cause the calendar shift")
+    critical_path_floored_item_ids: List[str] = Field(default_factory=list, description="IDs of critical-path items that are stalled — subset of all floored items in the network")
+    network_stalled_item_count: int = Field(default=0, ge=0, description="Total project-wide count of items floored to today across ALL chains, not just the critical path")
 
     # Dependency pressure
     dependency_pressure_item_count: int = Field(..., ge=0, description="Distinct downstream items whose predecessor is currently stalled/late")

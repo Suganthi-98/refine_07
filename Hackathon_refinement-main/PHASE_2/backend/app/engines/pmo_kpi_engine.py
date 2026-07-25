@@ -54,7 +54,7 @@ class PMOKpiEngine:
         planned_completion_pct, actual_completion_pct, spi = self._schedule_performance_index()
         sprint_adherence_index, sprints_due, sprints_on_time = self._sprint_adherence()
         milestone_adherence_score = self._milestone_adherence(as_of)
-        cp_drift_days, cp_scope_growth_pct, cp_floored_count = self._critical_path_drift()
+        cp_drift_days, cp_scope_growth_pct, cp_floored_count, cp_floored_ids, cp_network_stalled_count = self._critical_path_drift()
         dep_pressure_count, dep_pressure_hours = self._dependency_pressure()
         confidence_decomp = self._confidence_decomposition()
         recovery_feasible, recovery_margin_days, max_sustainable_velocity = self._recovery_feasibility()
@@ -72,6 +72,8 @@ class PMOKpiEngine:
             critical_path_drift_days=cp_drift_days,
             critical_path_scope_growth_percent=cp_scope_growth_pct,
             critical_path_floored_item_count=cp_floored_count,
+            critical_path_floored_item_ids=cp_floored_ids,
+            network_stalled_item_count=cp_network_stalled_count,
             dependency_pressure_item_count=dep_pressure_count,
             dependency_pressure_hours=dep_pressure_hours,
             confidence_decomposition=confidence_decomp,
@@ -210,8 +212,15 @@ class PMOKpiEngine:
     def _critical_path_drift(self):
         drift_days = round(float(self.cp_result.calendar_shift_hours) / 24.0, 2)
         scope_growth_pct = round(float(self.cp_result.critical_path_growth_percent), 2)
-        floored_count = len(self.cp_result.calendar_floored_items)
-        return drift_days, scope_growth_pct, floored_count
+
+        all_floored = list(self.cp_result.calendar_floored_items)
+        network_stalled_count = len(all_floored)
+
+        cp_set = set(self.cp_result.items_on_critical_path)
+        cp_floored = [i for i in all_floored if i in cp_set]
+        cp_floored_count = len(cp_floored)
+
+        return drift_days, scope_growth_pct, cp_floored_count, cp_floored, network_stalled_count
 
     # ------------------------------------------------------------------
     # Dependency Pressure

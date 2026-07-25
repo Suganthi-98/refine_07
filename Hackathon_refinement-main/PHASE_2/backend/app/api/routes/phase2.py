@@ -273,6 +273,7 @@ async def get_dependencies(session_id: str = Query(..., description="Session ID"
             active_blockers=[b.blocker_id for b in project_state.blockers if not b.actual_resolution_date],
             items_blocked=list(blocked_items),
             zero_slack_items=cp_result.items_on_critical_path,
+            num_critical_paths=cp_result.num_critical_paths,
         )
 
         return ApiResponse(success=True, data=response.model_dump())

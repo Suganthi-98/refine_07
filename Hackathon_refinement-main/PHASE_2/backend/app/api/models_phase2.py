@@ -102,6 +102,7 @@ class DependenciesResponse(BaseModel):
     
     # Slack analysis
     zero_slack_items: List[str]  # Items on critical path
+    num_critical_paths: int = 1  # Number of parallel critical paths of equal length
 
 
 class SpilloverResponse(BaseModel):

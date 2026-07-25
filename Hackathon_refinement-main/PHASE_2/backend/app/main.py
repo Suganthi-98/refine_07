@@ -32,6 +32,7 @@ from app.api.routes.learning import router as learning_router
 from app.api.routes.historical import router as historical_router
 from app.api.routes.reasoning_trace import router as reasoning_trace_router
 from app.api.routes.session_snapshot import router as session_snapshot_router
+from app.api.routes.forecast_trend import router as forecast_trend_router
 from app.api.routes.sprint_health import router as sprint_health_router
 
 
@@ -101,6 +102,7 @@ def create_app() -> FastAPI:
     app.include_router(diagnosis_router)
     app.include_router(learning_router)
     app.include_router(historical_router)
+    app.include_router(forecast_trend_router)
     app.include_router(reasoning_trace_router)   # Phase 3 — reasoning trace
     app.include_router(session_snapshot_router)     # Perf — single-call overview snapshot
     app.include_router(sprint_health_router)          # Sprint Health tab

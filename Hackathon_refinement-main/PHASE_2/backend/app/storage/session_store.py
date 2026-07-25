@@ -20,6 +20,9 @@ def _snapshot_from_analysis(analysis) -> dict:
         mc = analysis.monte_carlo
         forecast = analysis.forecast
         risk = analysis.risk_result
+        metrics = getattr(analysis, "metrics", None)
+        completed_sprints  = getattr(metrics, "completed_sprints", None)   if metrics else None
+        current_sprint_num = getattr(metrics, "current_sprint_number", None) if metrics else None
         return {
             "on_time_probability": round(mc.on_time_probability * 100, 1),
             "on_time_risk_level": (
@@ -33,6 +36,8 @@ def _snapshot_from_analysis(analysis) -> dict:
             "p80_date": mc.p80_finish_date.isoformat() if mc.p80_finish_date else None,
             "p95_date": mc.p95_finish_date.isoformat() if mc.p95_finish_date else None,
             "target_end_date": mc.target_end_date.isoformat() if mc.target_end_date else None,
+            "completed_sprints":  completed_sprints,
+            "current_sprint_num": current_sprint_num,
         }
     except Exception:
         return {}
@@ -71,7 +76,13 @@ class Session:
         # (LearningEngine) reads the most recent entry here instead of the
         # previous hardcoded actual_outcome=None.
         self.actual_outcomes: Dict[str, ActualSprintOutcome] = {}
-    
+        # forecast_history: time-series of snapshots appended on each fresh
+        # analysis build (triggered by upload, scope change, or recovery plan
+        # apply).  Capped at 12 entries — oldest dropped when full.
+        # Each entry: {recorded_at, label, p50_date, p80_date, p95_date,
+        #              on_time_probability, expected_delay_days}
+        self.forecast_history: list = []
+
     def touch(self) -> None:
         """Update last accessed timestamp."""
         self.last_accessed = datetime.now(timezone.utc)
@@ -192,6 +203,23 @@ class SessionStore:
             if session.baseline_snapshot is None:
                 session.baseline_snapshot = _snapshot_from_analysis(session._analysis)
 
+            # Append a trend entry every time a fresh analysis is built so the
+            # UI can show how forecast dates have moved over time.
+            snap = _snapshot_from_analysis(session._analysis)
+            _sprint_num = snap.get("current_sprint_num")
+            _label = (
+                f"Sprint {_sprint_num}" if _sprint_num is not None
+                else f"Run {len(session.forecast_history) + 1}"
+            )
+            entry = {
+                "recorded_at": datetime.now(timezone.utc).isoformat(),
+                "label": _label,
+                **snap,
+            }
+            session.forecast_history.append(entry)
+            if len(session.forecast_history) > 12:
+                session.forecast_history.pop(0)
+
         return session._analysis
 
     def capture_pre_apply_snapshot(self, session_id: str, plan_id: str) -> None:
@@ -232,6 +260,11 @@ class SessionStore:
         if session is not None:
             session.invalidate_analysis()
     
+    def get_forecast_history(self, session_id: str) -> list:
+        """Return the time-series of forecast snapshots for this session."""
+        session = self.get_session(session_id)
+        return session.forecast_history if session is not None else []
+
     def record_actual_outcome(self, session_id: str, outcome: ActualSprintOutcome) -> bool:
         """
         Store a real sprint outcome once it's known (sprint closed).

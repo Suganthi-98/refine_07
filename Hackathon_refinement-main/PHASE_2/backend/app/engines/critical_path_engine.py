@@ -78,7 +78,12 @@ class CriticalPathEngine:
                 f"Review dependencies and break circular relationships."
             )
         
-        # Compute earliest start/finish times (forward pass)
+        # Baseline forward pass (no real-time floor) — zero-anchored project end.
+        # Diffing against the floored pass gives true network displacement.
+        baseline_finish = self._forward_pass_baseline()
+        baseline_end = max(baseline_finish.values()) if baseline_finish else 0.0
+
+        # Compute earliest start/finish times (forward pass with real-time floor)
         earliest_start, earliest_finish = self._forward_pass()
         
         # Compute latest start/finish times (backward pass)
@@ -132,10 +137,33 @@ class CriticalPathEngine:
             items_on_critical_path=critical_items,
             high_risk_items=critical_items,  # Critical path items are high risk
             num_critical_paths=num_cp,
-            calendar_shift_hours=self._real_time_floor_hours,
+            calendar_shift_hours=max(
+                0.0,
+                (max(earliest_finish.values()) if earliest_finish else 0.0) - baseline_end
+            ),
             calendar_floored_items=sorted(set(self.calendar_floored_items)),
         )
     
+    def _forward_pass_baseline(self) -> Dict[str, float]:
+        """Forward pass with NO real-time floor — zero-anchored project end.
+        Diff against floored pass to get true network displacement."""
+        earliest_finish: Dict[str, float] = {}
+        earliest_start: Dict[str, float] = {}
+        for node in self.dag.topological_order:
+            preds = self.dag.reverse_graph.get(node, [])
+            if not preds:
+                earliest_start[node] = 0.0
+            else:
+                max_pred = 0.0
+                for pred in preds:
+                    lag_h = self.dag.lag_days_map.get((pred, node), 0) * 8.0
+                    max_pred = max(max_pred, earliest_finish.get(pred, 0.0) + lag_h)
+                earliest_start[node] = max_pred
+            wi = self.work_items.get(node)
+            duration = wi.current_estimate_hrs if wi else 0.0
+            earliest_finish[node] = earliest_start[node] + duration
+        return earliest_finish
+
     def _forward_pass(self) -> Tuple[Dict[str, float], Dict[str, float]]:
         """Compute earliest start/finish times using topological sort."""
         earliest_start = {}

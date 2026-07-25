@@ -75,6 +75,10 @@ export const api = {
     const resp = await fetch(sessionUrl('/monte-carlo', sessionId))
     return unwrapResponse(resp)
   },
+  forecastTrend: async (sessionId = '') => {
+    const resp = await fetch(sessionUrl('/forecast-trend', sessionId))
+    return unwrapResponse(resp)
+  },
   risk: async (sessionId = '') => {
     const resp = await fetch(sessionUrl('/risk', sessionId))
     return unwrapResponse(resp)

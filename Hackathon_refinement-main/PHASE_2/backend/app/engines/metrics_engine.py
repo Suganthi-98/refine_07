@@ -313,6 +313,8 @@ class ProjectMetrics(BaseModel):
     resource_metrics: ResourceMetrics
     resource_sprint_loads: Dict[str, Dict[str, float]] = Field(default_factory=dict)
     # e.g. {"Meena Balasubramanian": {"Sprint 6": 1.21, "Sprint 7": 0.78}}
+    per_resource_base_velocity: Dict[str, float] = Field(default_factory=dict)
+    # e.g. {"Meena Balasubramanian": 48.0, "Ravi Chandran": 56.0}  (hrs/sprint, skill-adjusted)
     carryover_history: List[Dict[str, Any]] = Field(default_factory=list)
     # e.g. [{"item_id": "WI-047", "orig_sprint": "Sprint 5", "current_sprint": "Sprint 6"}]
     scope_inflation_by_reason: Dict[str, float] = Field(default_factory=dict)
@@ -373,7 +375,9 @@ class MetricsEngine:
         blocker_counts = self._count_blockers_by_severity(blockers)
         active_blockers = sum(1 for b in blockers if not b.actual_resolution_date)
         _as_of = self.project_state.project_info.effective_as_of_date()
-        blocker_velocity_impact = self._estimate_blocker_velocity_impact(blockers, as_of_date=_as_of)
+        blocker_velocity_impact = self._estimate_blocker_velocity_impact(
+            blockers, as_of_date=_as_of, work_items=work_items, team=team
+        )
 
         # Schedule metrics
         completed_sprints = sum(1 for s in sprints if s.status == SprintStatus.COMPLETED)
@@ -397,6 +401,7 @@ class MetricsEngine:
         velocity_metrics = self._build_velocity_metrics(actuals)
         resource_metrics = self._build_resource_metrics(team, work_items)
         resource_sprint_loads = self._build_resource_sprint_loads(team, sprints, work_items)
+        per_resource_base_velocity = self._build_per_resource_base_velocity(team, work_items, sprints)
         effective_project_velocity = self._calculate_effective_project_velocity(
             team=team,
             work_items=work_items,
@@ -468,6 +473,7 @@ class MetricsEngine:
             velocity_metrics=velocity_metrics,
             resource_metrics=resource_metrics,
             resource_sprint_loads=resource_sprint_loads,
+            per_resource_base_velocity=per_resource_base_velocity,
             carryover_history=carryover_history,
             scope_inflation_by_reason=scope_inflation_by_reason,
             blocker_metrics=blocker_metrics,
@@ -750,6 +756,28 @@ class MetricsEngine:
             result[resource.name] = per_sprint
         return result
 
+
+    def _build_per_resource_base_velocity(
+        self, team: List[Any], work_items: List[Any], sprints: List[Any]
+    ) -> Dict[str, float]:
+        """Skill-adjusted effective velocity (hrs/sprint) for each team member.
+
+        Uses the same _calculate_resource_effectiveness() formula that drives
+        effective_project_velocity, so the two are always consistent.  The
+        result is consumed by ForecastEngine to degrade each person's velocity
+        individually (for blockers and spillover) then sum to a team total —
+        replacing the old approach of applying a single drag factor to one
+        monolithic base_velocity figure.
+        """
+        sprint_days = float(self.project_state.project_info.sprint_duration_days or 10)
+        result: Dict[str, float] = {}
+        for resource in team:
+            result[resource.name] = self._calculate_resource_effectiveness(
+                resource=resource,
+                work_items=work_items,
+                sprint_days=sprint_days,
+            )
+        return result
     def _calculate_effective_project_velocity(
         self,
         team: List[Any],
@@ -868,7 +896,12 @@ class MetricsEngine:
         blocker_counts = self._count_blockers_by_severity(blockers)
         active_blockers = [b for b in blockers if not b.actual_resolution_date]
         _as_of = self.project_state.project_info.effective_as_of_date()
-        blocker_velocity_impact = self._estimate_blocker_velocity_impact(blockers, as_of_date=_as_of)
+        blocker_velocity_impact = self._estimate_blocker_velocity_impact(
+            blockers,
+            as_of_date=_as_of,
+            work_items=getattr(self.project_state, "work_items", None),
+            team=getattr(self.project_state, "team", None),
+        )
         recurring_categories: Dict[str, int] = {}
         for blocker in blockers:
             recurring_categories[blocker.category.value] = recurring_categories.get(blocker.category.value, 0) + 1
@@ -1078,33 +1111,33 @@ class MetricsEngine:
 
     @staticmethod
     @staticmethod
-    def _estimate_blocker_velocity_impact(blockers, as_of_date=None) -> float:
+    def _estimate_blocker_velocity_impact(
+        blockers, as_of_date=None, work_items=None, team=None
+    ) -> float:
         """Estimate velocity impact from active blockers (0.0-1.0).
 
-        Age-weighted: a blocker that has been open for many days causes more
-        disruption than one raised yesterday, because chronic blockers erode
-        team focus, accumulate workarounds, and signal systemic dysfunction —
-        not just a point-in-time impediment.
+        Age-weighted and WI-owner-scoped: the drag a blocker exerts on team
+        velocity is proportional to the fraction of the team that is actually
+        blocked — derived from the owners of the work items listed in
+        impacted_item_ids, not applied uniformly to the whole team.
+
+        Example: BLK-004 blocks 2 WIs both owned by Meena on a 9-person team.
+        team_fraction = 1/9 ≈ 0.11.  A HIGH blocker's base_weight of 0.20 is
+        scaled to 0.20 × 0.11 = 0.022 before age amplification.  This keeps
+        the blocker delay proportional to real impact rather than treating one
+        person's external dependency as a whole-team slowdown.
 
         Weighting formula per blocker:
-            base_weight  = severity-tier weight (unchanged)
-            age_days     = (as_of - raised_date).days, floored at 0
-            age_factor   = 1 + log2(1 + age_days / 21)
-                           ↑ doubles the weight at 21 days open,
-                             triples at ~63 days, quadruples at ~147 days.
-                             Divisor raised from 7→21 so a blocker that has
-                             been open for ~5 weeks (a realistic escalation
-                             window) doesn't already sit near the 0.80 cap.
-                             The curve still age-penalises meaningfully — it
-                             just doesn't treat a 5-week-old HIGH blocker the
-                             same as one that has been ignored for a year.
-            effective_wt = min(base_weight * age_factor, 0.80)
-                           ↑ hard cap per blocker so one ancient LOW blocker
-                             can't dominate the entire impact score.
+            base_weight   = severity-tier weight
+            team_fraction = distinct affected WI owners / total team size
+                            (floored at 1/team_size so a blocker always has
+                             some impact; capped at 1.0)
+            age_days      = (as_of - raised_date).days, floored at 0
+            age_factor    = 1 + log2(1 + age_days / 21)
+            effective_wt  = min(base_weight * team_fraction * age_factor, 0.80)
 
-        The survival-product aggregation is unchanged: independent blockers
-        compound multiplicatively, not additively, which avoids the
-        mathematically-incorrect scenario where 10 LOW blockers sum to >1.0.
+        Survival-product aggregation (unchanged): independent blockers compound
+        multiplicatively so multiple LOW blockers can never sum beyond 1.0.
         """
         import math
 
@@ -1123,14 +1156,50 @@ class MetricsEngine:
             from datetime import datetime
             as_of_date = datetime.utcnow()
 
+        # Build a lookup from item_id -> assigned_resource for team-fraction calc.
+        item_owner: dict = {}
+        if work_items:
+            for wi in work_items:
+                owner = getattr(wi, "assigned_resource", None)
+                if owner:
+                    item_owner[wi.item_id] = owner
+
+        total_team = max(1, len(team)) if team else 1
+
         survival = 1.0
         for blocker in active_blockers:
             base_w = base_weight_map.get(blocker.severity, 0.05)
 
+            # ── team_fraction: who is actually blocked? ───────────────────────
+            # Collect all item IDs this blocker touches (primary + impacted).
+            all_blocked_ids: set = set()
+            primary = getattr(blocker, "related_item_id", None)
+            if primary:
+                all_blocked_ids.add(primary)
+            for iid in (getattr(blocker, "impacted_item_ids", None) or []):
+                all_blocked_ids.add(iid)
+
+            if all_blocked_ids and item_owner:
+                affected_owners = {
+                    item_owner[iid]
+                    for iid in all_blocked_ids
+                    if iid in item_owner
+                }
+                # Floor at 1 person so the blocker always registers something;
+                # cap at total_team so fraction never exceeds 1.0.
+                n_affected = max(1, len(affected_owners))
+            else:
+                # No WI linkage available — fall back to assuming 1 person
+                # affected rather than the whole team (conservative but not
+                # zero, and better than the old whole-team assumption).
+                n_affected = 1
+
+            team_fraction = min(1.0, n_affected / total_team)
+
+            # ── age amplification ─────────────────────────────────────────────
             raised = getattr(blocker, "raised_date", None)
             if raised is not None:
                 try:
-                    # Normalize both sides to offset-naive UTC for comparison.
                     r = raised.replace(tzinfo=None) if raised.tzinfo else raised
                     a = as_of_date.replace(tzinfo=None) if getattr(as_of_date, "tzinfo", None) else as_of_date
                     age_days = max(0.0, (a - r).total_seconds() / 86400.0)
@@ -1139,11 +1208,8 @@ class MetricsEngine:
             else:
                 age_days = 0.0
 
-            # age_factor: 1.0 at day 0, ~2.0 at 7 days, ~3.0 at 21 days,
-            # ~4.0 at 49 days.  Logarithmic so very old blockers don't
-            # dominate everything — they matter more, but within reason.
-            age_factor = 1.0 + math.log2(1.0 + age_days / 21.0)  # /21: doubles at 21 d, not 7 d — avoids over-penalising realistic escalation timelines
-            effective_w = min(base_w * age_factor, 0.80)
+            age_factor = 1.0 + math.log2(1.0 + age_days / 21.0)
+            effective_w = min(base_w * team_fraction * age_factor, 0.80)
 
             survival *= (1.0 - effective_w)
 
