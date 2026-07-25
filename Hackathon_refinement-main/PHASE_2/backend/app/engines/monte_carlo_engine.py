@@ -100,7 +100,7 @@ class MonteCarloEngine:
         # so one bad sprint doesn't distort the whole forecast.
         self._velocity_bias_correction = 0.0
         try:
-            team_id = getattr(project_state.project_info, "team_id", "default") or "default"
+            team_id = getattr(self.project_state.project_info, "team_id", "default") or "default"
             profile = CalibrationStore.get(team_id)
             if profile and profile.episode_count >= MIN_EPISODES_FOR_CORRECTION:
                 # velocity_bias = (actual - forecast) / forecast
@@ -325,37 +325,33 @@ class MonteCarloEngine:
         return expected_finish
 
     def _calculate_schedule_elapsed_days(self, sprint_days: float) -> float:
-        """Estimate elapsed project time using sprint schedule dates only."""
-        completed_sprints = sum(
-            1
-            for sprint in self.project_state.sprints
-            if (
-                sprint.status == SprintStatus.COMPLETED
-                or (isinstance(sprint.status, str) and sprint.status == SprintStatus.COMPLETED.value)
-            )
-        )
+        """Real elapsed calendar days since project start, anchored to
+        effective_as_of_date() (wall-clock time unless a demo snapshot is
+        pinned via as_of_date).
 
-        days_from_completed = completed_sprints * sprint_days
+        FIX: The previous implementation counted elapsed time purely from
+        sprint status labels — completed_sprints * sprint_days + at most one
+        sprint window for the in-progress sprint. That made the model's
+        internal clock stop advancing once the current sprint started, no
+        matter how many calendar days had passed. For this project, Sprint 6
+        ended 2026-07-13 but is still marked In Progress with zero velocity —
+        the old method credited only 14 days for Sprint 6 regardless of the
+        actual overrun, making the project appear 11+ days younger than it is
+        and producing an "ahead of schedule" result despite blockers,
+        overloads, and zero throughput.
 
-        current_sprint = next(
-            (
-                sprint
-                for sprint in self.project_state.sprints
-                if (
-                    sprint.status == SprintStatus.IN_PROGRESS
-                    or (isinstance(sprint.status, str) and sprint.status == SprintStatus.IN_PROGRESS.value)
-                )
-            ),
-            None,
-        )
-        if not current_sprint:
-            return days_from_completed
+        Anchoring to the real date fixes this unconditionally: stalled sprints
+        and overdue-but-not-started sprints immediately show up as elapsed
+        schedule time, with no dependency on anyone updating a status field.
 
-        sprint_window_days = max(
-            0.0,
-            (current_sprint.end_date - current_sprint.start_date).total_seconds() / (24 * 3600),
-        )
-        return days_from_completed + min(sprint_window_days, sprint_days)
+        Must stay in sync with ForecastEngine._calculate_schedule_elapsed_days,
+        which uses the identical approach. If these two diverge, the
+        deterministic and probabilistic elapsed-day figures will disagree and
+        produce contradictory delay/probability signals.
+        """
+        project_start = self.project_state.project_info.forecast_anchor_date()
+        as_of = self.project_state.project_info.effective_as_of_date()
+        return max(0.0, (as_of - project_start).total_seconds() / (24 * 3600))
 
     def _calculate_statistics(
         self, finish_dates: List[datetime], target_end_date: datetime

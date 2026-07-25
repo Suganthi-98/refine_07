@@ -437,6 +437,42 @@ def run_emios_pipeline(
         simulation_count=simulation_count,
         seed=seed,
     ).calculate()
+
+    # ── P95 guardrail ────────────────────────────────────────────────────────
+    # The deterministic engine produces a single-point forecast grounded in
+    # real project data (remaining effort, velocity, blocker impact, spillover).
+    # The Monte Carlo P95 is the 95th-percentile tail across 10 000 simulations
+    # of the same inputs — meaning only 5% of simulation outcomes finish later.
+    # If the deterministic date exceeds P95, it has no new information beyond
+    # what the simulations already modelled; it is an arithmetic artefact
+    # (concurrent risks being double-counted as sequential).  Cap it here so
+    # the two models agree on the outer bound and the UI never shows a
+    # projected finish that is worse than the 1-in-20 worst-case scenario.
+    try:
+        _p95 = result.monte_carlo.p95_finish_date if result.monte_carlo else None
+        if _p95 and result.forecast.expected_finish_date > _p95:
+            # Rebuild only the two date fields that feed the UI; all other
+            # forecast fields (velocity, effort, waterfall days) are unchanged.
+            result.forecast = result.forecast.model_copy(update={
+                "expected_finish_date": _p95,
+                "expected_delay_days": float(round(
+                    (result.forecast.expected_delay_days
+                     - (result.forecast.expected_finish_date - _p95).days),
+                    2,
+                )),
+            })
+            # Mirror the cap into steering_brief so Steering Summary and
+            # Delivery Outlook show the same date.
+            if result.forecast.steering_brief:
+                result.forecast = result.forecast.model_copy(update={
+                    "steering_brief": result.forecast.steering_brief.model_copy(update={
+                        "expected_finish_date": _p95,
+                        "expected_delay_days": result.forecast.expected_delay_days,
+                    })
+                })
+    except Exception:
+        pass  # guardrail is advisory — never crash the pipeline
+
     impact_scores = ImpactScoringEngine(state, result.dependency_dag).score()
     result.risk_scores = impact_scores
     result.risk_result = RiskEngine(

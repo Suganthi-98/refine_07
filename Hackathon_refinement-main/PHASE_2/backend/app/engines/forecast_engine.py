@@ -108,9 +108,91 @@ class ForecastEngine:
         predicted_spillover_items = 0.0
         if self.spillover:
             try:
-                total_spill = sum(self.spillover.predicted_spillover_by_sprint.values())
+                # Only count active / future sprints — completed sprints always
+                # return 0.0 from the spillover engine (nothing left to spill),
+                # so including them dilutes the sum and masks real overload signals
+                # from the current and upcoming sprints.
+                active_sprint_nums: set = {
+                    s.sprint_number
+                    for s in self.project_state.sprints
+                    if s.status in (SprintStatus.IN_PROGRESS, SprintStatus.NOT_STARTED)
+                }
+                total_spill = sum(
+                    v
+                    for sprint_num, v in self.spillover.predicted_spillover_by_sprint.items()
+                    if sprint_num in active_sprint_nums
+                )
                 predicted_spillover_items = float(total_spill)
                 spillover_hours = float(total_spill) * avg_item_effort
+
+                # Floor: if individual resources are over-allocated the spillover
+                # engine may still round down to zero items when the excess hours
+                # are smaller than avg_item_effort.  Compute the raw overload
+                # hours directly from team loads (same formula MetricsEngine uses
+                # for resource_sprint_loads) and use whichever is larger — so
+                # three overloaded team members always show a non-zero spillover
+                # signal in the waterfall, even when no single sprint crosses the
+                # item-count threshold on its own.
+                try:
+                    sprint_days_local = float(
+                        self.project_state.project_info.sprint_duration_days or 10
+                    )
+                    team = getattr(self.project_state, "team", None) or []
+                    loads = getattr(self.metrics, "resource_sprint_loads", None) or {}
+                    active_sprint_ids = {
+                        s.sprint_id
+                        for s in self.project_state.sprints
+                        if s.status in (SprintStatus.IN_PROGRESS, SprintStatus.NOT_STARTED)
+                    }
+                    overload_excess_hrs = 0.0
+                    overloaded_resource_names: set = set()
+                    for resource in team:
+                        per_sprint = loads.get(resource.name) or loads.get(resource.resource_id) or {}
+                        for sprint_id, ratio in per_sprint.items():
+                            if sprint_id not in active_sprint_ids or ratio <= 1.0:
+                                continue
+                            capacity = (
+                                (resource.daily_capacity_hrs or 0.0)
+                                * sprint_days_local
+                                * (resource.availability_pct or 1.0)
+                                * (resource.allocation_pct or 1.0)
+                            )
+                            overload_excess_hrs += capacity * (ratio - 1.0)
+                            overloaded_resource_names.add(resource.name)
+                    if overload_excess_hrs > spillover_hours:
+                        spillover_hours = overload_excess_hrs
+                        predicted_spillover_items = max(
+                            predicted_spillover_items,
+                            overload_excess_hrs / avg_item_effort,
+                        )
+                    # Scope the spillover velocity drag to overloaded people only.
+                    # Without this, spillover_fraction is applied to the whole team's
+                    # projected_velocity even though context-switching and crowded-sprint
+                    # friction falls only on the resources who are actually over capacity.
+                    # Scale spillover_hours by (overloaded_capacity / total_capacity) so
+                    # the drag is proportional to the affected share of the team.
+                    if overloaded_resource_names and team:
+                        total_capacity = sum(
+                            (r.daily_capacity_hrs or 0.0)
+                            * sprint_days_local
+                            * (r.availability_pct or 1.0)
+                            * (r.allocation_pct or 1.0)
+                            for r in team
+                        )
+                        overloaded_capacity = sum(
+                            (r.daily_capacity_hrs or 0.0)
+                            * sprint_days_local
+                            * (r.availability_pct or 1.0)
+                            * (r.allocation_pct or 1.0)
+                            for r in team
+                            if r.name in overloaded_resource_names
+                        )
+                        if total_capacity > 0:
+                            spillover_team_fraction = min(1.0, overloaded_capacity / total_capacity)
+                            spillover_hours = spillover_hours * spillover_team_fraction
+                            predicted_spillover_items = spillover_hours / max(avg_item_effort, 1.0)
+                except Exception:
+                    pass  # floor is advisory — never crash if metrics lack loads
             except Exception:
                 predicted_spillover_items = 0.0
                 spillover_hours = 0.0
@@ -220,17 +302,127 @@ class ForecastEngine:
         except Exception:
             pass  # stall detection is advisory — never crash the core forecast
 
-        # Compute velocity_without_spillover AFTER the substitution above settles base_velocity --
-        # otherwise this and base_schedule_days below are derived from two different base_velocity
-        # values, and their difference gets mislabeled as blocker-caused delay when it is really
-        # just the sprint-velocity-substitution effect (reproducible even when blocker_impact == 0).
-        velocity_without_spillover = max(base_velocity * (1.0 - blocker_impact), base_velocity * _cal.velocity_floor_pct)
+        # ── Per-resource velocity degradation ─────────────────────────────────
+        # Degrade each person's velocity individually then sum, instead of
+        # applying a single blocker_impact / spillover_fraction to one monolithic
+        # base_velocity.
+        #
+        # Blocker drag  → only the owners of blocked WIs take the drag,
+        #                 proportional to their share of total blocked hours.
+        # Spillover drag → only overloaded resources take the context-switch
+        #                  friction (excess load ratio × 0.5 dampener).
+        # Everyone else runs at their undegraded skill-adjusted base velocity.
+
+        per_res_vel: Dict[str, float] = dict(
+            getattr(self.metrics, "per_resource_base_velocity", None) or {}
+        )
+        team_list = getattr(self.project_state, "team", None) or []
+
+        if per_res_vel:
+            base_velocity = max(sum(per_res_vel.values()), base_velocity)
+
+        # Blocker drag: map blocked WI hours to their owners
+        item_owner_map: Dict[str, str] = {
+            wi.item_id: wi.assigned_resource
+            for wi in self.project_state.work_items
+            if getattr(wi, "assigned_resource", None)
+        }
+        blocked_hrs_per_resource: Dict[str, float] = {}
+        total_blocked_hrs = 0.0
+        try:
+            open_blockers = [
+                b for b in self.project_state.blockers
+                if not getattr(b, "actual_resolution_date", None)
+            ]
+            for b in open_blockers:
+                all_ids: set = set()
+                if getattr(b, "related_item_id", None):
+                    all_ids.add(b.related_item_id)
+                for iid in (getattr(b, "impacted_item_ids", None) or []):
+                    all_ids.add(iid)
+                for iid in all_ids:
+                    owner = item_owner_map.get(iid)
+                    if not owner:
+                        continue
+                    wi_obj = next(
+                        (w for w in self.project_state.work_items if w.item_id == iid), None
+                    )
+                    hrs = float(getattr(wi_obj, "remaining_effort_hrs", 0.0)) if wi_obj else 0.0
+                    blocked_hrs_per_resource[owner] = blocked_hrs_per_resource.get(owner, 0.0) + hrs
+                    total_blocked_hrs += hrs
+        except Exception:
+            pass
+
+        # Spillover drag: overload ratio per resource in active sprints
+        overload_ratio_per_resource: Dict[str, float] = {}
+        try:
+            loads = getattr(self.metrics, "resource_sprint_loads", None) or {}
+            active_sprint_ids_set = {
+                s.sprint_id for s in self.project_state.sprints
+                if s.status in (SprintStatus.IN_PROGRESS, SprintStatus.NOT_STARTED)
+            }
+            for resource in team_list:
+                per_sprint = loads.get(resource.name) or loads.get(resource.resource_id) or {}
+                max_ratio = max(
+                    (r for sid, r in per_sprint.items() if sid in active_sprint_ids_set),
+                    default=0.0,
+                )
+                if max_ratio > 1.0:
+                    overload_ratio_per_resource[resource.name] = max_ratio - 1.0
+        except Exception:
+            pass
+
+        # Build per-resource projected velocity
+        velocity_floor_abs = base_velocity * _cal.velocity_floor_pct
+        n_resources = max(len(team_list), 1)
+        projected_vel_per_resource: Dict[str, float] = {}
+
+        for resource in team_list:
+            rv = float(per_res_vel.get(resource.name, 0.0))
+            if rv <= 0:
+                continue
+            personal_blocked_hrs = blocked_hrs_per_resource.get(resource.name, 0.0)
+            personal_blocker_impact = (
+                blocker_impact * (personal_blocked_hrs / total_blocked_hrs)
+                if total_blocked_hrs > 0 and personal_blocked_hrs > 0
+                else 0.0
+            )
+            rv_after_blocker = max(rv * (1.0 - personal_blocker_impact), velocity_floor_abs / n_resources)
+            excess = overload_ratio_per_resource.get(resource.name, 0.0)
+            personal_spillover_fraction = min(0.4, excess)
+            rv_projected = rv_after_blocker * (1.0 - personal_spillover_fraction * 0.5)
+            projected_vel_per_resource[resource.name] = max(rv_projected, velocity_floor_abs / n_resources)
+
+        if projected_vel_per_resource:
+            projected_velocity = max(sum(projected_vel_per_resource.values()), velocity_floor_abs)
+            # velocity_without_spillover: blocker-degraded only, no spillover drag
+            vel_without_spillover_sum = sum(
+                max(
+                    float(per_res_vel.get(r.name, 0.0)) * (
+                        1.0 - (
+                            blocker_impact * (blocked_hrs_per_resource.get(r.name, 0.0) / max(total_blocked_hrs, 1.0))
+                            if total_blocked_hrs > 0 else 0.0
+                        )
+                    ),
+                    velocity_floor_abs / n_resources,
+                )
+                for r in team_list if per_res_vel.get(r.name, 0.0) > 0
+            )
+            velocity_without_spillover = max(vel_without_spillover_sum, velocity_floor_abs)
+        else:
+            # Fallback: old monolithic formula
+            velocity_without_spillover = max(base_velocity * (1.0 - blocker_impact), velocity_floor_abs)
+            projected_velocity = max(
+                base_velocity * (1.0 - blocker_impact) * (1.0 - min(0.4, spillover_hours / max(base_velocity, 1.0)) * 0.5),
+                velocity_floor_abs,
+            )
+
         base_schedule_days = (adjusted_remaining / base_velocity) * sprint_days if base_velocity > 0 else 0.0
         days_without_spillover = (
             (adjusted_remaining / velocity_without_spillover) * sprint_days
             if velocity_without_spillover > 0 else 0.0
         )
-
+        # spillover_fraction retained for waterfall display decomposition only
         spillover_penalty_days = (
             (spillover_hours / velocity_without_spillover) * sprint_days
             if velocity_without_spillover > 0 else 0.0
@@ -239,15 +431,19 @@ class ForecastEngine:
             min(0.4, spillover_penalty_days / max(1.0, days_without_spillover))
             if days_without_spillover > 0 else 0.0
         )
-        projected_velocity = max(
-            base_velocity * (1.0 - blocker_impact) * (1.0 - spillover_fraction * 0.5),
-            base_velocity * _cal.velocity_floor_pct,
-        )
         remaining_days_blocker_loss = max(0.0, days_without_spillover - base_schedule_days)
         raw_remaining_days = (adjusted_remaining / projected_velocity) * sprint_days if projected_velocity > 0 else 0.0
         spillover_delay_days = max(0.0, raw_remaining_days - days_without_spillover)
         remaining_days_base_work = base_schedule_days
-        remaining_days_total = base_schedule_days + remaining_days_blocker_loss + spillover_delay_days
+        # FIX: use raw_remaining_days (derived from projected_velocity which already
+        # compounds blocker_impact and spillover_fraction multiplicatively) as the
+        # single remaining-time figure.  The old formula summed three separate additive
+        # buckets (base + blocker_loss + spillover_delay) which treated every risk as
+        # purely sequential, causing the deterministic finish date to overshoot the
+        # Monte Carlo P95 worst-case ceiling.  The decomposition variables above are
+        # kept for the steering waterfall display (so bars still sum meaningfully for
+        # stakeholders) but they must not be re-added here to produce the headline date.
+        remaining_days_total = raw_remaining_days
         velocity_floor = base_velocity * _cal.velocity_floor_pct
         velocity_floor_saturated_by_blockers = bool(velocity_without_spillover <= velocity_floor + 1e-6 and spillover_hours > 0.0)
 

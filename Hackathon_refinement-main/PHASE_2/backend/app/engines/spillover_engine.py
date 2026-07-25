@@ -31,7 +31,7 @@ from typing import Dict, List, Tuple, Any
 from pydantic import BaseModel
 import statistics
 
-from app.domain.models import ProjectState, WorkItemStatus
+from app.domain.models import ProjectState, WorkItemStatus, SprintStatus
 
 
 class SpilloverAnalysis(BaseModel):
@@ -183,6 +183,20 @@ class SpilloverAnalysisEngine:
         avg_velocity = sum(actual_velocities) / len(actual_velocities) if actual_velocities else 100.0
         
         for sprint_num, sprint in self.sprints.items():
+            # Skip completed sprints — they are done, their velocity already
+            # appears in SprintActual records, and any stray NOT_STARTED /
+            # IN_PROGRESS items left assigned to them are anomalies in the
+            # workbook, not genuine future spillover risk.  Including completed
+            # sprints here inflates predicted_spillover_by_sprint with work that
+            # will never actually spill into future capacity, which in turn
+            # causes ForecastEngine and MonteCarloEngine to under-count
+            # effective velocity and report fictitious schedule delay.
+            if getattr(sprint, 'status', None) in (SprintStatus.COMPLETED,) or (
+                isinstance(getattr(sprint, 'status', None), str)
+                and getattr(sprint, 'status', '') == SprintStatus.COMPLETED.value
+            ):
+                continue
+
             # Group items assigned to this sprint
             sprint_items = [
                 i for i in self.work_items
