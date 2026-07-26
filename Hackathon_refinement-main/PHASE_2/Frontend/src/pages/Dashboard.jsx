@@ -401,16 +401,16 @@ function DelayDiagnosis({session}){
           <p className="text-xs text-slate-500">Adds up to the {Math.abs(brief.expected_delay_days).toFixed(1)}-day {brief.expected_delay_days >= 0 ? 'delay' : 'cushion'} above</p>
         </div>
         <div className="mt-4 space-y-4">
-          {brief.waterfall.map((d, i) => {
-            const isZero = d.days === 0
-            const tone = isZero ? TONE_STYLES.neutral : (TONE_STYLES[d.tone] || TONE_STYLES.neutral)
-            const width = isZero ? 0 : Math.max(4, Math.round((Math.abs(d.days || 0) / maxAbs) * 100))
+          {/* Additive rows: days > 0 or days < 0 — these sum to expected_delay_days */}
+          {brief.waterfall.filter(d => d.days !== 0).map((d, i) => {
+            const tone = TONE_STYLES[d.tone] || TONE_STYLES.neutral
+            const width = Math.max(4, Math.round((Math.abs(d.days || 0) / maxAbs) * 100))
             return (
-              <div key={d.key} className={`space-y-1.5 ${isZero ? 'opacity-50' : ''}`}>
+              <div key={d.key} className="space-y-1.5">
                 <div className="flex items-center justify-between text-sm text-slate-300">
-                  <span className={`font-medium ${isZero ? 'text-slate-500' : ''}`}>{d.label}</span>
-                  <span className={`font-semibold ${isZero ? 'text-slate-500' : tone.value}`}>
-                    {isZero ? '✓ 0.0d' : `${d.days > 0 ? '+' : ''}${d.days.toFixed(1)}d`}
+                  <span className="font-medium">{d.label}</span>
+                  <span className={`font-semibold ${tone.value}`}>
+                    {`${d.days > 0 ? '+' : ''}${d.days.toFixed(1)}d`}
                   </span>
                 </div>
                 <div className="h-3 rounded-full bg-slate-800 overflow-hidden">
@@ -426,6 +426,27 @@ function DelayDiagnosis({session}){
               </div>
             )
           })}
+
+          {/* Risk-signal rows: days = 0, already priced into additive rows above */}
+          {brief.waterfall.some(d => d.days === 0) && (
+            <div className="mt-4 pt-4 border-t border-slate-800">
+              <p className="text-[10px] uppercase tracking-[0.2em] text-slate-500 mb-3">Risk signals (already priced in above)</p>
+              <div className="space-y-2">
+                {brief.waterfall.filter(d => d.days === 0).map(d => {
+                  const isRisk = d.tone === 'risk'
+                  return (
+                    <div key={d.key} className="flex items-start gap-2">
+                      <span className={`mt-0.5 h-2 w-2 flex-none rounded-full ${isRisk ? 'bg-amber-400' : 'bg-slate-600'}`} />
+                      <div>
+                        <span className={`text-xs font-medium ${isRisk ? 'text-amber-300' : 'text-slate-500'}`}>{d.label}</span>
+                        <p className="text-[11px] text-slate-500 leading-relaxed">{d.detail}</p>
+                      </div>
+                    </div>
+                  )
+                })}
+              </div>
+            </div>
+          )}
         </div>
       </div>
 
@@ -453,7 +474,6 @@ function DelayDiagnosis({session}){
                   <th className="px-4 py-2 font-medium">Blocker</th>
                   <th className="px-4 py-2 font-medium">Owner</th>
                   <th className="px-4 py-2 font-medium">Severity</th>
-                  <th className="px-4 py-2 font-medium text-right">Impact (this blocker)</th>
                   <th className="px-4 py-2 font-medium">Age</th>
                   <th className="px-4 py-2 font-medium">Target date</th>
                 </tr>
@@ -475,12 +495,6 @@ function DelayDiagnosis({session}){
                       </td>
                       <td className="px-4 py-3 align-top text-slate-300">{b.owner || <span className="text-rose-400">Unassigned</span>}</td>
                       <td className="px-4 py-3 align-top"><SeverityBadge severity={b.severity} /></td>
-                      <td className="px-4 py-3 align-top text-right">
-                        <span className="font-semibold text-rose-300">{b.delay_days.toFixed(1)}d</span>
-                        {ageDays != null && ageDays >= 7 && (
-                          <div className="text-[10px] text-slate-500 mt-0.5">age-amplified</div>
-                        )}
-                      </td>
                       <td className={`px-4 py-3 align-top ${ageColor}`}>
                         {ageDays != null ? `${ageDays}d open` : '—'}
                       </td>
@@ -492,7 +506,7 @@ function DelayDiagnosis({session}){
             </table>
           </div>
           <p className="mt-1.5 text-[10px] text-slate-500 px-1">
-            <span className="font-medium text-slate-400">Impact (this blocker)</span> shows each blocker's individual age-weighted velocity drag — the longer it stays open, the more it compounds (log₂ scale: doubles at 7 days, triples at 21 days). The <span className="font-medium text-slate-400">Open blockers</span> figure in the waterfall above is the combined total across all open blockers, so it will always exceed any single blocker's impact shown here.
+            The <span className="font-medium text-slate-400">Open blockers</span> figure in the waterfall above is the combined team-velocity drag across all open blockers. Age column turns amber at 7 days and red at 14 days — older blockers compound velocity impact logarithmically.
           </p>
         </div>
       )}

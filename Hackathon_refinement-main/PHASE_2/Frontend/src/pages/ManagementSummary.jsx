@@ -124,7 +124,7 @@ function FinishDateWindow({ sessionId }) {
       color: 'text-amber-300',  border: 'border-amber-400/40',  bg: 'bg-amber-400/5',  accent: 'text-amber-400',
     },
     {
-      label: 'Worst-Case Ceiling',
+      label: 'P95 Confidence Ceiling',
       hint:  '95th percentile outcome — only 1 in 20 simulations exceed this date. Use as the outer boundary for contingency planning, not as a target.',
       value: fmtShort(worstCase),
       color: 'text-rose-300',   border: 'border-rose-500/40',   bg: 'bg-rose-500/5',   accent: 'text-rose-400',

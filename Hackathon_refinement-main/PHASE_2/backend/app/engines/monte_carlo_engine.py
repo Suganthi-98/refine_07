@@ -122,6 +122,41 @@ class MonteCarloEngine:
         anchor = self.project_state.project_info.forecast_anchor_date()
         self._holiday_index = working_calendar.HolidayIndex.covering(anchor)
 
+        # Pre-compute stall factor once for all simulations.
+        # ForecastEngine applies the same logic deterministically; MC applies it
+        # to the mean so the P50 output is coherent with the deterministic finish.
+        # SYNC CONTRACT: mirrors forecast_engine.py stall detection exactly.
+        self._stall_adjusted_base_velocity_factor = 1.0
+        try:
+            as_of_mc = self.project_state.project_info.effective_as_of_date()
+            in_progress_sprints_mc = [
+                s for s in self.project_state.sprints
+                if s.status in (SprintStatus.IN_PROGRESS,)
+            ]
+            if in_progress_sprints_mc:
+                ip = in_progress_sprints_mc[0]
+                sprint_window = max(1.0, (ip.end_date - ip.start_date).total_seconds() / 86400.0)
+                elapsed_in_sprint = max(0.0, (as_of_mc - ip.start_date).total_seconds() / 86400.0)
+                fraction_elapsed = min(1.0, elapsed_in_sprint / sprint_window)
+                if fraction_elapsed >= 0.30:
+                    actuals_by_id = {a.sprint_id: a for a in self.project_state.actuals}
+                    actual_rec = actuals_by_id.get(ip.sprint_id)
+                    actual_so_far = float(actual_rec.actual_effort_hrs) if actual_rec else 0.0
+                    if actual_so_far > 0:
+                        raw_base_vel = float(self.metrics.actual_avg_velocity or 1.0)
+                        projected_full = actual_so_far / fraction_elapsed
+                        if projected_full < raw_base_vel:
+                            blended = max(
+                                0.5 * projected_full + 0.5 * raw_base_vel,
+                                raw_base_vel * self._velocity_floor_pct,
+                            )
+                            self._stall_adjusted_base_velocity_factor = blended / raw_base_vel
+                    else:
+                        # Zero hours logged: apply floor (same as ForecastEngine)
+                        self._stall_adjusted_base_velocity_factor = self._velocity_floor_pct
+        except Exception:
+            self._stall_adjusted_base_velocity_factor = 1.0
+
         # Collect finish dates from all simulations
         finish_dates: List[datetime] = []
 
@@ -229,6 +264,13 @@ class MonteCarloEngine:
                     base_velocity = max(base_velocity, avg_remaining_planned_velocity)
         except Exception:
             pass
+        # Apply stall factor (computed once in calculate(), mirrors ForecastEngine stall logic).
+        # This scales base_velocity DOWN when the in-progress sprint shows zero/low throughput,
+        # ensuring MC's mean velocity matches ForecastEngine's deterministic velocity so their
+        # outputs are coherent: FC should fall between MC P50 and P80, not beyond P95.
+        stall_factor = getattr(self, "_stall_adjusted_base_velocity_factor", 1.0)
+        if stall_factor < 1.0:
+            base_velocity = base_velocity * stall_factor
         # C1 fix: apply learned velocity bias correction
         if self._velocity_bias_correction != 0.0:
             # bias < 0 means model over-estimated → team was slower → reduce velocity
