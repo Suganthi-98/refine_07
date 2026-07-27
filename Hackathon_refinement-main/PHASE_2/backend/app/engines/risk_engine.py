@@ -216,7 +216,6 @@ class RiskEngine:
         """
         drivers: List[RiskDriver] = []
         reasons: List[str] = []
-        risk_components = []
 
         # 1. On-time probability is a confidence modifier on the delay estimate
         on_time_prob = self.monte_carlo.on_time_probability
@@ -361,20 +360,19 @@ class RiskEngine:
                     )
                 )
 
-        risk_components = []
-        if schedule_primary > 0:
-            risk_components.append(schedule_primary)
-            if spillover_component > 0.0 and delay_component > 0.0:
-                # Combine the forecast delay signal with a separate spillover-based
-                # schedule pressure signal when both are present. This prevents
-                # the schedule score from saturating prematurely at 100 for large
-                # delays while still reflecting additional spillover risk.
-                risk_components.append(spillover_component)
-
-        if risk_components:
-            schedule_score = sum(risk_components) / len(risk_components)
-        else:
-            schedule_score = 0.0
+        # Additive (not averaged) combination: the primary delay/spillover-
+        # fallback signal always counts in full, and the additive spillover
+        # pressure signal is added on top when present. Averaging these two
+        # (as before) meant that once spillover cleared, the primary signal
+        # was divided by a smaller denominator and could jump *up* even
+        # though a real risk factor (spillover) had just been resolved.
+        # Summing with a cap keeps the score monotonic: resolving spillover
+        # can only lower or hold the score, never raise it.
+        primary_slot = schedule_primary if schedule_primary > 0 else 0.0
+        additive_spillover_slot = (
+            spillover_component if (spillover_component > 0.0 and delay_component > 0.0) else 0.0
+        )
+        schedule_score = min(100.0, primary_slot + additive_spillover_slot)
 
         return RiskExplanation(
             score=min(100.0, schedule_score),
@@ -397,7 +395,17 @@ class RiskEngine:
         """
         drivers: List[RiskDriver] = []
         reasons: List[str] = []
-        risk_components = []
+
+        # Fixed slots (density, critical-path length, bottlenecks, cascade
+        # depth, active-blocker baseline) so an untriggered or resolved
+        # factor contributes 0.0 rather than shrinking the averaging
+        # denominator, which would otherwise let resolving one issue raise
+        # the score.
+        density_slot = 0.0
+        cp_length_slot = 0.0
+        bottleneck_slot = 0.0
+        cascade_slot = 0.0
+        blocker_baseline_slot = 0.0
 
         # 1. Total dependency count (normalized)
         dependency_metrics = self.metrics.dependency_metrics
@@ -408,7 +416,7 @@ class RiskEngine:
         # Benchmark: 1.5 deps per item is moderate, 2.5+ is high
         if dep_ratio > self.thresholds["dependency_density_high_ratio"]:
             dep_risk = min(100.0, (dep_ratio - self.thresholds["dependency_density_high_ratio"]) * 40.0 + 60.0)
-            risk_components.append(dep_risk)
+            density_slot = dep_risk
             drivers.append(
                 RiskDriver(
                     category="DEPENDENCY",
@@ -422,7 +430,7 @@ class RiskEngine:
             reasons.append(f"{dep_count} dependencies ({dep_ratio:.2f} per item)")
         elif dep_ratio > self.thresholds["dependency_density_moderate_ratio"]:
             dep_risk = (dep_ratio - self.thresholds["dependency_density_moderate_ratio"]) * 20.0 + 30.0
-            risk_components.append(dep_risk)
+            density_slot = dep_risk
             drivers.append(
                 RiskDriver(
                     category="DEPENDENCY",
@@ -439,7 +447,7 @@ class RiskEngine:
         cp_items = len(self.cp_result.items_on_critical_path)
         if cp_items > self.thresholds["critical_path_items_high"]:
             cp_risk = min(100.0, (cp_items - self.thresholds["critical_path_items_high"]) * 5.0 + 50.0)
-            risk_components.append(cp_risk)
+            cp_length_slot = cp_risk
             drivers.append(
                 RiskDriver(
                     category="DEPENDENCY",
@@ -453,7 +461,7 @@ class RiskEngine:
             reasons.append(f"{cp_items} items on critical path")
         elif cp_items > self.thresholds["critical_path_items_moderate"]:
             cp_risk = (cp_items - self.thresholds["critical_path_items_moderate"]) * 10.0
-            risk_components.append(cp_risk)
+            cp_length_slot = cp_risk
             drivers.append(
                 RiskDriver(
                     category="DEPENDENCY",
@@ -470,7 +478,7 @@ class RiskEngine:
         bottleneck_count = self.metrics.dependency_metrics.dependency_bottleneck_count
         if bottleneck_count > 0:
             bottleneck_risk = min(100.0, bottleneck_count * 15.0 + 40.0)
-            risk_components.append(bottleneck_risk)
+            bottleneck_slot = bottleneck_risk
             drivers.append(
                 RiskDriver(
                     category="DEPENDENCY",
@@ -489,7 +497,7 @@ class RiskEngine:
             max_cascade_depth = max(cascade_depths)
             if max_cascade_depth > self.thresholds["dependency_cascade_depth_high"]:
                 cascade_risk = min(100.0, (max_cascade_depth - self.thresholds["dependency_cascade_depth_high"]) * 15.0 + 60.0)
-                risk_components.append(cascade_risk)
+                cascade_slot = cascade_risk
                 drivers.append(
                     RiskDriver(
                         category="DEPENDENCY",
@@ -514,7 +522,7 @@ class RiskEngine:
             base = self.SEVERITY_SCORES.get(highest_sev, 15.0) if highest_sev is not None else 15.0
             extra = self.ADDITIONAL_BLOCKER_BONUS * (active_blockers - 1)
             baseline_score = min(100.0, base + extra)
-            risk_components.append(baseline_score)
+            blocker_baseline_slot = baseline_score
             drivers.append(
                 RiskDriver(
                     category="DEPENDENCY",
@@ -529,11 +537,17 @@ class RiskEngine:
             )
             reasons.append(f"{active_blockers} active blocker(s); baseline {baseline_score:.1f}")
 
-        # Average risk components
-        if risk_components:
-            dependency_score = sum(risk_components) / len(risk_components)
-        else:
-            dependency_score = 0.0
+        # Take the strongest (max) risk slot rather than averaging across
+        # fixed slots. This mirrors the existing pattern already used for
+        # single-sprint risk scoring below (max(components)) and is
+        # strictly monotonic: resolving/clearing a driver can only remove it
+        # from consideration (lowering or holding the max), never raise the
+        # score by shrinking an averaging denominator. It also avoids
+        # diluting a single strong driver (e.g. one severe bottleneck) just
+        # because other slots happen to be empty.
+        dependency_score = max(
+            density_slot, cp_length_slot, bottleneck_slot, cascade_slot, blocker_baseline_slot
+        )
 
         return RiskExplanation(
             score=min(100.0, dependency_score),
@@ -555,7 +569,14 @@ class RiskEngine:
         """
         drivers: List[RiskDriver] = []
         reasons: List[str] = []
-        risk_components = []
+
+        # Fixed slots (utilization, velocity degradation, active blockers,
+        # allocation imbalance) so an untriggered/resolved factor
+        # contributes 0.0 instead of shrinking the averaging denominator.
+        utilization_slot = 0.0
+        velocity_slot = 0.0
+        blocker_slot = 0.0
+        imbalance_slot = 0.0
 
         # 1. Team utilization
         avg_utilization = (
@@ -564,7 +585,7 @@ class RiskEngine:
         )
         if avg_utilization > self.thresholds["resource_utilization_high"]:
             util_risk = min(100.0, (avg_utilization - self.thresholds["resource_utilization_high"]) * 1000.0 + 80.0)
-            risk_components.append(util_risk)
+            utilization_slot = util_risk
             drivers.append(
                 RiskDriver(
                     category="RESOURCE",
@@ -578,7 +599,7 @@ class RiskEngine:
             reasons.append(f"Team utilization {avg_utilization*100:.1f}%")
         elif avg_utilization > self.thresholds["resource_utilization_moderate"]:
             util_risk = (avg_utilization - self.thresholds["resource_utilization_moderate"]) * 100.0 + 60.0
-            risk_components.append(util_risk)
+            utilization_slot = util_risk
             drivers.append(
                 RiskDriver(
                     category="RESOURCE",
@@ -596,7 +617,7 @@ class RiskEngine:
             velocity_trend = self._calculate_velocity_trend()
             if velocity_trend < self.thresholds["velocity_degradation_threshold"]:
                 trend_risk = min(100.0, abs(velocity_trend) * 500.0)
-                risk_components.append(trend_risk)
+                velocity_slot = trend_risk
                 drivers.append(
                     RiskDriver(
                         category="RESOURCE",
@@ -639,7 +660,7 @@ class RiskEngine:
                 )
             else:
                 blocker_risk = min(100.0, (active_blockers - self.thresholds["blocker_count_high"]) * 12.0 + 50.0)
-                risk_components.append(blocker_risk)
+                blocker_slot = blocker_risk
                 self._blocker_resource_pts = min(100.0, blocker_risk)
                 drivers.append(
                     RiskDriver(
@@ -660,7 +681,7 @@ class RiskEngine:
         allocation_variance = self._calculate_allocation_imbalance()
         if allocation_variance > self.thresholds["assignment_imbalance_threshold"]:
             imbalance_risk = min(100.0, (allocation_variance - self.thresholds["assignment_imbalance_threshold"]) * 200.0 + 40.0)
-            risk_components.append(imbalance_risk)
+            imbalance_slot = imbalance_risk
             drivers.append(
                 RiskDriver(
                     category="RESOURCE",
@@ -672,11 +693,9 @@ class RiskEngine:
                 )
             )
 
-        # Average risk components
-        if risk_components:
-            resource_score = sum(risk_components) / len(risk_components)
-        else:
-            resource_score = 0.0
+        # Take the strongest (max) risk slot rather than averaging across
+        # fixed slots — see the same rationale in _calculate_dependency_risk.
+        resource_score = max(utilization_slot, velocity_slot, blocker_slot, imbalance_slot)
 
         return RiskExplanation(
             score=min(100.0, resource_score),
@@ -697,13 +716,22 @@ class RiskEngine:
         """
         drivers: List[RiskDriver] = []
         reasons: List[str] = []
-        risk_components = []
+
+        # Fixed slots (scope growth, planning volatility, carryover,
+        # blocked-item rate, not-started volume) so an untriggered/resolved
+        # factor contributes 0.0 instead of shrinking the averaging
+        # denominator.
+        growth_slot = 0.0
+        volatility_slot = 0.0
+        carryover_slot = 0.0
+        blocked_slot = 0.0
+        not_started_slot = 0.0
 
         forecast_scope_growth_pct = float(getattr(self.forecast, "scope_growth_percent", 0.0) or 0.0)
         forecast_scope_growth_hours = float(getattr(self.forecast, "scope_growth_hours", 0.0) or 0.0)
         if forecast_scope_growth_pct > self.thresholds["scope_growth_high_pct"] or forecast_scope_growth_hours > 0.0:
             inflation_risk = min(100.0, (forecast_scope_growth_pct - self.thresholds["scope_growth_high_pct"]) * 2.5 + 60.0)
-            risk_components.append(inflation_risk)
+            growth_slot = inflation_risk
             drivers.append(
                 RiskDriver(
                     category="SCOPE",
@@ -719,7 +747,7 @@ class RiskEngine:
             reasons.append(f"Forecast scope growth {forecast_scope_growth_pct:.1f}%")
         elif forecast_scope_growth_pct > self.thresholds["scope_growth_moderate_pct"]:
             inflation_risk = (forecast_scope_growth_pct - self.thresholds["scope_growth_moderate_pct"]) * 2.0 + 40.0
-            risk_components.append(inflation_risk)
+            growth_slot = inflation_risk
             drivers.append(
                 RiskDriver(
                     category="SCOPE",
@@ -737,7 +765,7 @@ class RiskEngine:
         scope_creep_score = self.metrics.quality_metrics.scope_creep_score
         if scope_volatility_score > 0.7 or scope_creep_score > 0.7:
             volatility_risk = min(100.0, max(scope_volatility_score, scope_creep_score) * 100.0)
-            risk_components.append(volatility_risk)
+            volatility_slot = volatility_risk
             drivers.append(
                 RiskDriver(
                     category="SCOPE",
@@ -754,7 +782,7 @@ class RiskEngine:
         historical_carryover = self.spillover.historical_carryover_rate
         if historical_carryover > self.thresholds["carryover_high"]:
             carryover_risk = min(100.0, (historical_carryover - self.thresholds["carryover_high"]) * 20.0 + 50.0)
-            risk_components.append(carryover_risk)
+            carryover_slot = carryover_risk
             drivers.append(
                 RiskDriver(
                     category="SCOPE",
@@ -768,7 +796,7 @@ class RiskEngine:
             reasons.append(f"Historical carryover {historical_carryover:.1f} items/sprint")
         elif historical_carryover > self.thresholds["carryover_moderate"]:
             carryover_risk = (historical_carryover - self.thresholds["carryover_moderate"]) * 20.0
-            risk_components.append(carryover_risk)
+            carryover_slot = carryover_risk
             drivers.append(
                 RiskDriver(
                     category="SCOPE",
@@ -786,7 +814,7 @@ class RiskEngine:
                 100.0,
                 (blocked_items / self.metrics.total_items - self.thresholds["blocked_items_high_ratio"]) * 500.0 + 60.0,
             )
-            risk_components.append(blocked_risk)
+            blocked_slot = blocked_risk
             drivers.append(
                 RiskDriver(
                     category="SCOPE",
@@ -807,7 +835,7 @@ class RiskEngine:
                 100.0,
                 (not_started / self.metrics.total_items - self.thresholds["not_started_items_high_ratio"]) * 300.0 + 50.0,
             )
-            risk_components.append(not_started_risk)
+            not_started_slot = not_started_risk
             drivers.append(
                 RiskDriver(
                     category="SCOPE",
@@ -820,10 +848,11 @@ class RiskEngine:
             )
             reasons.append(f"{not_started} items not started")
 
-        if risk_components:
-            scope_score = sum(risk_components) / len(risk_components)
-        else:
-            scope_score = 0.0
+        # Take the strongest (max) risk slot rather than averaging across
+        # fixed slots — see the same rationale in _calculate_dependency_risk.
+        scope_score = max(
+            growth_slot, volatility_slot, carryover_slot, blocked_slot, not_started_slot
+        )
 
         return RiskExplanation(
             score=min(100.0, scope_score),
