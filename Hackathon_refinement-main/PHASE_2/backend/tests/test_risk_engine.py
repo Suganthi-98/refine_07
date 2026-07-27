@@ -1055,7 +1055,14 @@ def test_sprint_risk_still_uses_predicted_spillover():
     assert len(sprint_risks) == 1
     assert sprint_risks[0].spillover_items == 7
     assert abs(sprint_risks[0].risk_score - 56.0) < 0.01
-    """Test dependency risk increases with long critical path."""
+    """Test dependency risk increases with long critical path.
+    
+    After A1 fixed-denominator fix: dependency score uses 5 defined slots as
+    denominator.  A single 'Moderate Critical Path Length' driver (score=50)
+    out of 5 slots → 50/5 = 10.0.  The test now asserts > 5.0 to verify
+    that a long CP still registers non-trivial dependency risk while
+    remaining robust to future calibration adjustments.
+    """
     start_date = datetime(2025, 1, 1)
     end_date = datetime(2025, 3, 1)
     project_info = ProjectInfo(
@@ -1157,9 +1164,11 @@ def test_sprint_risk_still_uses_predicted_spillover():
     )
     result = risk_engine.analyze()
     
-    # With long critical path, dependency risk should be high
+    # With long critical path, dependency risk should be non-trivial.
+    # Fixed-denominator model: single cp-length driver / 5 slots = score/5.
+    # 10 items on CP triggers "Moderate" driver (score=50) → 50/5=10.0.
     assert len(cp_result.items_on_critical_path) > 5
-    assert result.dependency_risk.score > 30.0
+    assert result.dependency_risk.score > 5.0
 
 
 def test_resource_risk_increases_with_utilization():
@@ -1361,9 +1370,15 @@ def test_scope_risk_detects_estimate_growth():
     )
     result = risk_engine.analyze()
     
-    # With estimate inflation, scope risk should be high
-    assert result.scope_risk.score > 40.0
+    # With estimate inflation, scope risk should be non-trivial.
+    # Fixed-denominator model: 1 triggered slot (score=100) / 5 slots = 20.0.
+    # The driver itself scores 100 — inflation IS detected; category score
+    # is lower because untriggered slots no longer free-ride to zero.
+    assert result.scope_risk.score > 15.0
     assert len(result.scope_risk.reasons) > 0
+    # Verify the driver itself scored high even if category mean is diluted
+    scope_driver_titles = {d.title for d in result.scope_risk.drivers}
+    assert "Scope Growth Signal" in scope_driver_titles
 
 
 def test_risk_drivers_ranked(sample_project_state_high_risk):
@@ -2137,11 +2152,18 @@ def test_moderate_risk_project_with_high_utilization(sample_project_state_high_r
     print("\nScope Risk")
     print(result.scope_risk)
 
-    # Under DC-1, small delay + low probability + high utilization + high scope inflation = MODERATE
+    # Under DC-1 + A1 fixed-denominator: small delay + low probability +
+    # high utilization + high scope inflation = MODERATE overall risk.
     assert result.overall_risk_level in [
         RiskLevel.MODERATE,
         RiskLevel.HIGH,
     ]
-    
-    # Verify resource risk dominates (95% utilization)
-    assert result.resource_risk.score >= 60.0
+
+    # Fixed-denominator model: utilization driver (score=70) / 4 resource slots = 17.5.
+    # The driver IS detected; category score is lower because inactive slots
+    # share the denominator.  Verify the driver fires at >= 60.
+    resource_util_drivers = [d for d in result.resource_risk.drivers
+                              if d.title in ("Extreme Team Overload", "High Team Overload")]
+    assert len(resource_util_drivers) >= 1
+    assert resource_util_drivers[0].score >= 60.0
+    assert result.resource_risk.score >= 15.0
